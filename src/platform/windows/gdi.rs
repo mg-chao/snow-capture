@@ -5,12 +5,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
-use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::Foundation::{HANDLE, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
     DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetMonitorInfoW, GetWindowDC, HBITMAP, HDC,
     HGDIOBJ, HMONITOR, MONITORINFO, MONITORINFOEXW, ReleaseDC, SRCCOPY, SelectObject,
 };
+use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic, IsWindow, IsWindowVisible};
 
 use crate::backend::CaptureMode;
 use crate::convert;
@@ -66,11 +68,74 @@ fn resolve_geometry(resolver: &MonitorResolver, id: &MonitorId) -> CaptureResult
     geometry_from_handle(resolved.handle)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowCapturePath {
+    WindowDcBitBlt,
+    PrintWindow(PRINT_WINDOW_FLAGS),
+}
+
+const PRINT_WINDOW_RENDER_FULL: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(2);
+const PRINT_WINDOW_DEFAULT: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(0);
+const PRINT_WINDOW_EXPERIMENTAL: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(4);
+
+const WINDOW_CAPTURE_ORDER_SCREENSHOT: [WindowCapturePath; 4] = [
+    WindowCapturePath::PrintWindow(PRINT_WINDOW_RENDER_FULL),
+    WindowCapturePath::PrintWindow(PRINT_WINDOW_DEFAULT),
+    WindowCapturePath::PrintWindow(PRINT_WINDOW_EXPERIMENTAL),
+    WindowCapturePath::WindowDcBitBlt,
+];
+
+const WINDOW_CAPTURE_ORDER_RECORDING: [WindowCapturePath; 4] = [
+    WindowCapturePath::WindowDcBitBlt,
+    WindowCapturePath::PrintWindow(PRINT_WINDOW_RENDER_FULL),
+    WindowCapturePath::PrintWindow(PRINT_WINDOW_DEFAULT),
+    WindowCapturePath::PrintWindow(PRINT_WINDOW_EXPERIMENTAL),
+];
+
+#[inline(always)]
+fn window_capture_order(mode: CaptureMode) -> &'static [WindowCapturePath; 4] {
+    match mode {
+        CaptureMode::Screenshot => &WINDOW_CAPTURE_ORDER_SCREENSHOT,
+        CaptureMode::ScreenRecording => &WINDOW_CAPTURE_ORDER_RECORDING,
+    }
+}
+
+fn build_window_capture_attempts(
+    mode: CaptureMode,
+    preferred_path: Option<WindowCapturePath>,
+) -> ([WindowCapturePath; 4], usize) {
+    let default_order = window_capture_order(mode);
+    let mut attempts = [default_order[0]; 4];
+    let mut attempt_count = 0usize;
+
+    let preferred_path = match mode {
+        CaptureMode::ScreenRecording => preferred_path,
+        CaptureMode::Screenshot => None,
+    };
+
+    if let Some(preferred) = preferred_path {
+        attempts[attempt_count] = preferred;
+        attempt_count += 1;
+    }
+
+    for &candidate in default_order {
+        if attempts[..attempt_count].contains(&candidate) {
+            continue;
+        }
+        attempts[attempt_count] = candidate;
+        attempt_count += 1;
+    }
+
+    (attempts, attempt_count)
+}
+
 struct GdiResources {
     screen_dc: HDC,
     mem_dc: HDC,
     bitmap: Option<HBITMAP>,
     old_bitmap: Option<HGDIOBJ>,
+    window_dc: Option<HDC>,
+    window_dc_owner: Option<HWND>,
     bits: *mut u8,
     width: i32,
     height: i32,
@@ -101,6 +166,8 @@ impl GdiResources {
             mem_dc,
             bitmap: None,
             old_bitmap: None,
+            window_dc: None,
+            window_dc_owner: None,
             bits: null_mut(),
             width: 0,
             height: 0,
@@ -111,6 +178,8 @@ impl GdiResources {
     /// Re-acquire the desktop screen DC.  Called when the display
     /// configuration has changed so the old DC may be stale.
     fn refresh_screen_dc(&mut self) -> CaptureResult<()> {
+        self.release_window_dc();
+
         // Release the old DC first.
         if !self.screen_dc.0.is_null() {
             unsafe {
@@ -146,6 +215,38 @@ impl GdiResources {
         }
         self.mem_dc = new_mem_dc;
         Ok(())
+    }
+
+    fn release_window_dc(&mut self) {
+        if let (Some(owner), Some(window_dc)) = (self.window_dc_owner.take(), self.window_dc.take())
+            && !window_dc.0.is_null()
+        {
+            unsafe {
+                let _ = ReleaseDC(owner, window_dc);
+            }
+        }
+    }
+
+    fn acquire_window_dc(&mut self, hwnd: HWND) -> CaptureResult<HDC> {
+        if let (Some(owner), Some(window_dc)) = (self.window_dc_owner, self.window_dc)
+            && owner == hwnd
+            && !window_dc.0.is_null()
+        {
+            return Ok(window_dc);
+        }
+
+        self.release_window_dc();
+
+        let window_dc = unsafe { GetWindowDC(hwnd) };
+        if window_dc.0.is_null() {
+            return Err(CaptureError::Platform(anyhow::anyhow!(
+                "GetWindowDC returned null during GDI window capture"
+            )));
+        }
+
+        self.window_dc_owner = Some(hwnd);
+        self.window_dc = Some(window_dc);
+        Ok(window_dc)
     }
 
     fn ensure_surface(&mut self, width: i32, height: i32) -> CaptureResult<()> {
@@ -286,38 +387,57 @@ impl GdiResources {
         height: i32,
         reuse: Option<Frame>,
         mode: CaptureMode,
-    ) -> CaptureResult<Frame> {
+        preferred_path: Option<WindowCapturePath>,
+    ) -> CaptureResult<(Frame, WindowCapturePath)> {
         self.ensure_surface(width, height)?;
 
-        let mut rendered =
-            unsafe { PrintWindow(hwnd, self.mem_dc, PRINT_WINDOW_FLAGS(2)) }.as_bool();
-        if !rendered {
-            rendered = unsafe { PrintWindow(hwnd, self.mem_dc, PRINT_WINDOW_FLAGS(0)) }.as_bool();
-        }
-        if !rendered {
-            rendered = unsafe { PrintWindow(hwnd, self.mem_dc, PRINT_WINDOW_FLAGS(4)) }.as_bool();
-        }
-        if !rendered {
-            let window_dc = unsafe { GetWindowDC(hwnd) };
-            if window_dc.0.is_null() {
-                return Err(CaptureError::Platform(anyhow::anyhow!(
-                    "PrintWindow failed and GetWindowDC returned null during GDI window capture"
-                )));
+        let (attempts, attempt_count) = build_window_capture_attempts(mode, preferred_path);
+
+        let mut last_error: Option<CaptureError> = None;
+        for &path in &attempts[..attempt_count] {
+            match self.try_capture_window_path(hwnd, width, height, path) {
+                Ok(()) => {
+                    let frame = self.read_surface_to_rgba(width, height, reuse, mode)?;
+                    return Ok((frame, path));
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                }
             }
-
-            let blit_result =
-                unsafe { BitBlt(self.mem_dc, 0, 0, width, height, window_dc, 0, 0, SRCCOPY) };
-
-            unsafe {
-                let _ = ReleaseDC(hwnd, window_dc);
-            }
-
-            blit_result
-                .context("PrintWindow failed and BitBlt fallback failed during GDI window capture")
-                .map_err(CaptureError::Platform)?;
         }
 
-        self.read_surface_to_rgba(width, height, reuse, mode)
+        Err(last_error.unwrap_or_else(|| {
+            CaptureError::Platform(anyhow::anyhow!("all GDI window capture strategies failed"))
+        }))
+    }
+
+    fn try_capture_window_path(
+        &mut self,
+        hwnd: HWND,
+        width: i32,
+        height: i32,
+        path: WindowCapturePath,
+    ) -> CaptureResult<()> {
+        match path {
+            WindowCapturePath::WindowDcBitBlt => {
+                let window_dc = self.acquire_window_dc(hwnd)?;
+                unsafe { BitBlt(self.mem_dc, 0, 0, width, height, window_dc, 0, 0, SRCCOPY) }
+                    .context("BitBlt failed during GDI window capture")
+                    .map_err(CaptureError::Platform)?;
+                Ok(())
+            }
+            WindowCapturePath::PrintWindow(flags) => {
+                self.release_window_dc();
+                if unsafe { PrintWindow(hwnd, self.mem_dc, flags) }.as_bool() {
+                    return Ok(());
+                }
+
+                Err(CaptureError::Platform(anyhow::anyhow!(
+                    "PrintWindow failed for flags {:#x}",
+                    flags.0
+                )))
+            }
+        }
     }
 
     fn release_bitmap(&mut self) {
@@ -340,6 +460,7 @@ impl GdiResources {
 
 impl Drop for GdiResources {
     fn drop(&mut self) {
+        self.release_window_dc();
         self.release_bitmap();
 
         if !self.mem_dc.0.is_null() {
@@ -446,15 +567,13 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
 
 use crate::backend::MonitorCapturer;
 use crate::window::WindowId;
-use windows::Win32::Foundation::RECT;
-use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
-use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic, IsWindow, IsWindowVisible};
 
 pub(crate) struct WindowsWindowCapturer {
     _com: CoInitGuard,
     resources: GdiResources,
     hwnd: HWND,
     capture_mode: CaptureMode,
+    preferred_path: Option<WindowCapturePath>,
 }
 
 // GdiResources contains raw pointers (HDC, HBITMAP, *mut u8) that are
@@ -484,6 +603,7 @@ impl WindowsWindowCapturer {
             resources,
             hwnd,
             capture_mode: CaptureMode::Screenshot,
+            preferred_path: None,
         })
     }
 }
@@ -517,19 +637,88 @@ impl MonitorCapturer for WindowsWindowCapturer {
         }
 
         let capture_time = Instant::now();
-        let mut frame = self.resources.capture_window_to_rgba(
+        let (mut frame, used_path) = self.resources.capture_window_to_rgba(
             self.hwnd,
             width,
             height,
             reuse,
             self.capture_mode,
+            self.preferred_path,
         )?;
+        self.preferred_path = match self.capture_mode {
+            CaptureMode::ScreenRecording => Some(used_path),
+            CaptureMode::Screenshot => None,
+        };
         frame.metadata.capture_time = Some(capture_time);
         frame.metadata.present_time_qpc = crate::frame::query_qpc_now();
         Ok(frame)
     }
 
     fn set_capture_mode(&mut self, mode: CaptureMode) {
+        if self.capture_mode != mode {
+            self.preferred_path = None;
+        }
         self.capture_mode = mode;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screenshot_mode_prefers_printwindow_paths() {
+        let (attempts, count) = build_window_capture_attempts(CaptureMode::Screenshot, None);
+        assert_eq!(count, 4);
+        assert_eq!(
+            attempts[0],
+            WindowCapturePath::PrintWindow(PRINT_WINDOW_RENDER_FULL)
+        );
+        assert_eq!(
+            attempts[1],
+            WindowCapturePath::PrintWindow(PRINT_WINDOW_DEFAULT)
+        );
+        assert_eq!(
+            attempts[2],
+            WindowCapturePath::PrintWindow(PRINT_WINDOW_EXPERIMENTAL)
+        );
+        assert_eq!(attempts[3], WindowCapturePath::WindowDcBitBlt);
+    }
+
+    #[test]
+    fn recording_mode_prefers_cached_window_dc() {
+        let (attempts, count) = build_window_capture_attempts(CaptureMode::ScreenRecording, None);
+        assert_eq!(count, 4);
+        assert_eq!(attempts[0], WindowCapturePath::WindowDcBitBlt);
+        assert_eq!(
+            attempts[1],
+            WindowCapturePath::PrintWindow(PRINT_WINDOW_RENDER_FULL)
+        );
+    }
+
+    #[test]
+    fn preferred_path_is_front_loaded_without_duplicates() {
+        let preferred = WindowCapturePath::PrintWindow(PRINT_WINDOW_DEFAULT);
+        let (attempts, count) =
+            build_window_capture_attempts(CaptureMode::ScreenRecording, Some(preferred));
+        assert_eq!(count, 4);
+        assert_eq!(attempts[0], preferred);
+        for idx in 0..count {
+            assert!(!attempts[..idx].contains(&attempts[idx]));
+        }
+    }
+
+    #[test]
+    fn screenshot_mode_ignores_cached_preferred_path() {
+        let (attempts, count) = build_window_capture_attempts(
+            CaptureMode::Screenshot,
+            Some(WindowCapturePath::WindowDcBitBlt),
+        );
+        assert_eq!(count, 4);
+        assert_eq!(
+            attempts[0],
+            WindowCapturePath::PrintWindow(PRINT_WINDOW_RENDER_FULL)
+        );
+        assert_eq!(attempts[3], WindowCapturePath::WindowDcBitBlt);
     }
 }

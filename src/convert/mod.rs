@@ -508,7 +508,101 @@ fn nt_destination_is_aligned(dst: *const u8) -> bool {
 #[inline(always)]
 fn nt_rows_are_aligned(dst: *const u8, dst_pitch: usize) -> bool {
     let alignment = nt_store_alignment_bytes();
-    alignment <= 1 || (ptr_is_aligned(dst, alignment) && dst_pitch % alignment == 0)
+    alignment <= 1 || (ptr_is_aligned(dst, alignment) && dst_pitch.is_multiple_of(alignment))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+struct BgraNtKernelSet {
+    avx512: Option<PixelKernel>,
+    avx2: Option<PixelKernel>,
+    ssse3: Option<PixelKernel>,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn bgra_nt_kernel_set() -> &'static BgraNtKernelSet {
+    static KERNELS: OnceLock<BgraNtKernelSet> = OnceLock::new();
+    KERNELS.get_or_init(|| BgraNtKernelSet {
+        avx512: if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+        {
+            Some(simd_x86::convert_bgra_to_rgba_avx512_nt_unchecked)
+        } else {
+            None
+        },
+        avx2: if std::arch::is_x86_feature_detected!("avx2") {
+            Some(simd_x86::convert_bgra_to_rgba_avx2_nt_unchecked)
+        } else {
+            None
+        },
+        ssse3: if std::arch::is_x86_feature_detected!("ssse3") {
+            Some(simd_x86::convert_bgra_to_rgba_ssse3_nt_unchecked)
+        } else {
+            None
+        },
+    })
+}
+
+#[inline(always)]
+fn bgra_nt_kernel_for_destination(dst: *const u8) -> Option<PixelKernel> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let kernels = bgra_nt_kernel_set();
+        if let Some(kernel) = kernels.avx512
+            && ptr_is_aligned(dst, 64)
+        {
+            return Some(kernel);
+        }
+        if let Some(kernel) = kernels.avx2
+            && ptr_is_aligned(dst, 32)
+        {
+            return Some(kernel);
+        }
+        if let Some(kernel) = kernels.ssse3
+            && ptr_is_aligned(dst, 16)
+        {
+            return Some(kernel);
+        }
+        None
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = dst;
+        None
+    }
+}
+
+#[inline(always)]
+fn bgra_nt_kernel_for_rows(dst: *const u8, dst_pitch: usize) -> Option<PixelKernel> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let kernels = bgra_nt_kernel_set();
+        if let Some(kernel) = kernels.avx512
+            && ptr_is_aligned(dst, 64)
+            && dst_pitch.is_multiple_of(64)
+        {
+            return Some(kernel);
+        }
+        if let Some(kernel) = kernels.avx2
+            && ptr_is_aligned(dst, 32)
+            && dst_pitch.is_multiple_of(32)
+        {
+            return Some(kernel);
+        }
+        if let Some(kernel) = kernels.ssse3
+            && ptr_is_aligned(dst, 16)
+            && dst_pitch.is_multiple_of(16)
+        {
+            return Some(kernel);
+        }
+        None
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (dst, dst_pitch);
+        None
+    }
 }
 
 pub(crate) unsafe fn convert_surface_to_rgba_unchecked(
@@ -545,7 +639,12 @@ pub(crate) unsafe fn convert_surface_to_rgba_unchecked(
         // surfaces the regular (temporal) path is faster.
         let use_nt = non_overlapping
             && total_pixels >= NT_STORE_MIN_PIXELS
-            && nt_destination_is_aligned(layout.dst as *const u8);
+            && match format {
+                SurfacePixelFormat::Bgra8 => {
+                    bgra_nt_kernel_for_destination(layout.dst as *const u8).is_some()
+                }
+                _ => nt_destination_is_aligned(layout.dst as *const u8),
+            };
         if use_nt {
             if format == SurfacePixelFormat::Bgra8 {
                 unsafe {
@@ -570,11 +669,19 @@ pub(crate) unsafe fn convert_surface_to_rgba_unchecked(
         // Use NT row kernel when buffers don't overlap and the surface
         // is large enough — avoids cache pollution from write-allocate
         // traffic in the row-based path (common for padded staging textures).
+        let bgra_row_nt_kernel = if format == SurfacePixelFormat::Bgra8 {
+            bgra_nt_kernel_for_rows(layout.dst as *const u8, layout.dst_pitch)
+        } else {
+            None
+        };
         let use_nt = layout.allow_parallel_rows()
             && total_pixels >= NT_STORE_MIN_PIXELS
-            && nt_rows_are_aligned(layout.dst as *const u8, layout.dst_pitch);
+            && match format {
+                SurfacePixelFormat::Bgra8 => bgra_row_nt_kernel.is_some(),
+                _ => nt_rows_are_aligned(layout.dst as *const u8, layout.dst_pitch),
+            };
         let kernel = if use_nt {
-            plan.row_kernel_nt
+            bgra_row_nt_kernel.unwrap_or(plan.row_kernel_nt)
         } else {
             plan.row_kernel
         };
@@ -585,11 +692,19 @@ pub(crate) unsafe fn convert_surface_to_rgba_unchecked(
     }
 
     // Serial row path — use NT stores when non-overlapping and large enough.
+    let bgra_row_nt_kernel = if format == SurfacePixelFormat::Bgra8 {
+        bgra_nt_kernel_for_rows(layout.dst as *const u8, layout.dst_pitch)
+    } else {
+        None
+    };
     let use_nt = layout.allow_parallel_rows()
         && total_pixels >= NT_STORE_MIN_PIXELS
-        && nt_rows_are_aligned(layout.dst as *const u8, layout.dst_pitch);
+        && match format {
+            SurfacePixelFormat::Bgra8 => bgra_row_nt_kernel.is_some(),
+            _ => nt_rows_are_aligned(layout.dst as *const u8, layout.dst_pitch),
+        };
     let kernel = if use_nt {
-        plan.row_kernel_nt
+        bgra_row_nt_kernel.unwrap_or(plan.row_kernel_nt)
     } else {
         plan.row_kernel
     };
@@ -936,12 +1051,12 @@ pub(crate) unsafe fn convert_bgra_to_rgba_nt_unchecked(
     dst: *mut u8,
     pixel_count: usize,
 ) {
-    if !nt_destination_is_aligned(dst as *const u8) {
+    let Some(nt_kernel) = bgra_nt_kernel_for_destination(dst as *const u8) else {
         unsafe {
             convert_bgra_to_rgba_unchecked(src, dst, pixel_count);
         }
         return;
-    }
+    };
 
     if should_parallelize(
         pixel_count,
@@ -956,6 +1071,7 @@ pub(crate) unsafe fn convert_bgra_to_rgba_nt_unchecked(
                 pixel_count,
                 BGRA_NT_PARALLEL_MIN_CHUNK_PIXELS,
                 BGRA_PARALLEL_MAX_WORKERS,
+                Some(nt_kernel),
             );
         }
         return;
@@ -963,7 +1079,7 @@ pub(crate) unsafe fn convert_bgra_to_rgba_nt_unchecked(
     // Serial path — still use NT stores since src != dst is guaranteed
     // by the caller and the working set far exceeds the cache.
     unsafe {
-        bgra_kernel_nt()(src, dst, pixel_count);
+        nt_kernel(src, dst, pixel_count);
     }
 }
 
@@ -1030,6 +1146,7 @@ pub(crate) unsafe fn convert_f16_rgba_to_srgb_nt_unchecked(
 }
 
 unsafe fn convert_bgra_to_rgba_parallel(src: *const u8, dst: *mut u8, pixel_count: usize) {
+    let nt_kernel = bgra_nt_kernel_for_destination(dst as *const u8);
     unsafe {
         convert_bgra_to_rgba_parallel_inner(
             src,
@@ -1037,6 +1154,7 @@ unsafe fn convert_bgra_to_rgba_parallel(src: *const u8, dst: *mut u8, pixel_coun
             pixel_count,
             BGRA_PARALLEL_MIN_CHUNK_PIXELS,
             BGRA_PARALLEL_MAX_WORKERS,
+            nt_kernel,
         );
     }
 }
@@ -1047,10 +1165,17 @@ unsafe fn convert_bgra_to_rgba_parallel_inner(
     pixel_count: usize,
     min_chunk_pixels: usize,
     max_workers: usize,
+    nt_kernel: Option<PixelKernel>,
 ) {
     let Some(chunk_pixels) = parallel_chunk_pixels(pixel_count, min_chunk_pixels, max_workers)
     else {
-        unsafe { bgra_kernel_nt()(src, dst, pixel_count) };
+        unsafe {
+            if let Some(kernel) = nt_kernel {
+                kernel(src, dst, pixel_count);
+            } else {
+                bgra_kernel()(src, dst, pixel_count);
+            }
+        };
         return;
     };
 
@@ -1066,7 +1191,7 @@ unsafe fn convert_bgra_to_rgba_parallel_inner(
     // Use non-temporal stores in the parallel path — each chunk is large
     // enough that the destination lines won't be read back before the
     // full conversion completes, so bypassing the cache is a net win.
-    let kernel = bgra_kernel_nt();
+    let kernel = nt_kernel.unwrap_or_else(bgra_kernel);
     let src_addr = src as usize;
     let dst_addr = dst as usize;
 

@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic, IsWindow, IsWindowVisible};
 
-use crate::backend::CaptureMode;
+use crate::backend::{CaptureBlitRegion, CaptureMode, CaptureSampleMetadata};
 use crate::convert;
 use crate::error::{CaptureError, CaptureResult};
 use crate::frame::Frame;
@@ -91,6 +91,23 @@ const WINDOW_CAPTURE_ORDER_RECORDING: [WindowCapturePath; 4] = [
     WindowCapturePath::PrintWindow(PRINT_WINDOW_DEFAULT),
     WindowCapturePath::PrintWindow(PRINT_WINDOW_EXPERIMENTAL),
 ];
+
+#[inline]
+fn gdi_direct_region_capture_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_DISABLE_GDI_DIRECT_REGION")
+            .map(|raw| {
+                let normalized = raw.trim().to_ascii_lowercase();
+                !(normalized == "1"
+                    || normalized == "true"
+                    || normalized == "yes"
+                    || normalized == "on")
+            })
+            .unwrap_or(true)
+    })
+}
 
 #[inline(always)]
 fn window_capture_order(mode: CaptureMode) -> &'static [WindowCapturePath; 4] {
@@ -379,6 +396,147 @@ impl GdiResources {
         self.read_surface_to_rgba(geometry.width, geometry.height, reuse, mode)
     }
 
+    /// Capture a monitor sub-rectangle and write it directly into an
+    /// already allocated destination frame at `blit.dst_x/dst_y`.
+    ///
+    /// This avoids the legacy region fallback path of:
+    /// 1) full monitor BitBlt + full monitor BGRA->RGBA conversion
+    /// 2) CPU crop/copy into the region output frame
+    ///
+    /// Instead, we only BitBlt the requested source rectangle and convert
+    /// those pixels straight into the destination slice.
+    fn capture_region_into_rgba(
+        &mut self,
+        geometry: MonitorGeometry,
+        blit: CaptureBlitRegion,
+        destination: &mut Frame,
+        mode: CaptureMode,
+    ) -> CaptureResult<()> {
+        if blit.width == 0 || blit.height == 0 {
+            return Ok(());
+        }
+
+        let src_width = u32::try_from(geometry.width).map_err(|_| CaptureError::BufferOverflow)?;
+        let src_height =
+            u32::try_from(geometry.height).map_err(|_| CaptureError::BufferOverflow)?;
+        let src_right = blit
+            .src_x
+            .checked_add(blit.width)
+            .ok_or(CaptureError::BufferOverflow)?;
+        let src_bottom = blit
+            .src_y
+            .checked_add(blit.height)
+            .ok_or(CaptureError::BufferOverflow)?;
+        if src_right > src_width || src_bottom > src_height {
+            return Err(CaptureError::BufferOverflow);
+        }
+
+        let dst_width = destination.width();
+        let dst_height = destination.height();
+        let dst_right = blit
+            .dst_x
+            .checked_add(blit.width)
+            .ok_or(CaptureError::BufferOverflow)?;
+        let dst_bottom = blit
+            .dst_y
+            .checked_add(blit.height)
+            .ok_or(CaptureError::BufferOverflow)?;
+        if dst_right > dst_width || dst_bottom > dst_height {
+            return Err(CaptureError::BufferOverflow);
+        }
+
+        let copy_w_i32 = i32::try_from(blit.width).map_err(|_| CaptureError::BufferOverflow)?;
+        let copy_h_i32 = i32::try_from(blit.height).map_err(|_| CaptureError::BufferOverflow)?;
+        self.ensure_surface(copy_w_i32, copy_h_i32)?;
+
+        let source_x = i32::try_from(i64::from(geometry.left) + i64::from(blit.src_x))
+            .map_err(|_| CaptureError::BufferOverflow)?;
+        let source_y = i32::try_from(i64::from(geometry.top) + i64::from(blit.src_y))
+            .map_err(|_| CaptureError::BufferOverflow)?;
+
+        unsafe {
+            BitBlt(
+                self.mem_dc,
+                0,
+                0,
+                copy_w_i32,
+                copy_h_i32,
+                self.screen_dc,
+                source_x,
+                source_y,
+                SRCCOPY,
+            )
+        }
+        .context("BitBlt failed during GDI region capture")
+        .map_err(CaptureError::Platform)?;
+
+        let copy_w = usize::try_from(blit.width).map_err(|_| CaptureError::BufferOverflow)?;
+        let copy_h = usize::try_from(blit.height).map_err(|_| CaptureError::BufferOverflow)?;
+        let dst_pitch = usize::try_from(dst_width)
+            .map_err(|_| CaptureError::BufferOverflow)?
+            .checked_mul(4)
+            .ok_or(CaptureError::BufferOverflow)?;
+        let dst_height_usize =
+            usize::try_from(dst_height).map_err(|_| CaptureError::BufferOverflow)?;
+        let dst_required_len = dst_pitch
+            .checked_mul(dst_height_usize)
+            .ok_or(CaptureError::BufferOverflow)?;
+        if destination.as_rgba_bytes().len() < dst_required_len {
+            return Err(CaptureError::BufferOverflow);
+        }
+        let dst_x = usize::try_from(blit.dst_x).map_err(|_| CaptureError::BufferOverflow)?;
+        let dst_y = usize::try_from(blit.dst_y).map_err(|_| CaptureError::BufferOverflow)?;
+        let dst_offset = dst_y
+            .checked_mul(dst_pitch)
+            .and_then(|base| dst_x.checked_mul(4).and_then(|xoff| base.checked_add(xoff)))
+            .ok_or(CaptureError::BufferOverflow)?;
+
+        let dst_ptr = unsafe { destination.as_mut_rgba_ptr().add(dst_offset) };
+        let row_bytes = copy_w.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+
+        // Fast path: contiguous destination rows (single-monitor region output)
+        // can use the dedicated contiguous kernels directly.
+        if dst_pitch == row_bytes {
+            unsafe {
+                match mode {
+                    CaptureMode::ScreenRecording => convert::convert_bgra_to_rgba_nt_unchecked(
+                        self.bits.cast_const(),
+                        dst_ptr,
+                        copy_w
+                            .checked_mul(copy_h)
+                            .ok_or(CaptureError::BufferOverflow)?,
+                    ),
+                    CaptureMode::Screenshot => convert::convert_bgra_to_rgba_unchecked(
+                        self.bits.cast_const(),
+                        dst_ptr,
+                        copy_w
+                            .checked_mul(copy_h)
+                            .ok_or(CaptureError::BufferOverflow)?,
+                    ),
+                }
+            }
+            return Ok(());
+        }
+
+        // General path for multi-monitor composites where destination rows
+        // include padding to the full region width.
+        unsafe {
+            convert::convert_surface_to_rgba_unchecked(
+                convert::SurfacePixelFormat::Bgra8,
+                convert::SurfaceLayout::new(
+                    self.bits.cast_const(),
+                    self.stride,
+                    dst_ptr,
+                    dst_pitch,
+                    copy_w,
+                    copy_h,
+                ),
+                convert::SurfaceConversionOptions::default(),
+            );
+        }
+        Ok(())
+    }
+
     /// Capture a window directly into the backing DIB.
     fn capture_window_to_rgba(
         &mut self,
@@ -558,6 +716,31 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
         // across backends.
         frame.metadata.present_time_qpc = crate::frame::query_qpc_now();
         Ok(frame)
+    }
+
+    fn capture_region_into(
+        &mut self,
+        blit: CaptureBlitRegion,
+        destination: &mut Frame,
+        _destination_has_history: bool,
+    ) -> CaptureResult<Option<CaptureSampleMetadata>> {
+        if !gdi_direct_region_capture_enabled() {
+            return Ok(None);
+        }
+
+        self.refresh_geometry()?;
+        let capture_time = Instant::now();
+        self.resources.capture_region_into_rgba(
+            self.geometry,
+            blit,
+            destination,
+            self.capture_mode,
+        )?;
+        Ok(Some(CaptureSampleMetadata {
+            capture_time: Some(capture_time),
+            present_time_qpc: crate::frame::query_qpc_now(),
+            is_duplicate: false,
+        }))
     }
 
     fn set_capture_mode(&mut self, mode: CaptureMode) {

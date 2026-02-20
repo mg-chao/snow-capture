@@ -1,0 +1,2 @@
+target,backend,avg_ms,p50_ms,p95_ms,p99_ms,min_ms,max_ms,stddev_ms,fps,duplicate_pct,fresh_fps
+primary-monitor,gdi,48.951288,45.437800,64.886700,75.684600,36.917300,80.645500,8.757349,20.428472,0.000,20.428472

@@ -23,6 +23,24 @@ pub fn warmup() {
     let _ = f16_hdr_kernel();
 }
 
+#[inline]
+pub(crate) fn with_conversion_pool<F>(max_workers: usize, job: F)
+where
+    F: FnOnce() + Send,
+{
+    install_conversion_pool(max_workers, job);
+}
+
+#[inline(always)]
+pub(crate) fn should_parallelize_work(
+    pixel_count: usize,
+    min_pixels: usize,
+    min_chunk_pixels: usize,
+    max_workers: usize,
+) -> bool {
+    should_parallelize(pixel_count, min_pixels, min_chunk_pixels, max_workers)
+}
+
 const BGRA_PARALLEL_MIN_PIXELS: usize = 524_288;
 const BGRA_PARALLEL_MIN_CHUNK_PIXELS: usize = 131_072;
 const BGRA_PARALLEL_MAX_WORKERS: usize = 9;

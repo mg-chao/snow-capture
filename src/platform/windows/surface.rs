@@ -1,4 +1,5 @@
 use anyhow::Context;
+use std::sync::OnceLock;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_STAGING, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
@@ -44,6 +45,60 @@ fn source_bytes_per_pixel(format: SurfacePixelFormat) -> usize {
         SurfacePixelFormat::Bgra8 | SurfacePixelFormat::Rgba8 => 4usize,
         SurfacePixelFormat::Rgba16Float => 8usize,
     }
+}
+
+const DIRTY_RECT_PARALLEL_MIN_PIXELS: usize = 131_072;
+const DIRTY_RECT_PARALLEL_MIN_CHUNK_PIXELS: usize = 32_768;
+const DIRTY_RECT_PARALLEL_MAX_WORKERS: usize = 9;
+const DIRTY_RECT_PARALLEL_MIN_RECTS: usize = 4;
+
+#[derive(Clone, Copy)]
+struct DirtyRectWorkItem {
+    src_offset: usize,
+    dst_offset: usize,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+#[inline(always)]
+fn work_items_overlap(a: DirtyRectWorkItem, b: DirtyRectWorkItem) -> bool {
+    let a_right = a.x.saturating_add(a.width);
+    let a_bottom = a.y.saturating_add(a.height);
+    let b_right = b.x.saturating_add(b.width);
+    let b_bottom = b.y.saturating_add(b.height);
+    a.x < b_right && b.x < a_right && a.y < b_bottom && b.y < a_bottom
+}
+
+fn work_items_non_overlapping(work_items: &[DirtyRectWorkItem]) -> bool {
+    if work_items.len() <= 1 {
+        return true;
+    }
+
+    for i in 0..work_items.len() {
+        for j in (i + 1)..work_items.len() {
+            if work_items_overlap(work_items[i], work_items[j]) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn dirty_rect_parallel_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_DISABLE_DIRTY_RECT_PARALLEL")
+            .map(|raw| {
+                let normalized = raw.trim().to_ascii_lowercase();
+                !(normalized == "1"
+                    || normalized == "true"
+                    || normalized == "yes"
+                    || normalized == "on")
+            })
+            .unwrap_or(true)
+    })
 }
 
 pub(crate) fn ensure_staging_texture<'a>(
@@ -429,7 +484,8 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
             .ok_or(CaptureError::BufferOverflow)?;
         let dst_base = frame.as_mut_rgba_ptr();
 
-        let mut converted = 0usize;
+        let mut work_items = Vec::with_capacity(dirty_rects.len());
+        let mut total_dirty_pixels = 0usize;
 
         for rect in dirty_rects {
             let x = usize::try_from(rect.x).map_err(|_| CaptureError::BufferOverflow)?;
@@ -449,6 +505,7 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
 
             let copy_w = end_x - x;
             let copy_h = end_y - y;
+
             let src_row_bytes = source_row_bytes(format, copy_w)?;
             let src_end_in_row = x
                 .checked_mul(src_bytes_per_pixel)
@@ -496,28 +553,126 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
                 .and_then(|base| dst_x.checked_mul(4).and_then(|xoff| base.checked_add(xoff)))
                 .ok_or(CaptureError::BufferOverflow)?;
 
-            unsafe {
-                convert::convert_surface_to_rgba_unchecked(
-                    format,
-                    SurfaceLayout::new(
-                        src_base.add(src_offset),
-                        src_pitch,
-                        dst_base.add(dst_offset),
-                        dst_pitch,
-                        copy_w,
-                        copy_h,
-                    ),
-                    SurfaceConversionOptions { hdr_to_sdr },
-                );
-            }
-            converted += 1;
+            let dirty_pixels = copy_w
+                .checked_mul(copy_h)
+                .ok_or(CaptureError::BufferOverflow)?;
+            total_dirty_pixels = total_dirty_pixels
+                .checked_add(dirty_pixels)
+                .ok_or(CaptureError::BufferOverflow)?;
+
+            work_items.push(DirtyRectWorkItem {
+                src_offset,
+                dst_offset,
+                x,
+                y,
+                width: copy_w,
+                height: copy_h,
+            });
         }
 
-        Ok(converted)
+        if work_items.is_empty() {
+            return Ok(0);
+        }
+
+        let options = SurfaceConversionOptions { hdr_to_sdr };
+        let should_parallelize = convert::should_parallelize_work(
+            total_dirty_pixels,
+            DIRTY_RECT_PARALLEL_MIN_PIXELS,
+            DIRTY_RECT_PARALLEL_MIN_CHUNK_PIXELS,
+            DIRTY_RECT_PARALLEL_MAX_WORKERS,
+        );
+        let can_parallel = dirty_rect_parallel_enabled()
+            && work_items.len() >= DIRTY_RECT_PARALLEL_MIN_RECTS
+            && should_parallelize
+            && work_items_non_overlapping(&work_items);
+
+        if can_parallel {
+            use rayon::prelude::*;
+
+            let src_addr = src_base as usize;
+            let dst_addr = dst_base as usize;
+            convert::with_conversion_pool(DIRTY_RECT_PARALLEL_MAX_WORKERS, || {
+                work_items.par_iter().for_each(|item| unsafe {
+                    convert::convert_surface_to_rgba_unchecked(
+                        format,
+                        SurfaceLayout::new(
+                            (src_addr + item.src_offset) as *const u8,
+                            src_pitch,
+                            (dst_addr + item.dst_offset) as *mut u8,
+                            dst_pitch,
+                            item.width,
+                            item.height,
+                        ),
+                        options,
+                    );
+                });
+            });
+        } else {
+            for item in &work_items {
+                unsafe {
+                    convert::convert_surface_to_rgba_unchecked(
+                        format,
+                        SurfaceLayout::new(
+                            src_base.add(item.src_offset),
+                            src_pitch,
+                            dst_base.add(item.dst_offset),
+                            dst_pitch,
+                            item.width,
+                            item.height,
+                        ),
+                        options,
+                    );
+                }
+            }
+        }
+
+        Ok(work_items.len())
     })();
 
     unsafe {
         context.Unmap(resource, 0);
     }
     convert_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(x: usize, y: usize, width: usize, height: usize) -> DirtyRectWorkItem {
+        DirtyRectWorkItem {
+            src_offset: 0,
+            dst_offset: 0,
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn work_items_overlap_detects_intersection() {
+        let a = item(10, 10, 40, 30);
+        let b = item(30, 20, 20, 20);
+        assert!(work_items_overlap(a, b));
+    }
+
+    #[test]
+    fn work_items_overlap_rejects_edge_touch() {
+        let a = item(10, 10, 20, 20);
+        let b = item(30, 10, 20, 20);
+        assert!(!work_items_overlap(a, b));
+    }
+
+    #[test]
+    fn work_items_non_overlapping_detects_collision() {
+        let work_items = vec![item(0, 0, 32, 32), item(31, 4, 16, 16), item(80, 5, 8, 8)];
+        assert!(!work_items_non_overlapping(&work_items));
+    }
+
+    #[test]
+    fn work_items_non_overlapping_accepts_disjoint_list() {
+        let work_items = vec![item(0, 0, 16, 16), item(20, 0, 12, 16), item(0, 20, 8, 8)];
+        assert!(work_items_non_overlapping(&work_items));
+    }
 }

@@ -340,15 +340,53 @@ pub(crate) fn map_staging_dirty_rects_to_frame(
     hdr_to_sdr: Option<HdrToSdrParams>,
     map_context: &'static str,
 ) -> CaptureResult<usize> {
+    frame.ensure_rgba_capacity(desc.Width, desc.Height)?;
+    map_staging_dirty_rects_to_frame_with_offset(
+        context,
+        staging,
+        staging_resource,
+        desc,
+        frame,
+        dirty_rects,
+        0,
+        0,
+        hdr_to_sdr,
+        map_context,
+    )
+}
+
+/// Map an already-populated staging texture and apply dirty rectangles to the
+/// output frame at an offset destination origin.
+///
+/// Dirty rectangles are in source texture coordinates. They are written to
+/// `frame` at `(dst_origin_x + rect.x, dst_origin_y + rect.y)`.
+pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
+    context: &ID3D11DeviceContext,
+    staging: &ID3D11Texture2D,
+    staging_resource: Option<&ID3D11Resource>,
+    desc: &D3D11_TEXTURE2D_DESC,
+    frame: &mut Frame,
+    dirty_rects: &[DirtyRect],
+    dst_origin_x: u32,
+    dst_origin_y: u32,
+    hdr_to_sdr: Option<HdrToSdrParams>,
+    map_context: &'static str,
+) -> CaptureResult<usize> {
     if dirty_rects.is_empty() {
         return Ok(0);
     }
 
     let width_u32 = desc.Width;
     let height_u32 = desc.Height;
-    frame.ensure_rgba_capacity(width_u32, height_u32)?;
     let width = usize::try_from(width_u32).map_err(|_| CaptureError::BufferOverflow)?;
     let height = usize::try_from(height_u32).map_err(|_| CaptureError::BufferOverflow)?;
+    let dst_origin_x = usize::try_from(dst_origin_x).map_err(|_| CaptureError::BufferOverflow)?;
+    let dst_origin_y = usize::try_from(dst_origin_y).map_err(|_| CaptureError::BufferOverflow)?;
+
+    let dst_width_u32 = frame.width();
+    let dst_height_u32 = frame.height();
+    let dst_width = usize::try_from(dst_width_u32).map_err(|_| CaptureError::BufferOverflow)?;
+    let dst_height = usize::try_from(dst_height_u32).map_err(|_| CaptureError::BufferOverflow)?;
 
     let owned_resource;
     let resource = match staging_resource {
@@ -386,7 +424,9 @@ pub(crate) fn map_staging_dirty_rects_to_frame(
             .ok_or(CaptureError::BufferOverflow)?;
 
         let src_bytes_per_pixel = source_bytes_per_pixel(format);
-        let dst_pitch = width.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+        let dst_pitch = dst_width
+            .checked_mul(4)
+            .ok_or(CaptureError::BufferOverflow)?;
         let dst_base = frame.as_mut_rgba_ptr();
 
         let mut converted = 0usize;
@@ -418,8 +458,24 @@ pub(crate) fn map_staging_dirty_rects_to_frame(
                 return Err(CaptureError::BufferOverflow);
             }
 
+            let dst_x = dst_origin_x
+                .checked_add(x)
+                .ok_or(CaptureError::BufferOverflow)?;
+            let dst_y = dst_origin_y
+                .checked_add(y)
+                .ok_or(CaptureError::BufferOverflow)?;
+            let dst_right = dst_x
+                .checked_add(copy_w)
+                .ok_or(CaptureError::BufferOverflow)?;
+            let dst_bottom = dst_y
+                .checked_add(copy_h)
+                .ok_or(CaptureError::BufferOverflow)?;
+            if dst_right > dst_width || dst_bottom > dst_height {
+                return Err(CaptureError::BufferOverflow);
+            }
+
             let dst_row_bytes = copy_w.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
-            let dst_end_in_row = x
+            let dst_end_in_row = dst_x
                 .checked_mul(4)
                 .and_then(|offset| offset.checked_add(dst_row_bytes))
                 .ok_or(CaptureError::BufferOverflow)?;
@@ -435,9 +491,9 @@ pub(crate) fn map_staging_dirty_rects_to_frame(
                 })
                 .ok_or(CaptureError::BufferOverflow)?;
 
-            let dst_offset = y
+            let dst_offset = dst_y
                 .checked_mul(dst_pitch)
-                .and_then(|base| x.checked_mul(4).and_then(|xoff| base.checked_add(xoff)))
+                .and_then(|base| dst_x.checked_mul(4).and_then(|xoff| base.checked_add(xoff)))
                 .ok_or(CaptureError::BufferOverflow)?;
 
             unsafe {

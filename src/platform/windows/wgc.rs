@@ -15,7 +15,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_BOX, D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_TEXTURE2D_DESC, ID3D11Device,
     ID3D11DeviceContext, ID3D11Query, ID3D11Resource, ID3D11Texture2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_R16G16B16A16_FLOAT};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
 use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_ACCESS_LOST, IDXGIDevice};
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
@@ -89,6 +89,11 @@ fn clamp_dirty_rect(rect: DirtyRect, width: u32, height: u32) -> Option<DirtyRec
     })
 }
 
+fn dirty_region_mode_supported(mode: GraphicsCaptureDirtyRegionMode) -> bool {
+    mode == GraphicsCaptureDirtyRegionMode::ReportOnly
+        || mode == GraphicsCaptureDirtyRegionMode::ReportAndRender
+}
+
 fn extract_dirty_rects(
     frame: &Direct3D11CaptureFrame,
     width: u32,
@@ -97,6 +102,9 @@ fn extract_dirty_rects(
 ) -> Option<GraphicsCaptureDirtyRegionMode> {
     out.clear();
     let mode = frame.DirtyRegionMode().ok()?;
+    if !dirty_region_mode_supported(mode) {
+        return None;
+    }
     let regions = frame.DirtyRegions().ok()?;
     let count = regions.Size().ok()?;
 
@@ -129,6 +137,102 @@ fn extract_dirty_rects(
     }
 
     Some(mode)
+}
+
+fn intersect_dirty_rects(a: DirtyRect, b: DirtyRect) -> Option<DirtyRect> {
+    let a_right = a.x.saturating_add(a.width);
+    let a_bottom = a.y.saturating_add(a.height);
+    let b_right = b.x.saturating_add(b.width);
+    let b_bottom = b.y.saturating_add(b.height);
+
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    let right = a_right.min(b_right);
+    let bottom = a_bottom.min(b_bottom);
+    if right <= x || bottom <= y {
+        return None;
+    }
+
+    Some(DirtyRect {
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+    })
+}
+
+fn extract_region_dirty_rects(
+    frame: &Direct3D11CaptureFrame,
+    source_width: u32,
+    source_height: u32,
+    blit: CaptureBlitRegion,
+    out: &mut Vec<DirtyRect>,
+) -> bool {
+    out.clear();
+    let Some(mode) = frame.DirtyRegionMode().ok() else {
+        return false;
+    };
+    if !dirty_region_mode_supported(mode) {
+        return false;
+    }
+    let Some(regions) = frame.DirtyRegions().ok() else {
+        return false;
+    };
+    let Some(count) = regions.Size().ok() else {
+        return false;
+    };
+
+    let Some(region_bounds) = clamp_dirty_rect(
+        DirtyRect {
+            x: blit.src_x,
+            y: blit.src_y,
+            width: blit.width,
+            height: blit.height,
+        },
+        source_width,
+        source_height,
+    ) else {
+        return false;
+    };
+
+    for idx in 0..count {
+        let Ok(rect) = regions.GetAt(idx) else {
+            continue;
+        };
+
+        if rect.Width <= 0 || rect.Height <= 0 {
+            continue;
+        }
+
+        let x = rect.X.max(0) as u32;
+        let y = rect.Y.max(0) as u32;
+        let rect_width = rect.Width as u32;
+        let rect_height = rect.Height as u32;
+        let Some(clamped) = clamp_dirty_rect(
+            DirtyRect {
+                x,
+                y,
+                width: rect_width,
+                height: rect_height,
+            },
+            source_width,
+            source_height,
+        ) else {
+            continue;
+        };
+
+        let Some(intersection) = intersect_dirty_rects(clamped, region_bounds) else {
+            continue;
+        };
+        out.push(DirtyRect {
+            x: intersection.x.saturating_sub(region_bounds.x),
+            y: intersection.y.saturating_sub(region_bounds.y),
+            width: intersection.width,
+            height: intersection.height,
+        });
+    }
+
+    true
 }
 
 fn should_use_dirty_copy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
@@ -281,12 +385,16 @@ struct WindowsGraphicsCaptureCapturer {
     /// Most recent submitted slot. In recording mode this is read on the
     /// following capture call so GPU copy and CPU conversion overlap.
     pending_slot: Option<usize>,
+    region_slots: [WgcStagingSlot; WGC_STAGING_SLOTS],
+    region_next_write_slot: usize,
+    region_pending_slot: Option<usize>,
     cached_src_desc: Option<D3D11_TEXTURE2D_DESC>,
     /// Last system-relative time, used for duplicate detection.
     last_present_time: i64,
     /// Last present timestamp emitted to callers.
     last_emitted_present_time: i64,
     adaptive_spin_polls: u32,
+    region_adaptive_spin_polls: u32,
     capture_mode: CaptureMode,
     /// HDR-to-SDR tonemap parameters, `Some` when the monitor has HDR enabled.
     hdr_to_sdr: Option<HdrToSdrParams>,
@@ -294,10 +402,7 @@ struct WindowsGraphicsCaptureCapturer {
     gpu_tonemapper: Option<GpuTonemapper>,
     /// GPU F16->sRGB converter for when source is F16 but no HDR tonemap needed.
     gpu_f16_converter: Option<GpuF16Converter>,
-    /// Dedicated staging texture for sub-rect readback (region capture).
-    region_staging: Option<ID3D11Texture2D>,
-    region_staging_resource: Option<ID3D11Resource>,
-    region_staging_key: Option<(u32, u32, DXGI_FORMAT)>,
+    region_blit: Option<CaptureBlitRegion>,
     cursor_config: CursorCaptureConfig,
     has_frame_history: bool,
 }
@@ -439,17 +544,19 @@ impl WindowsGraphicsCaptureCapturer {
             staging_slots: std::array::from_fn(|_| WgcStagingSlot::default()),
             next_write_slot: 0,
             pending_slot: None,
+            region_slots: std::array::from_fn(|_| WgcStagingSlot::default()),
+            region_next_write_slot: 0,
+            region_pending_slot: None,
             cached_src_desc: None,
             last_present_time: 0,
             last_emitted_present_time: 0,
             adaptive_spin_polls: WGC_QUERY_SPIN_INITIAL_POLLS,
+            region_adaptive_spin_polls: WGC_QUERY_SPIN_INITIAL_POLLS,
             capture_mode: CaptureMode::Screenshot,
             hdr_to_sdr,
             gpu_tonemapper,
             gpu_f16_converter,
-            region_staging: None,
-            region_staging_resource: None,
-            region_staging_key: None,
+            region_blit: None,
             cursor_config,
             has_frame_history: false,
         })
@@ -588,9 +695,28 @@ impl WindowsGraphicsCaptureCapturer {
         }
         self.pending_slot = None;
         self.next_write_slot = 0;
+        self.reset_region_pipeline();
         self.has_frame_history = false;
         self.last_emitted_present_time = 0;
         self.adaptive_spin_polls = WGC_QUERY_SPIN_INITIAL_POLLS;
+    }
+
+    fn reset_region_pipeline(&mut self) {
+        for slot in &mut self.region_slots {
+            slot.invalidate();
+        }
+        self.region_pending_slot = None;
+        self.region_next_write_slot = 0;
+        self.region_adaptive_spin_polls = WGC_QUERY_SPIN_INITIAL_POLLS;
+        self.region_blit = None;
+    }
+
+    fn ensure_region_pipeline_for_blit(&mut self, blit: CaptureBlitRegion) {
+        if self.region_blit == Some(blit) {
+            return;
+        }
+        self.reset_region_pipeline();
+        self.region_blit = Some(blit);
     }
 
     fn ensure_staging_slot(
@@ -640,40 +766,120 @@ impl WindowsGraphicsCaptureCapturer {
         Ok(())
     }
 
-    fn ensure_region_staging(
-        &mut self,
+    fn region_desc_for_blit(
         source_desc: &D3D11_TEXTURE2D_DESC,
-        width: u32,
-        height: u32,
-    ) -> CaptureResult<D3D11_TEXTURE2D_DESC> {
+        blit: CaptureBlitRegion,
+    ) -> D3D11_TEXTURE2D_DESC {
         let mut region_desc = *source_desc;
-        region_desc.Width = width;
-        region_desc.Height = height;
+        region_desc.Width = blit.width;
+        region_desc.Height = blit.height;
         region_desc.MipLevels = 1;
         region_desc.ArraySize = 1;
         region_desc.SampleDesc.Count = 1;
         region_desc.SampleDesc.Quality = 0;
+        region_desc
+    }
 
-        let staging = surface::ensure_staging_texture(
-            &self.device,
-            &mut self.region_staging,
-            &region_desc,
-            StagingSampleDesc::SingleSample,
-            "failed to create WGC region staging texture",
-        )?;
+    fn ensure_region_slot(
+        &mut self,
+        slot_idx: usize,
+        desc: &D3D11_TEXTURE2D_DESC,
+    ) -> CaptureResult<()> {
+        let slot = &mut self.region_slots[slot_idx];
+        let needs_recreate = slot.source_desc.is_none_or(|cached| {
+            cached.Width != desc.Width
+                || cached.Height != desc.Height
+                || cached.Format != desc.Format
+                || cached.SampleDesc.Count != desc.SampleDesc.Count
+                || cached.SampleDesc.Quality != desc.SampleDesc.Quality
+        });
 
-        let key = (region_desc.Width, region_desc.Height, region_desc.Format);
-        if self.region_staging_key != Some(key) || self.region_staging_resource.is_none() {
-            self.region_staging_resource = Some(
+        if needs_recreate {
+            slot.staging = None;
+            let staging = surface::ensure_staging_texture(
+                &self.device,
+                &mut slot.staging,
+                desc,
+                StagingSampleDesc::SingleSample,
+                "failed to create WGC region staging texture",
+            )?;
+            slot.staging_resource = Some(
                 staging
                     .cast::<ID3D11Resource>()
                     .context("failed to cast WGC region staging texture to ID3D11Resource")
                     .map_err(CaptureError::Platform)?,
             );
-            self.region_staging_key = Some(key);
+            slot.source_desc = Some(*desc);
+            slot.populated = false;
         }
 
-        Ok(region_desc)
+        if slot.query.is_none() {
+            let query_desc = D3D11_QUERY_DESC {
+                Query: D3D11_QUERY_EVENT,
+                ..Default::default()
+            };
+            let mut query: Option<ID3D11Query> = None;
+            unsafe { self.device.CreateQuery(&query_desc, Some(&mut query)) }
+                .context("CreateQuery for WGC region staging slot failed")
+                .map_err(CaptureError::Platform)?;
+            slot.query = query;
+        }
+        Ok(())
+    }
+
+    fn copy_region_source_to_slot(
+        &mut self,
+        slot_idx: usize,
+        source_resource: &ID3D11Resource,
+        blit: CaptureBlitRegion,
+    ) -> CaptureResult<()> {
+        let staging_resource = self.region_slots[slot_idx]
+            .staging_resource
+            .as_ref()
+            .ok_or_else(|| {
+                CaptureError::Platform(anyhow::anyhow!(
+                    "failed to resolve WGC region staging resource for slot {}",
+                    slot_idx
+                ))
+            })?
+            .clone();
+        let query = self.region_slots[slot_idx].query.clone();
+
+        let src_right = blit
+            .src_x
+            .checked_add(blit.width)
+            .ok_or(CaptureError::BufferOverflow)?;
+        let src_bottom = blit
+            .src_y
+            .checked_add(blit.height)
+            .ok_or(CaptureError::BufferOverflow)?;
+        let source_box = D3D11_BOX {
+            left: blit.src_x,
+            top: blit.src_y,
+            front: 0,
+            right: src_right,
+            bottom: src_bottom,
+            back: 1,
+        };
+
+        unsafe {
+            self.context.CopySubresourceRegion(
+                &staging_resource,
+                0,
+                0,
+                0,
+                0,
+                source_resource,
+                0,
+                Some(&source_box),
+            );
+            if let Some(query) = query.as_ref() {
+                self.context.End(query);
+            }
+        }
+
+        self.region_slots[slot_idx].populated = true;
+        Ok(())
     }
 
     fn copy_source_to_slot(
@@ -816,6 +1022,171 @@ impl WindowsGraphicsCaptureCapturer {
         }
     }
 
+    fn region_slot_query_completed(&self, slot_idx: usize) -> bool {
+        const DO_NOT_FLUSH: u32 = 0x1;
+        let Some(query) = self.region_slots[slot_idx].query.as_ref() else {
+            return false;
+        };
+        self.query_signaled(query, DO_NOT_FLUSH)
+    }
+
+    fn maybe_flush_region_after_submit(&self, write_slot: usize, read_slot: usize) {
+        if write_slot == read_slot || !self.region_slot_query_completed(read_slot) {
+            unsafe {
+                self.context.Flush();
+            }
+        }
+    }
+
+    fn wait_for_region_slot_copy(&mut self, slot_idx: usize) {
+        const DO_NOT_FLUSH: u32 = 0x1;
+        let Some(query) = self.region_slots[slot_idx].query.as_ref() else {
+            return;
+        };
+
+        let mut completed_in_spin = false;
+        for _ in 0..self.region_adaptive_spin_polls {
+            if self.query_signaled(query, DO_NOT_FLUSH) {
+                completed_in_spin = true;
+                break;
+            }
+            std::hint::spin_loop();
+        }
+
+        if completed_in_spin {
+            self.region_adaptive_spin_polls = self
+                .region_adaptive_spin_polls
+                .saturating_sub(1)
+                .max(WGC_QUERY_SPIN_MIN_POLLS);
+        } else {
+            self.region_adaptive_spin_polls = self
+                .region_adaptive_spin_polls
+                .saturating_add(WGC_QUERY_SPIN_INCREASE_STEP)
+                .min(WGC_QUERY_SPIN_MAX_POLLS);
+        }
+    }
+
+    fn read_region_slot_into_output(
+        &mut self,
+        slot_idx: usize,
+        out: &mut Frame,
+        destination_has_history: bool,
+        blit: CaptureBlitRegion,
+    ) -> CaptureResult<CaptureSampleMetadata> {
+        if !self.region_slots[slot_idx].populated {
+            return Err(CaptureError::Timeout);
+        }
+
+        let slot = &self.region_slots[slot_idx];
+        let source_desc = slot.source_desc.ok_or_else(|| {
+            CaptureError::Platform(anyhow::anyhow!(
+                "WGC region slot is populated but missing source descriptor"
+            ))
+        })?;
+        let capture_time = slot.capture_time.unwrap_or_else(Instant::now);
+        let present_time_ticks = slot.present_time_ticks;
+        let source_duplicate = slot.is_duplicate;
+
+        let emitted_duplicate =
+            present_time_ticks != 0 && present_time_ticks == self.last_emitted_present_time;
+        let sample = CaptureSampleMetadata {
+            capture_time: Some(capture_time),
+            present_time_qpc: if present_time_ticks != 0 {
+                Some(present_time_ticks)
+            } else {
+                None
+            },
+            is_duplicate: source_duplicate || emitted_duplicate,
+        };
+
+        if destination_has_history && sample.is_duplicate {
+            if present_time_ticks != 0 {
+                self.last_emitted_present_time = present_time_ticks;
+            }
+            return Ok(sample);
+        }
+
+        self.wait_for_region_slot_copy(slot_idx);
+
+        let map_result = (|| -> CaptureResult<()> {
+            let slot = &self.region_slots[slot_idx];
+            let staging = slot.staging.as_ref().ok_or_else(|| {
+                CaptureError::Platform(anyhow::anyhow!(
+                    "WGC region slot is populated but missing staging texture"
+                ))
+            })?;
+            let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
+                CaptureError::Platform(anyhow::anyhow!(
+                    "WGC region slot is populated but missing staging resource"
+                ))
+            })?;
+
+            let use_dirty_copy = destination_has_history
+                && slot.dirty_mode_available
+                && !slot.dirty_rects.is_empty()
+                && should_use_dirty_copy(&slot.dirty_rects, source_desc.Width, source_desc.Height);
+
+            if use_dirty_copy {
+                match surface::map_staging_dirty_rects_to_frame_with_offset(
+                    &self.context,
+                    staging,
+                    Some(staging_resource),
+                    &source_desc,
+                    out,
+                    &slot.dirty_rects,
+                    blit.dst_x,
+                    blit.dst_y,
+                    slot.hdr_to_sdr,
+                    "failed to map WGC region staging texture (dirty regions)",
+                ) {
+                    Ok(converted) if converted > 0 => Ok(()),
+                    Ok(_) | Err(_) => surface::map_staging_rect_to_frame(
+                        &self.context,
+                        staging,
+                        Some(staging_resource),
+                        &source_desc,
+                        out,
+                        CaptureBlitRegion {
+                            src_x: 0,
+                            src_y: 0,
+                            width: source_desc.Width,
+                            height: source_desc.Height,
+                            dst_x: blit.dst_x,
+                            dst_y: blit.dst_y,
+                        },
+                        slot.hdr_to_sdr,
+                        "failed to map WGC region staging texture",
+                    ),
+                }
+            } else {
+                surface::map_staging_rect_to_frame(
+                    &self.context,
+                    staging,
+                    Some(staging_resource),
+                    &source_desc,
+                    out,
+                    CaptureBlitRegion {
+                        src_x: 0,
+                        src_y: 0,
+                        width: source_desc.Width,
+                        height: source_desc.Height,
+                        dst_x: blit.dst_x,
+                        dst_y: blit.dst_y,
+                    },
+                    slot.hdr_to_sdr,
+                    "failed to map WGC region staging texture",
+                )
+            }
+        })();
+
+        map_result?;
+
+        if present_time_ticks != 0 {
+            self.last_emitted_present_time = present_time_ticks;
+        }
+        Ok(sample)
+    }
+
     fn read_slot_into_output(
         &mut self,
         slot_idx: usize,
@@ -948,6 +1319,7 @@ impl WindowsGraphicsCaptureCapturer {
         // and region capture cannot consume stale pending slots.
         self.pending_slot = None;
         self.next_write_slot = 0;
+        self.ensure_region_pipeline_for_blit(blit);
 
         let allow_stale_return =
             self.capture_mode == CaptureMode::ScreenRecording && destination_has_history;
@@ -956,6 +1328,11 @@ impl WindowsGraphicsCaptureCapturer {
         let maybe_capture = self.acquire_next_frame_or_stale_region(allow_stale_return)?;
         let (capture_frame, time_ticks) = if let Some(capture) = maybe_capture {
             capture
+        } else if let Some(slot_idx) = self.region_pending_slot {
+            let sample =
+                self.read_region_slot_into_output(slot_idx, out, destination_has_history, blit)?;
+            self.has_frame_history = true;
+            return Ok(sample);
         } else {
             return Ok(CaptureSampleMetadata {
                 capture_time: Some(capture_time),
@@ -969,27 +1346,8 @@ impl WindowsGraphicsCaptureCapturer {
         if time_ticks != 0 {
             self.last_present_time = time_ticks;
         }
-        let emitted_duplicate = time_ticks != 0 && time_ticks == self.last_emitted_present_time;
-        let is_duplicate = source_is_duplicate || emitted_duplicate;
-
-        let sample = CaptureSampleMetadata {
-            capture_time: Some(capture_time),
-            present_time_qpc: if time_ticks != 0 {
-                Some(time_ticks)
-            } else {
-                None
-            },
-            is_duplicate,
-        };
 
         let capture_result = (|| -> CaptureResult<CaptureSampleMetadata> {
-            if destination_has_history && sample.is_duplicate {
-                if time_ticks != 0 {
-                    self.last_emitted_present_time = time_ticks;
-                }
-                return Ok(sample);
-            }
-
             self.recreate_pool_if_needed(&capture_frame)?;
 
             let frame_surface = capture_frame.Surface().map_err(|error| {
@@ -1058,66 +1416,63 @@ impl WindowsGraphicsCaptureCapturer {
                 return Err(CaptureError::BufferOverflow);
             }
 
-            let region_desc =
-                self.ensure_region_staging(&effective_desc, blit.width, blit.height)?;
-            let staging_texture = self.region_staging.as_ref().ok_or_else(|| {
-                CaptureError::Platform(anyhow::anyhow!(
-                    "WGC region staging texture is missing after initialization"
-                ))
-            })?;
-            let staging_resource = self.region_staging_resource.as_ref().ok_or_else(|| {
-                CaptureError::Platform(anyhow::anyhow!(
-                    "WGC region staging resource is missing after initialization"
-                ))
-            })?;
-
-            let source_resource: ID3D11Resource = effective_source
-                .cast()
-                .context("failed to cast WGC region source texture to ID3D11Resource")
-                .map_err(CaptureError::Platform)?;
-            let source_box = D3D11_BOX {
-                left: blit.src_x,
-                top: blit.src_y,
-                front: 0,
-                right: src_right,
-                bottom: src_bottom,
-                back: 1,
+            let region_desc = Self::region_desc_for_blit(&effective_desc, blit);
+            let write_slot = if self.capture_mode == CaptureMode::ScreenRecording {
+                self.region_next_write_slot % WGC_STAGING_SLOTS
+            } else {
+                0
             };
-            unsafe {
-                self.context.CopySubresourceRegion(
-                    staging_resource,
-                    0,
-                    0,
-                    0,
-                    0,
-                    &source_resource,
-                    0,
-                    Some(&source_box),
-                );
-                self.context.Flush();
+            let read_slot = if self.capture_mode == CaptureMode::ScreenRecording {
+                self.region_pending_slot.unwrap_or(write_slot)
+            } else {
+                write_slot
+            };
+
+            let skip_submit_copy = self.capture_mode == CaptureMode::ScreenRecording
+                && source_is_duplicate
+                && self.region_pending_slot.is_some();
+            if !skip_submit_copy {
+                self.ensure_region_slot(write_slot, &region_desc)?;
+                {
+                    let slot = &mut self.region_slots[write_slot];
+                    let dirty_mode_available = extract_region_dirty_rects(
+                        &capture_frame,
+                        effective_desc.Width,
+                        effective_desc.Height,
+                        blit,
+                        &mut slot.dirty_rects,
+                    );
+                    slot.dirty_mode_available = dirty_mode_available;
+                    if !dirty_mode_available {
+                        slot.dirty_rects.clear();
+                    }
+                    let region_unchanged = dirty_mode_available && slot.dirty_rects.is_empty();
+                    slot.capture_time = Some(capture_time);
+                    slot.present_time_ticks = time_ticks;
+                    slot.is_duplicate = source_is_duplicate || region_unchanged;
+                    slot.hdr_to_sdr = effective_hdr;
+                    slot.source_desc = Some(region_desc);
+                }
+
+                let source_resource: ID3D11Resource = effective_source
+                    .cast()
+                    .context("failed to cast WGC region source texture to ID3D11Resource")
+                    .map_err(CaptureError::Platform)?;
+                self.copy_region_source_to_slot(write_slot, &source_resource, blit)?;
+                self.maybe_flush_region_after_submit(write_slot, read_slot);
             }
 
-            let staging_blit = CaptureBlitRegion {
-                src_x: 0,
-                src_y: 0,
-                width: blit.width,
-                height: blit.height,
-                dst_x: blit.dst_x,
-                dst_y: blit.dst_y,
-            };
-            surface::map_staging_rect_to_frame(
-                &self.context,
-                staging_texture,
-                Some(staging_resource),
-                &region_desc,
-                out,
-                staging_blit,
-                effective_hdr,
-                "failed to map WGC region staging texture",
-            )?;
+            let sample =
+                self.read_region_slot_into_output(read_slot, out, destination_has_history, blit)?;
 
-            if time_ticks != 0 {
-                self.last_emitted_present_time = time_ticks;
+            if self.capture_mode == CaptureMode::ScreenRecording {
+                if !skip_submit_copy {
+                    self.region_pending_slot = Some(write_slot);
+                    self.region_next_write_slot = (write_slot + 1) % WGC_STAGING_SLOTS;
+                }
+            } else {
+                self.region_pending_slot = None;
+                self.region_next_write_slot = 0;
             }
 
             Ok(sample)
@@ -1130,6 +1485,7 @@ impl WindowsGraphicsCaptureCapturer {
                 Ok(sample)
             }
             Err(err) => {
+                self.reset_region_pipeline();
                 self.has_frame_history = false;
                 Err(err)
             }
@@ -1137,6 +1493,10 @@ impl WindowsGraphicsCaptureCapturer {
     }
 
     fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
+        self.region_pending_slot = None;
+        self.region_next_write_slot = 0;
+        self.region_blit = None;
+
         let mut out = reuse.unwrap_or_else(Frame::empty);
         let destination_has_history =
             out.metadata.capture_time.is_some() && !out.as_rgba_bytes().is_empty();
@@ -1493,5 +1853,60 @@ mod tests {
             WGC_DIRTY_COPY_MAX_RECTS + 1
         ];
         assert!(!should_use_dirty_copy(&rects, 1920, 1080));
+    }
+
+    #[test]
+    fn intersect_dirty_rects_returns_overlap() {
+        let a = DirtyRect {
+            x: 100,
+            y: 50,
+            width: 200,
+            height: 120,
+        };
+        let b = DirtyRect {
+            x: 220,
+            y: 100,
+            width: 160,
+            height: 120,
+        };
+        let overlap = intersect_dirty_rects(a, b).expect("expected overlap");
+        assert_eq!(
+            overlap,
+            DirtyRect {
+                x: 220,
+                y: 100,
+                width: 80,
+                height: 70,
+            }
+        );
+    }
+
+    #[test]
+    fn intersect_dirty_rects_returns_none_for_disjoint_rects() {
+        let a = DirtyRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let b = DirtyRect {
+            x: 200,
+            y: 200,
+            width: 50,
+            height: 50,
+        };
+        assert!(intersect_dirty_rects(a, b).is_none());
+    }
+
+    #[test]
+    fn dirty_region_mode_guard_rejects_unknown_mode_values() {
+        let unknown = GraphicsCaptureDirtyRegionMode(-1);
+        assert!(!dirty_region_mode_supported(unknown));
+        assert!(dirty_region_mode_supported(
+            GraphicsCaptureDirtyRegionMode::ReportOnly
+        ));
+        assert!(dirty_region_mode_supported(
+            GraphicsCaptureDirtyRegionMode::ReportAndRender
+        ));
     }
 }

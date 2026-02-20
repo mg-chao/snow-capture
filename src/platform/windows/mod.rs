@@ -72,9 +72,7 @@ impl WindowsBackend {
             CaptureBackendKind::WindowsGraphicsCapture => {
                 Ok(Box::new(wgc::WindowsWindowCapturer::new(window)?))
             }
-            CaptureBackendKind::Gdi => {
-                Ok(Box::new(gdi::WindowsWindowCapturer::new(window)?))
-            }
+            CaptureBackendKind::Gdi => Ok(Box::new(gdi::WindowsWindowCapturer::new(window)?)),
         }
     }
 

@@ -1,4 +1,4 @@
-﻿use std::ffi::c_void;
+use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::null_mut;
 use std::sync::Arc;
@@ -305,19 +305,8 @@ impl GdiResources {
                 )));
             }
 
-            let blit_result = unsafe {
-                BitBlt(
-                    self.mem_dc,
-                    0,
-                    0,
-                    width,
-                    height,
-                    window_dc,
-                    0,
-                    0,
-                    SRCCOPY,
-                )
-            };
+            let blit_result =
+                unsafe { BitBlt(self.mem_dc, 0, 0, width, height, window_dc, 0, 0, SRCCOPY) };
 
             unsafe {
                 let _ = ReleaseDC(hwnd, window_dc);
@@ -409,10 +398,10 @@ impl WindowsMonitorCapturer {
         // When backed by the event-driven DisplayInfoCache, skip the
         // refresh entirely if the generation hasn't changed — no
         // WM_DISPLAYCHANGE has fired since our last check.
-        if let (Some(current), Some(last)) = (current_gen, self.last_display_generation) {
-            if current == last {
-                return Ok(());
-            }
+        if let (Some(current), Some(last)) = (current_gen, self.last_display_generation)
+            && current == last
+        {
+            return Ok(());
         }
 
         self.last_display_generation = current_gen;
@@ -457,9 +446,9 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
 
 use crate::backend::MonitorCapturer;
 use crate::window::WindowId;
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic, IsWindow, IsWindowVisible};
-use windows::Win32::Foundation::RECT;
 
 pub(crate) struct WindowsWindowCapturer {
     _com: CoInitGuard,
@@ -507,14 +496,10 @@ impl MonitorCapturer for WindowsWindowCapturer {
             ));
         }
         if unsafe { IsIconic(self.hwnd) }.as_bool() {
-            return Err(CaptureError::InvalidTarget(
-                "window is minimized".into(),
-            ));
+            return Err(CaptureError::InvalidTarget("window is minimized".into()));
         }
         if !unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
-            return Err(CaptureError::InvalidTarget(
-                "window is not visible".into(),
-            ));
+            return Err(CaptureError::InvalidTarget("window is not visible".into()));
         }
 
         let mut rect = RECT::default();

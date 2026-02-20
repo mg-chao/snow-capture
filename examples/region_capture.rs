@@ -3,8 +3,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use snow_capture::{
-    CaptureMode, CaptureRegion, CaptureSession, CaptureTarget,
-    backend::CaptureBackendKind,
+    CaptureMode, CaptureRegion, CaptureSession, CaptureTarget, backend::CaptureBackendKind,
     frame::Frame,
 };
 
@@ -57,12 +56,15 @@ fn capture_region_to_png(
 
 fn main() -> Result<()> {
     // Region from (-500, 0) to (500, 1000) in virtual desktop coordinates.
-    let region = CaptureRegion::new(-500, 0, 1000, 1000)
-        .context("failed to create capture region")?;
+    let region =
+        CaptureRegion::new(-500, 0, 1000, 1000).context("failed to create capture region")?;
 
     println!(
         "Capturing region: ({}, {}) to ({}, {})\n",
-        region.x, region.y, region.x as i64 + region.width as i64, region.y as i64 + region.height as i64,
+        region.x,
+        region.y,
+        region.x as i64 + region.width as i64,
+        region.y as i64 + region.height as i64,
     );
 
     capture_region_to_png(

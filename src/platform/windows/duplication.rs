@@ -3,11 +3,11 @@ use std::time::Instant;
 
 use anyhow::Context;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext,
-    ID3D11Query, ID3D11Resource, ID3D11Texture2D,
+    D3D11_BOX, D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_TEXTURE2D_DESC, ID3D11Device,
+    ID3D11DeviceContext, ID3D11Query, ID3D11Resource, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
 };
 use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
@@ -17,7 +17,7 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::core::Interface;
 
-use crate::backend::{CaptureMode, CursorCaptureConfig};
+use crate::backend::{CaptureBlitRegion, CaptureMode, CaptureSampleMetadata, CursorCaptureConfig};
 use crate::convert::HdrToSdrParams;
 use crate::error::{CaptureError, CaptureResult};
 use crate::frame::{CursorData, DirtyRect, Frame};
@@ -270,7 +270,7 @@ impl StagingRing {
         desc: &D3D11_TEXTURE2D_DESC,
     ) -> CaptureResult<()> {
         let key = (desc.Width, desc.Height, desc.Format);
-        let needs_recreate = self.cached_desc.map_or(true, |cached| cached != key);
+        let needs_recreate = self.cached_desc != Some(key);
 
         if needs_recreate {
             for i in 0..STAGING_SLOTS {
@@ -344,7 +344,7 @@ impl StagingRing {
         // ensuring the copy starts promptly when we need the result
         // on the next call.
         if let Some(ridx) = read_idx {
-            let needs_flush = self.queries[ridx].as_ref().map_or(true, |q| {
+            let needs_flush = self.queries[ridx].as_ref().is_none_or(|q| {
                 let mut data: u32 = 0;
                 // D3D11_ASYNC_GETDATA_DONOTFLUSH = 0x1
                 unsafe {
@@ -644,6 +644,10 @@ struct OutputCapturer {
     /// doesn't pass one via `capture_frame_reuse`.  Avoids repeated
     /// large-page VirtualAlloc/VirtualFree cycles.
     spare_frame: Option<Frame>,
+    /// Dedicated staging texture for sub-rect readback (window/region capture).
+    region_staging: Option<ID3D11Texture2D>,
+    region_staging_resource: Option<ID3D11Resource>,
+    region_staging_key: Option<(u32, u32, DXGI_FORMAT)>,
     output: IDXGIOutput,
     hdr_to_sdr: Option<HdrToSdrParams>,
     gpu_tonemapper: Option<GpuTonemapper>,
@@ -684,6 +688,9 @@ impl OutputCapturer {
             pending_hdr: None,
             cached_src_desc: None,
             spare_frame: None,
+            region_staging: None,
+            region_staging_resource: None,
+            region_staging_key: None,
             output: resolved.output.clone(),
             hdr_to_sdr,
             gpu_tonemapper,
@@ -700,6 +707,9 @@ impl OutputCapturer {
         self.pending_desc = None;
         self.pending_hdr = None;
         self.cached_src_desc = None;
+        self.region_staging = None;
+        self.region_staging_resource = None;
+        self.region_staging_key = None;
         self.duplication = create_duplication(&self.output, &self.device)?;
         self.needs_presented_first_frame = true;
         Ok(())
@@ -714,6 +724,226 @@ impl OutputCapturer {
         self.pending_desc = None;
         self.pending_hdr = None;
         self.staging_ring.reset_pipeline();
+    }
+
+    fn effective_source(
+        &mut self,
+        desktop_texture: &ID3D11Texture2D,
+        src_desc: D3D11_TEXTURE2D_DESC,
+    ) -> CaptureResult<(
+        ID3D11Texture2D,
+        D3D11_TEXTURE2D_DESC,
+        Option<HdrToSdrParams>,
+    )> {
+        if src_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT {
+            return Ok((desktop_texture.clone(), src_desc, self.hdr_to_sdr));
+        }
+
+        if let (Some(params), Some(tonemapper)) = (self.hdr_to_sdr, self.gpu_tonemapper.as_mut()) {
+            let output = tonemapper.tonemap(
+                &self.device,
+                &self.context,
+                desktop_texture,
+                &src_desc,
+                params.sanitized(),
+            )?;
+            let mut out_desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { output.GetDesc(&mut out_desc) };
+            return Ok((output.clone(), out_desc, None));
+        }
+
+        if let Some(converter) = self.gpu_f16_converter.as_mut() {
+            let output =
+                converter.convert(&self.device, &self.context, desktop_texture, &src_desc)?;
+            let mut out_desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { output.GetDesc(&mut out_desc) };
+            return Ok((output.clone(), out_desc, None));
+        }
+
+        Ok((desktop_texture.clone(), src_desc, self.hdr_to_sdr))
+    }
+
+    fn ensure_region_staging(
+        &mut self,
+        source_desc: &D3D11_TEXTURE2D_DESC,
+        width: u32,
+        height: u32,
+    ) -> CaptureResult<D3D11_TEXTURE2D_DESC> {
+        let mut region_desc = *source_desc;
+        region_desc.Width = width;
+        region_desc.Height = height;
+        region_desc.MipLevels = 1;
+        region_desc.ArraySize = 1;
+        region_desc.SampleDesc.Count = 1;
+        region_desc.SampleDesc.Quality = 0;
+
+        let staging = surface::ensure_staging_texture(
+            &self.device,
+            &mut self.region_staging,
+            &region_desc,
+            StagingSampleDesc::SingleSample,
+            "failed to create region staging texture",
+        )?;
+
+        let key = (region_desc.Width, region_desc.Height, region_desc.Format);
+        if self.region_staging_key != Some(key) || self.region_staging_resource.is_none() {
+            self.region_staging_resource = Some(
+                staging
+                    .cast::<ID3D11Resource>()
+                    .context("failed to cast region staging texture to ID3D11Resource")
+                    .map_err(CaptureError::Platform)?,
+            );
+            self.region_staging_key = Some(key);
+        }
+
+        Ok(region_desc)
+    }
+
+    fn capture_region_into(
+        &mut self,
+        blit: CaptureBlitRegion,
+        destination: &mut Frame,
+        destination_has_history: bool,
+    ) -> CaptureResult<CaptureSampleMetadata> {
+        if blit.width == 0 || blit.height == 0 {
+            return Err(CaptureError::InvalidConfig(
+                "capture region dimensions must be non-zero".into(),
+            ));
+        }
+
+        // Region capture uses its own sub-rect staging path.
+        // Reset full-frame pipeline state so monitor capture and region
+        // capture don't consume stale pending slots when callers switch targets.
+        self.pending_desc = None;
+        self.pending_hdr = None;
+        self.staging_ring.reset_pipeline();
+
+        let capture_time = Instant::now();
+        let (desktop_texture, frame_info) =
+            match acquire_frame(&self.duplication, self.needs_presented_first_frame)? {
+                AcquireResult::Ok(texture, info) => (texture, info),
+                AcquireResult::AccessLost => {
+                    self.recreate_duplication()?;
+                    match acquire_frame(&self.duplication, self.needs_presented_first_frame)? {
+                        AcquireResult::Ok(texture, info) => (texture, info),
+                        AcquireResult::AccessLost => return Err(CaptureError::AccessLost),
+                    }
+                }
+            };
+
+        let present_time_qpc = if frame_info.LastPresentTime != 0 {
+            Some(frame_info.LastPresentTime)
+        } else {
+            None
+        };
+        let is_duplicate =
+            frame_info.LastPresentTime != 0 && frame_info.LastPresentTime == self.last_present_time;
+        if frame_info.LastPresentTime != 0 {
+            self.last_present_time = frame_info.LastPresentTime;
+        }
+
+        let sample = CaptureSampleMetadata {
+            capture_time: Some(capture_time),
+            present_time_qpc,
+            is_duplicate,
+        };
+
+        let capture_result = (|| -> CaptureResult<CaptureSampleMetadata> {
+            if destination_has_history && sample.is_duplicate {
+                return Ok(sample);
+            }
+
+            let src_desc = match self.cached_src_desc {
+                Some(desc) => desc,
+                None => {
+                    let mut desc = D3D11_TEXTURE2D_DESC::default();
+                    unsafe { desktop_texture.GetDesc(&mut desc) };
+                    self.cached_src_desc = Some(desc);
+                    desc
+                }
+            };
+
+            let (effective_source, effective_desc, effective_hdr) =
+                self.effective_source(&desktop_texture, src_desc)?;
+
+            let src_right = blit
+                .src_x
+                .checked_add(blit.width)
+                .ok_or(CaptureError::BufferOverflow)?;
+            let src_bottom = blit
+                .src_y
+                .checked_add(blit.height)
+                .ok_or(CaptureError::BufferOverflow)?;
+            if src_right > effective_desc.Width || src_bottom > effective_desc.Height {
+                return Err(CaptureError::BufferOverflow);
+            }
+
+            let region_desc =
+                self.ensure_region_staging(&effective_desc, blit.width, blit.height)?;
+            let staging_texture = self.region_staging.as_ref().ok_or_else(|| {
+                CaptureError::Platform(anyhow::anyhow!(
+                    "region staging texture is missing after initialization"
+                ))
+            })?;
+            let staging_resource = self.region_staging_resource.as_ref().ok_or_else(|| {
+                CaptureError::Platform(anyhow::anyhow!(
+                    "region staging resource is missing after initialization"
+                ))
+            })?;
+
+            let source_resource: ID3D11Resource = effective_source
+                .cast()
+                .context("failed to cast region source texture to ID3D11Resource")
+                .map_err(CaptureError::Platform)?;
+            let source_box = D3D11_BOX {
+                left: blit.src_x,
+                top: blit.src_y,
+                front: 0,
+                right: src_right,
+                bottom: src_bottom,
+                back: 1,
+            };
+            unsafe {
+                self.context.CopySubresourceRegion(
+                    staging_resource,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &source_resource,
+                    0,
+                    Some(&source_box),
+                );
+                self.context.Flush();
+            }
+
+            let staging_blit = CaptureBlitRegion {
+                src_x: 0,
+                src_y: 0,
+                width: blit.width,
+                height: blit.height,
+                dst_x: blit.dst_x,
+                dst_y: blit.dst_y,
+            };
+            surface::map_staging_rect_to_frame(
+                &self.context,
+                staging_texture,
+                Some(staging_resource),
+                &region_desc,
+                destination,
+                staging_blit,
+                effective_hdr,
+                "failed to map staging texture for region capture",
+            )?;
+
+            Ok(sample)
+        })();
+
+        unsafe {
+            self.duplication.ReleaseFrame().ok();
+        }
+        self.needs_presented_first_frame = false;
+        capture_result
     }
 
     fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
@@ -775,38 +1005,8 @@ impl OutputCapturer {
             }
         };
 
-        // GPU tonemap path: if HDR and source is f16, run compute shader on GPU
-        let (effective_source, effective_desc, effective_hdr) = if src_desc.Format
-            == DXGI_FORMAT_R16G16B16A16_FLOAT
-        {
-            if let (Some(params), Some(tonemapper)) =
-                (self.hdr_to_sdr, self.gpu_tonemapper.as_mut())
-            {
-                let output = tonemapper.tonemap(
-                    &self.device,
-                    &self.context,
-                    &desktop_texture,
-                    &src_desc,
-                    params.sanitized(),
-                )?;
-                let mut out_desc = D3D11_TEXTURE2D_DESC::default();
-                unsafe { output.GetDesc(&mut out_desc) };
-                (output.clone(), out_desc, None)
-            } else if let Some(converter) = self.gpu_f16_converter.as_mut() {
-                // No HDR tonemap needed, but source is F16 -- convert
-                // to RGBA8 sRGB on the GPU to avoid the expensive
-                // CPU-side F16->sRGB SIMD path.
-                let output =
-                    converter.convert(&self.device, &self.context, &desktop_texture, &src_desc)?;
-                let mut out_desc = D3D11_TEXTURE2D_DESC::default();
-                unsafe { output.GetDesc(&mut out_desc) };
-                (output.clone(), out_desc, None)
-            } else {
-                (desktop_texture.clone(), src_desc, self.hdr_to_sdr)
-            }
-        } else {
-            (desktop_texture.clone(), src_desc, self.hdr_to_sdr)
-        };
+        let (effective_source, effective_desc, effective_hdr) =
+            self.effective_source(&desktop_texture, src_desc)?;
 
         // Ensure staging ring has matching textures.
         self.staging_ring
@@ -816,14 +1016,13 @@ impl OutputCapturer {
                 .staging_ring
                 .submit_copy(&self.context, &effective_source);
 
-            if let (Some(slot), Some(ref prev_desc)) = (read_slot, self.pending_desc.as_ref()) {
+            if let (Some(slot), Some(prev_desc)) = (read_slot, self.pending_desc.as_ref()) {
                 // Read back the previous slot while the next copy is in flight.
-                let prev_desc = *prev_desc;
                 let prev_hdr = self.pending_hdr;
                 self.staging_ring.read_slot(
                     &self.context,
                     slot,
-                    &prev_desc,
+                    prev_desc,
                     &mut frame,
                     prev_hdr,
                 )?;
@@ -916,6 +1115,34 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
         }
     }
 
+    fn capture_region_into(
+        &mut self,
+        blit: CaptureBlitRegion,
+        destination: &mut Frame,
+        destination_has_history: bool,
+    ) -> CaptureResult<Option<CaptureSampleMetadata>> {
+        let result = self
+            .output
+            .capture_region_into(blit, destination, destination_has_history);
+        match result {
+            Ok(sample) => Ok(Some(sample)),
+            Err(CaptureError::MonitorLost) | Err(CaptureError::AccessLost) => {
+                let resolved = self.resolver.resolve_monitor(&self.monitor)?;
+                self.output = with_monitor_context(
+                    OutputCapturer::new(&resolved),
+                    &self.monitor,
+                    "reinitialize",
+                )?;
+                self.output.cursor_config = self.cursor_config;
+                self.output.set_capture_mode(self.capture_mode);
+                self.output
+                    .capture_region_into(blit, destination, destination_has_history)
+                    .map(Some)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     fn set_capture_mode(&mut self, mode: CaptureMode) {
         self.capture_mode = mode;
         self.output.set_capture_mode(mode);
@@ -928,37 +1155,27 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
 }
 
 // ---------------------------------------------------------------------------
-// DXGI-based window capture: captures the monitor containing the window,
-// then crops to the window's desktop bounds.  Falls back with
-// `BackendUnavailable` when the window spans multiple monitors or has
-// invalid geometry so the auto-backend policy can try WGC/GDI.
+// DXGI-based window capture: captures only the window's visible monitor
+// sub-rectangle via CopySubresourceRegion, avoiding full-monitor readback
+// and CPU-side cropping.
 // ---------------------------------------------------------------------------
 
+use crate::window::WindowId;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::HMONITOR;
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, IsIconic, IsWindow,
-};
-use crate::window::WindowId;
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic, IsWindow};
 
 /// Find the monitor that contains the majority of the given window.
 fn monitor_from_window(hwnd: HWND) -> Option<HMONITOR> {
-    use windows::Win32::Graphics::Gdi::MonitorFromWindow;
     use windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONULL;
+    use windows::Win32::Graphics::Gdi::MonitorFromWindow;
     let hmon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) };
-    if hmon.0.is_null() {
-        None
-    } else {
-        Some(hmon)
-    }
+    if hmon.0.is_null() { None } else { Some(hmon) }
 }
 
 /// Resolve a `HMONITOR` handle to a `MonitorId` by matching against the
 /// known monitor set from the resolver.
-fn hmonitor_to_monitor_id(
-    hmon: HMONITOR,
-    resolver: &MonitorResolver,
-) -> CaptureResult<MonitorId> {
+fn hmonitor_to_monitor_id(hmon: HMONITOR, resolver: &MonitorResolver) -> CaptureResult<MonitorId> {
     let monitors = resolver.enumerate_monitors()?;
     let target_handle = hmon.0 as isize;
     monitors
@@ -1015,12 +1232,8 @@ pub(crate) struct WindowsDxgiWindowCapturer {
 }
 
 impl WindowsDxgiWindowCapturer {
-    pub(crate) fn new(
-        window: &WindowId,
-        resolver: Arc<MonitorResolver>,
-    ) -> CaptureResult<Self> {
-        let com = super::com::CoInitGuard::init_multithreaded()
-            .map_err(CaptureError::Platform)?;
+    pub(crate) fn new(window: &WindowId, resolver: Arc<MonitorResolver>) -> CaptureResult<Self> {
+        let com = super::com::CoInitGuard::init_multithreaded().map_err(CaptureError::Platform)?;
         let hwnd = HWND(window.raw_handle() as *mut std::ffi::c_void);
 
         if hwnd.0.is_null() {
@@ -1037,9 +1250,7 @@ impl WindowsDxgiWindowCapturer {
         }
 
         let hmon = monitor_from_window(hwnd).ok_or_else(|| {
-            CaptureError::BackendUnavailable(
-                "window is not on any monitor".into(),
-            )
+            CaptureError::BackendUnavailable("window is not on any monitor".into())
         })?;
 
         let monitor_id = hmonitor_to_monitor_id(hmon, &resolver)?;
@@ -1073,54 +1284,37 @@ impl WindowsDxgiWindowCapturer {
         Ok(())
     }
 
-    /// Crop a full-monitor frame to the window's desktop bounds.
-    fn crop_to_window(
-        &self,
-        monitor_frame: &Frame,
+    fn window_blit_on_monitor(
         mon_rect: &RECT,
         win_rect: &RECT,
-    ) -> CaptureResult<Frame> {
+    ) -> CaptureResult<CaptureBlitRegion> {
         let mon_w = (mon_rect.right - mon_rect.left) as u32;
         let mon_h = (mon_rect.bottom - mon_rect.top) as u32;
 
-        // Clamp window rect to monitor bounds.
-        let cx = (win_rect.left.max(mon_rect.left) - mon_rect.left) as u32;
-        let cy = (win_rect.top.max(mon_rect.top) - mon_rect.top) as u32;
-        let cx2 = (win_rect.right.min(mon_rect.right) - mon_rect.left) as u32;
-        let cy2 = (win_rect.bottom.min(mon_rect.bottom) - mon_rect.top) as u32;
+        let src_x = (win_rect.left.max(mon_rect.left) - mon_rect.left) as u32;
+        let src_y = (win_rect.top.max(mon_rect.top) - mon_rect.top) as u32;
+        let right = (win_rect.right.min(mon_rect.right) - mon_rect.left) as u32;
+        let bottom = (win_rect.bottom.min(mon_rect.bottom) - mon_rect.top) as u32;
 
-        if cx >= cx2 || cy >= cy2 || cx2 > mon_w || cy2 > mon_h {
+        if src_x >= right || src_y >= bottom || right > mon_w || bottom > mon_h {
             return Err(CaptureError::InvalidTarget(
                 "window has no visible area on its monitor".into(),
             ));
         }
 
-        let crop_w = cx2 - cx;
-        let crop_h = cy2 - cy;
-
-        let mut out = Frame::empty();
-        out.ensure_rgba_capacity(crop_w, crop_h)?;
-
-        let src = monitor_frame.as_rgba_bytes();
-        let dst = out.as_mut_rgba_bytes();
-        let src_stride = mon_w as usize * 4;
-        let dst_stride = crop_w as usize * 4;
-
-        for row in 0..crop_h as usize {
-            let s_off = (cy as usize + row) * src_stride + cx as usize * 4;
-            let d_off = row * dst_stride;
-            if s_off + dst_stride <= src.len() && d_off + dst_stride <= dst.len() {
-                dst[d_off..d_off + dst_stride]
-                    .copy_from_slice(&src[s_off..s_off + dst_stride]);
-            }
-        }
-
-        Ok(out)
+        Ok(CaptureBlitRegion {
+            src_x,
+            src_y,
+            width: right - src_x,
+            height: bottom - src_y,
+            dst_x: 0,
+            dst_y: 0,
+        })
     }
 }
 
 impl crate::backend::MonitorCapturer for WindowsDxgiWindowCapturer {
-    fn capture(&mut self, _reuse: Option<Frame>) -> CaptureResult<Frame> {
+    fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
         let hwnd = self.hwnd.0;
 
         // Validate the window is still alive and visible.
@@ -1130,9 +1324,7 @@ impl crate::backend::MonitorCapturer for WindowsDxgiWindowCapturer {
             ));
         }
         if unsafe { IsIconic(hwnd) }.as_bool() {
-            return Err(CaptureError::InvalidTarget(
-                "window is minimized".into(),
-            ));
+            return Err(CaptureError::InvalidTarget("window is minimized".into()));
         }
 
         // Get current window bounds.
@@ -1152,9 +1344,7 @@ impl crate::backend::MonitorCapturer for WindowsDxgiWindowCapturer {
 
         // Check if the window moved to a different monitor.
         let hmon = monitor_from_window(hwnd).ok_or_else(|| {
-            CaptureError::BackendUnavailable(
-                "window is not on any monitor".into(),
-            )
+            CaptureError::BackendUnavailable("window is not on any monitor".into())
         })?;
 
         if SendHmon(hmon) != self.current_hmon {
@@ -1162,24 +1352,32 @@ impl crate::backend::MonitorCapturer for WindowsDxgiWindowCapturer {
         }
 
         let mon_rect = monitor_rect(self.current_hmon.0)?;
+        let blit = Self::window_blit_on_monitor(&mon_rect, &win_rect)?;
 
-        // Capture the full monitor.
-        let capture_time = Instant::now();
-        let monitor_frame = match self.output.capture(None) {
-            Ok(f) => f,
-            Err(CaptureError::MonitorLost) | Err(CaptureError::AccessLost) => {
-                self.reinit_for_monitor(hmon)?;
-                self.output.capture(None)?
-            }
-            Err(e) => return Err(e),
-        };
+        let mut frame = reuse.unwrap_or_else(Frame::empty);
+        let destination_has_history = frame.width() == blit.width
+            && frame.height() == blit.height
+            && !frame.as_rgba_bytes().is_empty();
+        frame.ensure_rgba_capacity(blit.width, blit.height)?;
+        frame.reset_metadata();
 
-        // Crop to window bounds.
-        let mut frame = self.crop_to_window(&monitor_frame, &mon_rect, &win_rect)?;
-        frame.metadata.capture_time = Some(capture_time);
-        frame.metadata.capture_duration = Some(capture_time.elapsed());
-        frame.metadata.present_time_qpc = monitor_frame.metadata.present_time_qpc;
-        frame.metadata.is_duplicate = monitor_frame.metadata.is_duplicate;
+        let sample =
+            match self
+                .output
+                .capture_region_into(blit, &mut frame, destination_has_history)
+            {
+                Ok(sample) => sample,
+                Err(CaptureError::MonitorLost) | Err(CaptureError::AccessLost) => {
+                    self.reinit_for_monitor(hmon)?;
+                    self.output
+                        .capture_region_into(blit, &mut frame, destination_has_history)?
+                }
+                Err(e) => return Err(e),
+            };
+
+        frame.metadata.capture_time = sample.capture_time;
+        frame.metadata.present_time_qpc = sample.present_time_qpc;
+        frame.metadata.is_duplicate = sample.is_duplicate;
         Ok(frame)
     }
 

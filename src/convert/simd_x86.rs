@@ -32,15 +32,15 @@ pub(crate) unsafe fn convert_bgra_to_rgba_avx512_nt_unchecked(
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn avx512_bgra_core(src: *const u8, dst: *mut u8, pixel_count: usize, nontemporal: bool) {
     use std::arch::x86_64::{
-        __m512i, _MM_HINT_T0, _mm_prefetch, _mm_sfence, _mm512_loadu_si512,
-        _mm512_shuffle_epi8, _mm512_storeu_si512, _mm512_stream_si512,
+        __m512i, _MM_HINT_T0, _mm_prefetch, _mm_sfence, _mm512_loadu_si512, _mm512_shuffle_epi8,
+        _mm512_storeu_si512, _mm512_stream_si512,
     };
 
     let shuffle = unsafe {
         let pattern: [i8; 64] = [
-            2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15, 2, 1, 0, 3, 6, 5, 4, 7, 10,
-            9, 8, 11, 14, 13, 12, 15, 2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15, 2, 1,
-            0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15,
+            2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15, 2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8,
+            11, 14, 13, 12, 15, 2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15, 2, 1, 0, 3,
+            6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15,
         ];
         _mm512_loadu_si512(pattern.as_ptr() as *const __m512i)
     };
@@ -146,14 +146,13 @@ pub(crate) unsafe fn convert_bgra_to_rgba_avx2_nt_unchecked(
 #[target_feature(enable = "avx2")]
 unsafe fn avx2_bgra_core(src: *const u8, dst: *mut u8, pixel_count: usize, nontemporal: bool) {
     use std::arch::x86_64::{
-        __m256i, _MM_HINT_T0, _mm_prefetch, _mm_sfence, _mm256_loadu_si256,
-        _mm256_setr_epi8, _mm256_shuffle_epi8, _mm256_storeu_si256,
-        _mm256_stream_si256,
+        __m256i, _MM_HINT_T0, _mm_prefetch, _mm_sfence, _mm256_loadu_si256, _mm256_setr_epi8,
+        _mm256_shuffle_epi8, _mm256_storeu_si256, _mm256_stream_si256,
     };
 
     let shuffle = _mm256_setr_epi8(
-        2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15, 2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8,
-        11, 14, 13, 12, 15,
+        2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15, 2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11,
+        14, 13, 12, 15,
     );
 
     macro_rules! store256 {
@@ -243,8 +242,8 @@ pub(crate) unsafe fn convert_bgra_to_rgba_ssse3_nt_unchecked(
 #[target_feature(enable = "ssse3")]
 unsafe fn ssse3_bgra_core(src: *const u8, dst: *mut u8, pixel_count: usize, nontemporal: bool) {
     use std::arch::x86_64::{
-        __m128i, _mm_loadu_si128, _mm_setr_epi8, _mm_sfence,
-        _mm_shuffle_epi8, _mm_storeu_si128, _mm_stream_si128,
+        __m128i, _mm_loadu_si128, _mm_setr_epi8, _mm_sfence, _mm_shuffle_epi8, _mm_storeu_si128,
+        _mm_stream_si128,
     };
 
     let shuffle = _mm_setr_epi8(2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15);

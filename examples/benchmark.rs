@@ -22,7 +22,7 @@ enum BenchTarget {
     Window(WindowId),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RegressionMetric {
     Avg,
     P50,
@@ -86,7 +86,7 @@ struct Config {
     baseline_path: Option<PathBuf>,
     save_baseline_path: Option<PathBuf>,
     max_regression_pct: f64,
-    regression_metric: RegressionMetric,
+    regression_metrics: Vec<RegressionMetric>,
     max_duplicate_pct: Option<f64>,
 }
 
@@ -156,6 +156,27 @@ fn parse_backends(csv: &str) -> Result<Vec<CaptureBackendKind>> {
         bail!("--backends resolved to empty backend list");
     }
     Ok(out)
+}
+
+fn parse_regression_metrics(csv: &str) -> Result<Vec<RegressionMetric>> {
+    let mut metrics = Vec::new();
+    for token in csv.split(',') {
+        if token.trim().is_empty() {
+            continue;
+        }
+        let Some(metric) = RegressionMetric::parse(token) else {
+            bail!(
+                "invalid regression metric token `{token}` in --regression-metrics (use avg,p50,p95,p99)"
+            );
+        };
+        if !metrics.contains(&metric) {
+            metrics.push(metric);
+        }
+    }
+    if metrics.is_empty() {
+        bail!("--regression-metrics resolved to empty metric list");
+    }
+    Ok(metrics)
 }
 
 fn parse_usize_arg(flag: &str, value: Option<&str>) -> Result<usize> {
@@ -308,7 +329,7 @@ fn parse_args() -> Result<Config> {
     let mut baseline_path = None;
     let mut save_baseline_path = None;
     let mut max_regression_pct = DEFAULT_MAX_REGRESSION_PCT;
-    let mut regression_metric = RegressionMetric::default();
+    let mut regression_metrics = vec![RegressionMetric::default()];
     let mut max_duplicate_pct = None;
 
     let args: Vec<String> = std::env::args().collect();
@@ -386,7 +407,14 @@ fn parse_args() -> Result<Config> {
                 let Some(metric) = RegressionMetric::parse(raw) else {
                     bail!("invalid --regression-metric: {raw}. Use avg, p50, p95, or p99");
                 };
-                regression_metric = metric;
+                regression_metrics = vec![metric];
+                i += 2;
+            }
+            "--regression-metrics" => {
+                let Some(raw) = args.get(i + 1).map(String::as_str) else {
+                    bail!("--regression-metrics requires a comma-separated list (e.g. avg,p50)");
+                };
+                regression_metrics = parse_regression_metrics(raw)?;
                 i += 2;
             }
             "--max-duplicate-pct" => {
@@ -413,6 +441,7 @@ fn parse_args() -> Result<Config> {
   --save-baseline <path>     Save current run as baseline CSV
   --max-regression-pct <f>   Allowed metric increase vs baseline (default: {DEFAULT_MAX_REGRESSION_PCT})
   --regression-metric <m>    Metric for regression checks: avg | p50 | p95 | p99 (default: p50)
+  --regression-metrics <csv> Metrics for regression checks, e.g. avg,p50,p95
   --max-duplicate-pct <f>    Fail if duplicate-frame percentage exceeds this threshold"
                 );
                 std::process::exit(0);
@@ -445,7 +474,7 @@ fn parse_args() -> Result<Config> {
         baseline_path,
         save_baseline_path,
         max_regression_pct,
-        regression_metric,
+        regression_metrics,
         max_duplicate_pct,
     })
 }
@@ -767,7 +796,7 @@ fn print_results(results: &[BenchResult]) {
 fn main() -> Result<()> {
     let config = parse_args()?;
     println!(
-        "Running benchmark: target={} warmup={} frames={} rounds={} backends={} regression_metric={} max_duplicate_pct={}",
+        "Running benchmark: target={} warmup={} frames={} rounds={} backends={} regression_metrics={} max_duplicate_pct={}",
         target_label(&config.target),
         config.warmup_frames,
         config.measure_frames,
@@ -778,7 +807,12 @@ fn main() -> Result<()> {
             .map(|k| backend_name(*k))
             .collect::<Vec<_>>()
             .join(","),
-        config.regression_metric.as_str(),
+        config
+            .regression_metrics
+            .iter()
+            .map(|metric| metric.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
         config
             .max_duplicate_pct
             .map(|v| format!("{v:.2}"))
@@ -806,17 +840,14 @@ fn main() -> Result<()> {
 
     if let Some(path) = &config.baseline_path {
         let baseline = load_baseline(path)?;
-        check_regression(
-            &baseline,
-            &results,
-            config.max_regression_pct,
-            config.regression_metric,
-        )?;
-        println!(
-            "Regression check passed ({}, max allowed regression: {:.2}%)",
-            config.regression_metric.as_str(),
-            config.max_regression_pct
-        );
+        for metric in &config.regression_metrics {
+            check_regression(&baseline, &results, config.max_regression_pct, *metric)?;
+            println!(
+                "Regression check passed ({}, max allowed regression: {:.2}%)",
+                metric.as_str(),
+                config.max_regression_pct
+            );
+        }
     }
 
     if let Some(max_duplicate_pct) = config.max_duplicate_pct {

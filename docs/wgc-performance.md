@@ -30,6 +30,12 @@ cargo run --release --example benchmark -- --backends wgc --region-center 1280x7
 
 The command exits with a non-zero code when the selected metric regresses more than the allowed threshold.
 
+For strict optimization validation (no p50 regression allowed + duplicate budget):
+
+```powershell
+cargo run --release --example benchmark -- --backends wgc --region-center 1280x720 --warmup 30 --frames 240 --rounds 3 --baseline target/perf/wgc-region-1280x720-baseline.csv --max-regression-pct 0 --regression-metric p50 --max-duplicate-pct 95
+```
+
 ## Notes
 
 - Baselines are keyed by both `target` and `backend`, so one CSV can store monitor, region, and window runs together.

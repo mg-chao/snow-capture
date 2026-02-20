@@ -3,13 +3,115 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 use crate::CaptureTarget;
-use crate::backend::{self, CaptureBackend, CaptureMode, CursorCaptureConfig, MonitorCapturer};
+use crate::backend::{
+    self, CaptureBackend, CaptureBlitRegion, CaptureMode, CaptureSampleMetadata,
+    CursorCaptureConfig, MonitorCapturer,
+};
 use crate::error::{CaptureError, CaptureResult};
 use crate::frame::Frame;
 use crate::monitor::{MonitorId, MonitorKey};
-use crate::region::MonitorLayout;
+use crate::region::{CaptureRegion, MonitorLayout};
 use crate::streaming::{StreamConfig, StreamHandle};
 use crate::window::{WindowId, WindowKey};
+
+#[derive(Clone, Debug)]
+struct RegionPlanEntry {
+    monitor: MonitorId,
+    monitor_key: MonitorKey,
+    blit: CaptureBlitRegion,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedRegionPlan {
+    region: CaptureRegion,
+    output_width: u32,
+    output_height: u32,
+    entries: Vec<RegionPlanEntry>,
+}
+
+fn copy_region_rgba(src: &Frame, blit: CaptureBlitRegion, dst: &mut Frame) -> CaptureResult<()> {
+    if blit.width == 0 || blit.height == 0 {
+        return Ok(());
+    }
+
+    let src_w = src.width() as usize;
+    let src_h = src.height() as usize;
+    let dst_w = dst.width() as usize;
+    let dst_h = dst.height() as usize;
+
+    let src_x = blit.src_x as usize;
+    let src_y = blit.src_y as usize;
+    let dst_x = blit.dst_x as usize;
+    let dst_y = blit.dst_y as usize;
+    let copy_w = blit.width as usize;
+    let copy_h = blit.height as usize;
+
+    let src_right = src_x
+        .checked_add(copy_w)
+        .ok_or(CaptureError::BufferOverflow)?;
+    let src_bottom = src_y
+        .checked_add(copy_h)
+        .ok_or(CaptureError::BufferOverflow)?;
+    let dst_right = dst_x
+        .checked_add(copy_w)
+        .ok_or(CaptureError::BufferOverflow)?;
+    let dst_bottom = dst_y
+        .checked_add(copy_h)
+        .ok_or(CaptureError::BufferOverflow)?;
+
+    if src_right > src_w || src_bottom > src_h || dst_right > dst_w || dst_bottom > dst_h {
+        return Err(CaptureError::BufferOverflow);
+    }
+
+    let src_stride = src_w.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+    let dst_stride = dst_w.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+    let row_bytes = copy_w.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+
+    let src_bytes = src.as_rgba_bytes();
+    let dst_bytes = dst.as_mut_rgba_bytes();
+    let src_required_len = src_stride
+        .checked_mul(src_h)
+        .ok_or(CaptureError::BufferOverflow)?;
+    if src_bytes.len() < src_required_len {
+        return Err(CaptureError::BufferOverflow);
+    }
+    let dst_required_len = dst_stride
+        .checked_mul(dst_h)
+        .ok_or(CaptureError::BufferOverflow)?;
+    if dst_bytes.len() < dst_required_len {
+        return Err(CaptureError::BufferOverflow);
+    }
+    let src_start = src_y
+        .checked_mul(src_stride)
+        .and_then(|off| src_x.checked_mul(4).and_then(|xoff| off.checked_add(xoff)))
+        .ok_or(CaptureError::BufferOverflow)?;
+    let dst_start = dst_y
+        .checked_mul(dst_stride)
+        .and_then(|off| dst_x.checked_mul(4).and_then(|xoff| off.checked_add(xoff)))
+        .ok_or(CaptureError::BufferOverflow)?;
+
+    let mut src_row_start = src_start;
+    let mut dst_row_start = dst_start;
+    for _ in 0..copy_h {
+        let src_row_end = src_row_start
+            .checked_add(row_bytes)
+            .ok_or(CaptureError::BufferOverflow)?;
+        let dst_row_end = dst_row_start
+            .checked_add(row_bytes)
+            .ok_or(CaptureError::BufferOverflow)?;
+
+        dst_bytes[dst_row_start..dst_row_end]
+            .copy_from_slice(&src_bytes[src_row_start..src_row_end]);
+
+        src_row_start = src_row_start
+            .checked_add(src_stride)
+            .ok_or(CaptureError::BufferOverflow)?;
+        dst_row_start = dst_row_start
+            .checked_add(dst_stride)
+            .ok_or(CaptureError::BufferOverflow)?;
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureSessionConfig {
@@ -104,6 +206,9 @@ impl CaptureSessionBuilder {
             config: self.config,
             sequence: 0,
             layout: None,
+            prepared_region_plan: None,
+            region_fallback_frames: FxHashMap::default(),
+            region_output_history_valid: false,
         })
     }
 }
@@ -122,6 +227,9 @@ pub struct CaptureSession {
     sequence: u64,
     /// Lazily-initialized monitor layout for region capture.
     layout: Option<MonitorLayout>,
+    prepared_region_plan: Option<PreparedRegionPlan>,
+    region_fallback_frames: FxHashMap<MonitorKey, Frame>,
+    region_output_history_valid: bool,
 }
 
 impl CaptureSession {
@@ -264,9 +372,13 @@ impl CaptureSession {
     fn do_capture(&mut self, target: &CaptureTarget, reuse: Option<Frame>) -> CaptureResult<Frame> {
         match target {
             CaptureTarget::Region(region) => return self.do_capture_region(region, reuse),
-            CaptureTarget::Window(window) => return self.do_capture_window(window, reuse),
+            CaptureTarget::Window(window) => {
+                self.region_output_history_valid = false;
+                return self.do_capture_window(window, reuse);
+            }
             _ => {}
         }
+        self.region_output_history_valid = false;
 
         let monitor = self.resolve_target(target)?;
         let key = monitor.key();
@@ -372,83 +484,135 @@ impl CaptureSession {
 
     /// Capture a region that may span multiple monitors by compositing
     /// individual monitor captures into a single output frame.
-    fn do_capture_region(
+    fn prepare_region_plan(
         &mut self,
-        region: &crate::region::CaptureRegion,
-        reuse: Option<Frame>,
-    ) -> CaptureResult<Frame> {
+        region: &CaptureRegion,
+    ) -> CaptureResult<(PreparedRegionPlan, bool)> {
         // Lazily snapshot the monitor layout on first region capture.
         if self.layout.is_none() {
             let monitors = self.backend.enumerate_monitors()?;
             self.layout = Some(MonitorLayout::snapshot_from_monitors(monitors)?);
         }
-        let layout = self.layout.as_ref().unwrap();
 
-        let overlaps = layout.overlapping_monitors(region);
-        if overlaps.is_empty() {
-            return Err(CaptureError::InvalidTarget(
-                "region does not overlap any monitor".into(),
-            ));
+        let needs_rebuild = self
+            .prepared_region_plan
+            .as_ref()
+            .is_none_or(|cached| cached.region != *region);
+        if needs_rebuild {
+            let layout = self.layout.as_ref().unwrap();
+            let overlaps = layout.overlapping_monitors(region);
+            if overlaps.is_empty() {
+                return Err(CaptureError::InvalidTarget(
+                    "region does not overlap any monitor".into(),
+                ));
+            }
+
+            let mut entries = Vec::with_capacity(overlaps.len());
+            for (mon_geo, intersection) in overlaps {
+                entries.push(RegionPlanEntry {
+                    monitor_key: mon_geo.monitor.key(),
+                    monitor: mon_geo.monitor,
+                    blit: CaptureBlitRegion {
+                        src_x: (intersection.x - mon_geo.x) as u32,
+                        src_y: (intersection.y - mon_geo.y) as u32,
+                        width: intersection.width,
+                        height: intersection.height,
+                        dst_x: (intersection.x - region.x) as u32,
+                        dst_y: (intersection.y - region.y) as u32,
+                    },
+                });
+            }
+
+            self.prepared_region_plan = Some(PreparedRegionPlan {
+                region: *region,
+                output_width: region.width,
+                output_height: region.height,
+                entries,
+            });
         }
+
+        Ok((
+            self.prepared_region_plan.as_ref().unwrap().clone(),
+            needs_rebuild,
+        ))
+    }
+
+    fn do_capture_region(
+        &mut self,
+        region: &CaptureRegion,
+        reuse: Option<Frame>,
+    ) -> CaptureResult<Frame> {
+        let (plan, plan_changed) = self.prepare_region_plan(region)?;
 
         self.sequence = self.sequence.wrapping_add(1);
         let seq = self.sequence;
 
-        let out_w = region.width;
-        let out_h = region.height;
+        let out_w = plan.output_width;
+        let out_h = plan.output_height;
 
         // Prepare output frame.
         let mut out_frame = reuse.unwrap_or_else(Frame::empty);
+        let had_region_history = self.region_output_history_valid;
+        self.region_output_history_valid = false;
+        let destination_has_history = had_region_history
+            && !plan_changed
+            && out_frame.width() == out_w
+            && out_frame.height() == out_h
+            && !out_frame.as_rgba_bytes().is_empty();
         out_frame.ensure_rgba_capacity(out_w, out_h)?;
-        // Zero-fill so gaps between monitors are black.
-        let out_buf = out_frame.as_mut_rgba_bytes();
-        out_buf.iter_mut().for_each(|b| *b = 0);
+        out_frame.reset_metadata();
+        // Initialize only when first created or when the region target changed.
+        if !destination_has_history {
+            out_frame.as_mut_rgba_bytes().fill(0);
+        }
 
         let mut latest_capture_time = None;
         let mut latest_present_qpc = None;
+        let mut all_duplicate = destination_has_history;
 
-        for (mon_geo, intersection) in &overlaps {
-            // Capture the full monitor.
-            let mon_frame = {
-                let capturer = self.get_or_create_capturer(&mon_geo.monitor)?;
-                capturer.capture(None)?
+        for entry in &plan.entries {
+            let sample = {
+                let capturer = self.get_or_create_capturer(&entry.monitor)?;
+                capturer.capture_region_into(entry.blit, &mut out_frame, destination_has_history)?
             };
 
-            // Track the latest timestamps.
-            if let Some(t) = mon_frame.metadata.capture_time {
-                latest_capture_time = Some(t);
-            }
-            if let Some(q) = mon_frame.metadata.present_time_qpc {
-                latest_present_qpc = Some(q);
-            }
+            let sample = if let Some(sample) = sample {
+                sample
+            } else {
+                let reuse_frame = self.region_fallback_frames.remove(&entry.monitor_key);
+                let monitor_frame = {
+                    let capturer = self.get_or_create_capturer(&entry.monitor)?;
+                    capturer.capture(reuse_frame)?
+                };
 
-            let src_bytes = mon_frame.as_rgba_bytes();
-            let src_w = mon_frame.width() as usize;
+                copy_region_rgba(&monitor_frame, entry.blit, &mut out_frame)?;
+                let sample = CaptureSampleMetadata {
+                    capture_time: monitor_frame.metadata.capture_time,
+                    present_time_qpc: monitor_frame.metadata.present_time_qpc,
+                    is_duplicate: monitor_frame.metadata.is_duplicate,
+                };
+                self.region_fallback_frames
+                    .insert(entry.monitor_key, monitor_frame);
+                sample
+            };
 
-            // Source rect within the monitor frame.
-            let src_x = (intersection.x - mon_geo.x) as usize;
-            let src_y = (intersection.y - mon_geo.y) as usize;
-            // Destination rect within the output frame.
-            let dst_x = (intersection.x - region.x) as usize;
-            let dst_y = (intersection.y - region.y) as usize;
-            let copy_w = intersection.width as usize;
-            let copy_h = intersection.height as usize;
-
-            let out_buf = out_frame.as_mut_rgba_bytes();
-            for row in 0..copy_h {
-                let src_off = ((src_y + row) * src_w + src_x) * 4;
-                let dst_off = ((dst_y + row) * out_w as usize + dst_x) * 4;
-                let len = copy_w * 4;
-                if src_off + len <= src_bytes.len() && dst_off + len <= out_buf.len() {
-                    out_buf[dst_off..dst_off + len]
-                        .copy_from_slice(&src_bytes[src_off..src_off + len]);
-                }
+            if let Some(t) = sample.capture_time {
+                latest_capture_time = Some(
+                    latest_capture_time.map_or(t, |current: std::time::Instant| current.max(t)),
+                );
             }
+            if let Some(q) = sample.present_time_qpc {
+                latest_present_qpc =
+                    Some(latest_present_qpc.map_or(q, |current: i64| current.max(q)));
+            }
+            all_duplicate &= sample.is_duplicate;
         }
 
         out_frame.metadata.sequence = seq;
         out_frame.metadata.capture_time = latest_capture_time;
         out_frame.metadata.present_time_qpc = latest_present_qpc;
+        out_frame.metadata.is_duplicate = all_duplicate;
+        self.region_output_history_valid = true;
         Ok(out_frame)
     }
 }

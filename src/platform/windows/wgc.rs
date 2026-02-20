@@ -23,7 +23,7 @@ use windows::Win32::System::WinRT::Direct3D11::{
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::core::{IInspectable, Interface};
 
-use crate::backend::{CaptureMode, CursorCaptureConfig};
+use crate::backend::{CaptureBlitRegion, CaptureMode, CaptureSampleMetadata, CursorCaptureConfig};
 use crate::convert::HdrToSdrParams;
 use crate::error::{CaptureError, CaptureResult};
 use crate::frame::{DirtyRect, Frame};
@@ -744,6 +744,261 @@ impl WindowsGraphicsCaptureCapturer {
         Ok(())
     }
 
+    fn read_slot_region_into_output(
+        &mut self,
+        slot_idx: usize,
+        out: &mut Frame,
+        blit: CaptureBlitRegion,
+        destination_has_history: bool,
+    ) -> CaptureResult<CaptureSampleMetadata> {
+        if !self.staging_slots[slot_idx].populated {
+            return Err(CaptureError::Timeout);
+        }
+
+        let slot = &self.staging_slots[slot_idx];
+        let source_desc = slot.source_desc.ok_or_else(|| {
+            CaptureError::Platform(anyhow::anyhow!(
+                "WGC staging slot is populated but missing source descriptor"
+            ))
+        })?;
+        let capture_time = slot.capture_time.unwrap_or_else(Instant::now);
+        let present_time_ticks = slot.present_time_ticks;
+        let source_duplicate = slot.is_duplicate;
+
+        let emitted_duplicate =
+            present_time_ticks != 0 && present_time_ticks == self.last_emitted_present_time;
+        let is_duplicate = source_duplicate || emitted_duplicate;
+
+        if self.has_frame_history && destination_has_history && is_duplicate {
+            if present_time_ticks != 0 {
+                self.last_emitted_present_time = present_time_ticks;
+            }
+            return Ok(CaptureSampleMetadata {
+                capture_time: Some(capture_time),
+                present_time_qpc: if present_time_ticks != 0 {
+                    Some(present_time_ticks)
+                } else {
+                    None
+                },
+                is_duplicate,
+            });
+        }
+
+        self.wait_for_slot_copy(slot_idx);
+
+        let slot = &self.staging_slots[slot_idx];
+        let staging = slot.staging.as_ref().ok_or_else(|| {
+            CaptureError::Platform(anyhow::anyhow!(
+                "WGC staging slot is populated but missing staging texture"
+            ))
+        })?;
+        let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
+            CaptureError::Platform(anyhow::anyhow!(
+                "WGC staging slot is populated but missing staging resource"
+            ))
+        })?;
+
+        surface::map_staging_rect_to_frame(
+            &self.context,
+            staging,
+            Some(staging_resource),
+            &source_desc,
+            out,
+            blit,
+            slot.hdr_to_sdr,
+            "failed to map WGC staging texture (region)",
+        )?;
+
+        if present_time_ticks != 0 {
+            self.last_emitted_present_time = present_time_ticks;
+        }
+
+        Ok(CaptureSampleMetadata {
+            capture_time: Some(capture_time),
+            present_time_qpc: if present_time_ticks != 0 {
+                Some(present_time_ticks)
+            } else {
+                None
+            },
+            is_duplicate,
+        })
+    }
+
+    fn capture_region_into(
+        &mut self,
+        blit: CaptureBlitRegion,
+        out: &mut Frame,
+        destination_has_history: bool,
+    ) -> CaptureResult<CaptureSampleMetadata> {
+        let allow_stale_return =
+            self.capture_mode == CaptureMode::ScreenRecording && destination_has_history;
+        let capture_time = Instant::now();
+
+        let (capture_frame, time_ticks) = match self.wait_for_next_frame(allow_stale_return) {
+            Ok(result) => result,
+            Err(CaptureError::Timeout) => {
+                if allow_stale_return {
+                    if let Some(slot_idx) = self.pending_slot {
+                        if let Ok(sample) = self.read_slot_region_into_output(
+                            slot_idx,
+                            out,
+                            blit,
+                            destination_has_history,
+                        ) {
+                            self.has_frame_history = true;
+                            return Ok(sample);
+                        }
+                        self.has_frame_history = false;
+                    }
+                    return Ok(CaptureSampleMetadata {
+                        capture_time: Some(capture_time),
+                        present_time_qpc: None,
+                        is_duplicate: true,
+                    });
+                }
+                return Err(CaptureError::Timeout);
+            }
+            Err(error) => return Err(error),
+        };
+
+        let source_is_duplicate = time_ticks != 0 && time_ticks == self.last_present_time;
+        if time_ticks != 0 {
+            self.last_present_time = time_ticks;
+        }
+
+        let capture_result = (|| -> CaptureResult<CaptureSampleMetadata> {
+            self.recreate_pool_if_needed(&capture_frame)?;
+
+            let frame_surface = capture_frame.Surface().map_err(|error| {
+                map_platform_error(error, "Direct3D11CaptureFrame::Surface failed")
+            })?;
+            let frame_dxgi_interface: IDirect3DDxgiInterfaceAccess = frame_surface
+                .cast()
+                .context("failed to cast frame surface to IDirect3DDxgiInterfaceAccess")
+                .map_err(CaptureError::Platform)?;
+            let frame_texture: ID3D11Texture2D = unsafe { frame_dxgi_interface.GetInterface() }
+                .map_err(|error| {
+                    map_platform_error(error, "IDirect3DDxgiInterfaceAccess::GetInterface failed")
+                })?;
+
+            let src_desc = match self.cached_src_desc {
+                Some(desc) => desc,
+                None => {
+                    let mut desc = D3D11_TEXTURE2D_DESC::default();
+                    unsafe { frame_texture.GetDesc(&mut desc) };
+                    self.cached_src_desc = Some(desc);
+                    desc
+                }
+            };
+
+            let (effective_source, effective_desc, effective_hdr) =
+                if src_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+                    if let (Some(params), Some(tonemapper)) =
+                        (self.hdr_to_sdr, self.gpu_tonemapper.as_mut())
+                    {
+                        let output = tonemapper.tonemap(
+                            &self.device,
+                            &self.context,
+                            &frame_texture,
+                            &src_desc,
+                            params.sanitized(),
+                        )?;
+                        let mut out_desc = D3D11_TEXTURE2D_DESC::default();
+                        unsafe { output.GetDesc(&mut out_desc) };
+                        (output.clone(), out_desc, None)
+                    } else if let Some(converter) = self.gpu_f16_converter.as_mut() {
+                        let output = converter.convert(
+                            &self.device,
+                            &self.context,
+                            &frame_texture,
+                            &src_desc,
+                        )?;
+                        let mut out_desc = D3D11_TEXTURE2D_DESC::default();
+                        unsafe { output.GetDesc(&mut out_desc) };
+                        (output.clone(), out_desc, None)
+                    } else {
+                        (frame_texture.clone(), src_desc, self.hdr_to_sdr)
+                    }
+                } else {
+                    (frame_texture.clone(), src_desc, self.hdr_to_sdr)
+                };
+
+            let write_slot = if self.capture_mode == CaptureMode::ScreenRecording {
+                self.next_write_slot % WGC_STAGING_SLOTS
+            } else {
+                0
+            };
+            let read_slot = if self.capture_mode == CaptureMode::ScreenRecording {
+                self.pending_slot.unwrap_or(write_slot)
+            } else {
+                write_slot
+            };
+
+            self.ensure_staging_slot(write_slot, &effective_desc)?;
+            {
+                let slot = &mut self.staging_slots[write_slot];
+                slot.dirty_mode_available = false;
+                slot.dirty_rects.clear();
+                slot.capture_time = Some(capture_time);
+                slot.present_time_ticks = time_ticks;
+                slot.is_duplicate = source_is_duplicate;
+                slot.hdr_to_sdr = effective_hdr;
+                slot.source_desc = Some(effective_desc);
+            }
+
+            let source_resource: ID3D11Resource = effective_source
+                .cast()
+                .context("failed to cast WGC frame texture to ID3D11Resource")
+                .map_err(CaptureError::Platform)?;
+            let staging_resource = self.staging_slots[write_slot]
+                .staging_resource
+                .as_ref()
+                .ok_or_else(|| {
+                    CaptureError::Platform(anyhow::anyhow!(
+                        "failed to resolve WGC staging resource for slot {}",
+                        write_slot
+                    ))
+                })?;
+            unsafe {
+                self.context
+                    .CopyResource(staging_resource, &source_resource);
+            }
+            if let Some(query) = self.staging_slots[write_slot].query.as_ref() {
+                unsafe {
+                    self.context.End(query);
+                }
+            }
+            self.staging_slots[write_slot].populated = true;
+
+            self.maybe_flush_after_submit(write_slot, read_slot);
+            let sample =
+                self.read_slot_region_into_output(read_slot, out, blit, destination_has_history)?;
+
+            if self.capture_mode == CaptureMode::ScreenRecording {
+                self.pending_slot = Some(write_slot);
+                self.next_write_slot = (write_slot + 1) % WGC_STAGING_SLOTS;
+            } else {
+                self.pending_slot = None;
+                self.next_write_slot = 0;
+            }
+
+            Ok(sample)
+        })();
+
+        let _ = capture_frame.Close();
+        match capture_result {
+            Ok(sample) => {
+                self.has_frame_history = true;
+                Ok(sample)
+            }
+            Err(err) => {
+                self.reset_staging_pipeline();
+                self.has_frame_history = false;
+                Err(err)
+            }
+        }
+    }
+
     fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
         let mut out = reuse.unwrap_or_else(Frame::empty);
         out.reset_metadata();
@@ -969,6 +1224,17 @@ impl WindowsMonitorCapturer {
 impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
     fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
         self.inner.capture(reuse)
+    }
+
+    fn capture_region_into(
+        &mut self,
+        blit: CaptureBlitRegion,
+        destination: &mut Frame,
+        destination_has_history: bool,
+    ) -> CaptureResult<Option<CaptureSampleMetadata>> {
+        self.inner
+            .capture_region_into(blit, destination, destination_has_history)
+            .map(Some)
     }
 
     fn set_capture_mode(&mut self, mode: CaptureMode) {

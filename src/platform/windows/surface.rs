@@ -9,6 +9,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::core::Interface;
 
+use crate::backend::CaptureBlitRegion;
 use crate::convert::{
     self, HdrToSdrParams, SurfaceConversionOptions, SurfaceLayout, SurfacePixelFormat,
 };
@@ -182,6 +183,147 @@ pub(crate) fn map_staging_to_frame(
         context.Unmap(resource, 0);
     }
     result
+}
+
+/// Map a populated staging texture and convert a source sub-rectangle into
+/// the destination frame at `blit.dst_x`/`blit.dst_y`.
+pub(crate) fn map_staging_rect_to_frame(
+    context: &ID3D11DeviceContext,
+    staging: &ID3D11Texture2D,
+    staging_resource: Option<&ID3D11Resource>,
+    desc: &D3D11_TEXTURE2D_DESC,
+    frame: &mut Frame,
+    blit: CaptureBlitRegion,
+    hdr_to_sdr: Option<HdrToSdrParams>,
+    map_context: &'static str,
+) -> CaptureResult<()> {
+    if blit.width == 0 || blit.height == 0 {
+        return Ok(());
+    }
+
+    let src_width = usize::try_from(desc.Width).map_err(|_| CaptureError::BufferOverflow)?;
+    let src_height = usize::try_from(desc.Height).map_err(|_| CaptureError::BufferOverflow)?;
+    let dst_width = usize::try_from(frame.width()).map_err(|_| CaptureError::BufferOverflow)?;
+    let dst_height = usize::try_from(frame.height()).map_err(|_| CaptureError::BufferOverflow)?;
+
+    let src_x = usize::try_from(blit.src_x).map_err(|_| CaptureError::BufferOverflow)?;
+    let src_y = usize::try_from(blit.src_y).map_err(|_| CaptureError::BufferOverflow)?;
+    let dst_x = usize::try_from(blit.dst_x).map_err(|_| CaptureError::BufferOverflow)?;
+    let dst_y = usize::try_from(blit.dst_y).map_err(|_| CaptureError::BufferOverflow)?;
+    let copy_w = usize::try_from(blit.width).map_err(|_| CaptureError::BufferOverflow)?;
+    let copy_h = usize::try_from(blit.height).map_err(|_| CaptureError::BufferOverflow)?;
+
+    let src_right = src_x
+        .checked_add(copy_w)
+        .ok_or(CaptureError::BufferOverflow)?;
+    let src_bottom = src_y
+        .checked_add(copy_h)
+        .ok_or(CaptureError::BufferOverflow)?;
+    let dst_right = dst_x
+        .checked_add(copy_w)
+        .ok_or(CaptureError::BufferOverflow)?;
+    let dst_bottom = dst_y
+        .checked_add(copy_h)
+        .ok_or(CaptureError::BufferOverflow)?;
+    if src_right > src_width
+        || src_bottom > src_height
+        || dst_right > dst_width
+        || dst_bottom > dst_height
+    {
+        return Err(CaptureError::BufferOverflow);
+    }
+
+    let owned_resource;
+    let resource = match staging_resource {
+        Some(r) => r,
+        None => {
+            owned_resource = staging
+                .cast::<ID3D11Resource>()
+                .context("failed to cast staging texture to ID3D11Resource")
+                .map_err(CaptureError::Platform)?;
+            &owned_resource
+        }
+    };
+
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    // D3D11_MAP_FLAG_DO_NOT_WAIT = 0x100000
+    const DO_NOT_WAIT: u32 = 0x100000;
+    let non_blocking =
+        unsafe { context.Map(resource, 0, D3D11_MAP_READ, DO_NOT_WAIT, Some(&mut mapped)) };
+    if non_blocking.is_err() {
+        mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe { context.Map(resource, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
+            .context(map_context)
+            .map_err(CaptureError::Platform)?;
+    }
+
+    let convert_result = (|| -> CaptureResult<()> {
+        let src_pitch = mapped.RowPitch as usize;
+        let src_base = mapped.pData as *const u8;
+        let format = source_surface_format(desc.Format)
+            .ok_or_else(|| CaptureError::UnsupportedFormat(format!("{:?}", desc.Format)))?;
+        let src_row_len = source_row_bytes(format, src_width)?;
+        src_pitch
+            .checked_mul(src_height.saturating_sub(1))
+            .and_then(|base| base.checked_add(src_row_len))
+            .ok_or(CaptureError::BufferOverflow)?;
+
+        let src_bytes_per_pixel = source_bytes_per_pixel(format);
+        let src_copy_row_bytes = source_row_bytes(format, copy_w)?;
+        let src_end_in_row = src_x
+            .checked_mul(src_bytes_per_pixel)
+            .and_then(|offset| offset.checked_add(src_copy_row_bytes))
+            .ok_or(CaptureError::BufferOverflow)?;
+        if src_end_in_row > src_pitch {
+            return Err(CaptureError::BufferOverflow);
+        }
+
+        let dst_pitch = dst_width
+            .checked_mul(4)
+            .ok_or(CaptureError::BufferOverflow)?;
+        let dst_copy_row_bytes = copy_w.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+        let dst_end_in_row = dst_x
+            .checked_mul(4)
+            .and_then(|offset| offset.checked_add(dst_copy_row_bytes))
+            .ok_or(CaptureError::BufferOverflow)?;
+        if dst_end_in_row > dst_pitch {
+            return Err(CaptureError::BufferOverflow);
+        }
+
+        let src_offset = src_y
+            .checked_mul(src_pitch)
+            .and_then(|base| {
+                src_x
+                    .checked_mul(src_bytes_per_pixel)
+                    .and_then(|xoff| base.checked_add(xoff))
+            })
+            .ok_or(CaptureError::BufferOverflow)?;
+        let dst_offset = dst_y
+            .checked_mul(dst_pitch)
+            .and_then(|base| dst_x.checked_mul(4).and_then(|xoff| base.checked_add(xoff)))
+            .ok_or(CaptureError::BufferOverflow)?;
+
+        unsafe {
+            convert::convert_surface_to_rgba_unchecked(
+                format,
+                SurfaceLayout::new(
+                    src_base.add(src_offset),
+                    src_pitch,
+                    frame.as_mut_rgba_ptr().add(dst_offset),
+                    dst_pitch,
+                    copy_w,
+                    copy_h,
+                ),
+                SurfaceConversionOptions { hdr_to_sdr },
+            );
+        }
+        Ok(())
+    })();
+
+    unsafe {
+        context.Unmap(resource, 0);
+    }
+    convert_result
 }
 
 /// Map an already-populated staging texture and apply only the provided

@@ -6,7 +6,9 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use snow_capture::backend::CaptureBackendKind;
 use snow_capture::frame::Frame;
-use snow_capture::{CaptureMode, CaptureSession, CaptureTarget, WindowId};
+use snow_capture::{
+    CaptureMode, CaptureRegion, CaptureSession, CaptureTarget, MonitorLayout, WindowId,
+};
 
 const DEFAULT_WARMUP_FRAMES: usize = 30;
 const DEFAULT_MEASURE_FRAMES: usize = 240;
@@ -16,6 +18,7 @@ const DEFAULT_MAX_REGRESSION_PCT: f64 = 10.0;
 #[derive(Clone, Debug)]
 enum BenchTarget {
     PrimaryMonitor,
+    Region(CaptureRegion),
     Window(WindowId),
 }
 
@@ -89,6 +92,7 @@ struct Config {
 #[derive(Clone, Debug)]
 struct BenchResult {
     backend: CaptureBackendKind,
+    target_label: String,
     avg_ms: f64,
     p50_ms: f64,
     p95_ms: f64,
@@ -105,6 +109,10 @@ struct BaselineEntry {
     p50_ms: f64,
     p95_ms: f64,
     p99_ms: f64,
+}
+
+fn baseline_key(target: &str, backend: &str) -> String {
+    format!("{target}|{backend}")
 }
 
 fn backend_name(kind: CaptureBackendKind) -> &'static str {
@@ -208,9 +216,78 @@ fn window_under_cursor() -> Result<WindowId> {
     Ok(WindowId::from_raw_handle(handle.0 as isize))
 }
 
+fn parse_region_csv(raw: &str) -> Result<CaptureRegion> {
+    let parts: Vec<&str> = raw.split(',').map(|part| part.trim()).collect();
+    if parts.len() != 4 {
+        bail!("--region expects x,y,width,height (got: {raw})");
+    }
+
+    let x = parts[0]
+        .parse::<i32>()
+        .with_context(|| format!("failed to parse region x: {}", parts[0]))?;
+    let y = parts[1]
+        .parse::<i32>()
+        .with_context(|| format!("failed to parse region y: {}", parts[1]))?;
+    let width = parts[2]
+        .parse::<u32>()
+        .with_context(|| format!("failed to parse region width: {}", parts[2]))?;
+    let height = parts[3]
+        .parse::<u32>()
+        .with_context(|| format!("failed to parse region height: {}", parts[3]))?;
+    CaptureRegion::new(x, y, width, height).context("invalid --region dimensions")
+}
+
+fn parse_size_2d(raw: &str) -> Result<(u32, u32)> {
+    let trimmed = raw.trim();
+    let Some((w_raw, h_raw)) = trimmed.split_once('x').or_else(|| trimmed.split_once('X')) else {
+        bail!("expected <width>x<height>, got: {raw}");
+    };
+    let width = w_raw
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("failed to parse width in {raw}"))?;
+    let height = h_raw
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("failed to parse height in {raw}"))?;
+    if width == 0 || height == 0 {
+        bail!("region dimensions must be > 0: {raw}");
+    }
+    Ok((width, height))
+}
+
+fn centered_primary_region(width: u32, height: u32) -> Result<CaptureRegion> {
+    let layout = MonitorLayout::snapshot().context("failed to snapshot monitor layout")?;
+    let primary = layout
+        .monitors
+        .iter()
+        .find(|monitor| monitor.monitor.is_primary())
+        .or_else(|| layout.monitors.first())
+        .context("no monitor available for --region-center")?;
+
+    if primary.width == 0 || primary.height == 0 {
+        bail!("primary monitor has zero-sized bounds");
+    }
+
+    let fit_width = width.min(primary.width);
+    let fit_height = height.min(primary.height);
+    let x = i32::try_from(i64::from(primary.x) + i64::from((primary.width - fit_width) / 2))
+        .context("centered region x overflowed i32 range")?;
+    let y = i32::try_from(i64::from(primary.y) + i64::from((primary.height - fit_height) / 2))
+        .context("centered region y overflowed i32 range")?;
+    CaptureRegion::new(x, y, fit_width, fit_height)
+        .context("failed to build centered primary region")
+}
+
 fn target_label(target: &BenchTarget) -> String {
     match target {
         BenchTarget::PrimaryMonitor => "primary-monitor".to_string(),
+        BenchTarget::Region(region) => {
+            format!(
+                "region:{}:{}:{}:{}",
+                region.x, region.y, region.width, region.height
+            )
+        }
         BenchTarget::Window(window) => format!("window:{}", window.stable_id()),
     }
 }
@@ -264,6 +341,21 @@ fn parse_args() -> Result<Config> {
                 target = BenchTarget::Window(WindowId::from_raw_handle(parse_window_handle(raw)?));
                 i += 2;
             }
+            "--region" => {
+                let Some(raw) = args.get(i + 1).map(String::as_str) else {
+                    bail!("--region requires x,y,width,height");
+                };
+                target = BenchTarget::Region(parse_region_csv(raw)?);
+                i += 2;
+            }
+            "--region-center" => {
+                let Some(raw) = args.get(i + 1).map(String::as_str) else {
+                    bail!("--region-center requires <width>x<height>");
+                };
+                let (width, height) = parse_size_2d(raw)?;
+                target = BenchTarget::Region(centered_primary_region(width, height)?);
+                i += 2;
+            }
             "--baseline" => {
                 let Some(raw) = args.get(i + 1) else {
                     bail!("--baseline requires a file path");
@@ -302,6 +394,8 @@ fn parse_args() -> Result<Config> {
   --backends <csv>           Backends list, e.g. dxgi,wgc,gdi
   --window-under-cursor      Benchmark window capture for the window under the cursor
   --window-handle <value>    Benchmark window capture for an HWND (decimal or 0xHEX)
+  --region <x,y,w,h>         Benchmark region capture in virtual desktop coordinates
+  --region-center <WxH>      Benchmark a centered region on the primary monitor
   --baseline <path>          Compare current run to baseline CSV
   --save-baseline <path>     Save current run as baseline CSV
   --max-regression-pct <f>   Allowed metric increase vs baseline (default: {DEFAULT_MAX_REGRESSION_PCT})
@@ -354,6 +448,7 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 fn capture_target_for(target: &BenchTarget) -> CaptureTarget {
     match target {
         BenchTarget::PrimaryMonitor => CaptureTarget::PrimaryMonitor,
+        BenchTarget::Region(region) => CaptureTarget::Region(*region),
         BenchTarget::Window(window) => CaptureTarget::Window(*window),
     }
 }
@@ -376,6 +471,7 @@ fn run_backend(
             )
         })?;
     let target = capture_target_for(bench_target);
+    let target_label = target_label(bench_target);
     let mut frame = Frame::empty();
 
     let total_samples = measure_frames
@@ -415,6 +511,7 @@ fn run_backend(
 
     Ok(BenchResult {
         backend: kind,
+        target_label,
         avg_ms,
         p50_ms: percentile(&sorted, 0.50),
         p95_ms: percentile(&sorted, 0.95),
@@ -427,10 +524,12 @@ fn run_backend(
 }
 
 fn save_baseline(path: &PathBuf, results: &[BenchResult]) -> Result<()> {
-    let mut out = String::from("backend,avg_ms,p50_ms,p95_ms,p99_ms,min_ms,max_ms,stddev_ms,fps\n");
+    let mut out =
+        String::from("target,backend,avg_ms,p50_ms,p95_ms,p99_ms,min_ms,max_ms,stddev_ms,fps\n");
     for result in results {
         out.push_str(&format!(
-            "{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}\n",
+            "{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}\n",
+            result.target_label,
             backend_name(result.backend),
             result.avg_ms,
             result.p50_ms,
@@ -462,6 +561,7 @@ fn load_baseline(path: &PathBuf) -> Result<HashMap<String, BaselineEntry>> {
     };
     let backend_idx =
         column_index("backend").context("baseline header is missing required `backend` column")?;
+    let target_idx = column_index("target");
     let avg_idx =
         column_index("avg_ms").context("baseline header is missing required `avg_ms` column")?;
     let p50_idx =
@@ -514,9 +614,14 @@ fn load_baseline(path: &PathBuf) -> Result<HashMap<String, BaselineEntry>> {
         if backend.is_empty() {
             bail!("baseline line {line_number} has empty backend value");
         }
+        let target = target_idx
+            .and_then(|index| parts.get(index))
+            .map(|raw| raw.trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("primary-monitor");
 
         out.insert(
-            backend.to_string(),
+            baseline_key(target, backend),
             BaselineEntry {
                 avg_ms,
                 p50_ms,
@@ -536,7 +641,7 @@ fn check_regression(
 ) -> Result<()> {
     let mut regressions = Vec::new();
     for result in current {
-        let key = backend_name(result.backend).to_string();
+        let key = baseline_key(&result.target_label, backend_name(result.backend));
         let Some(base) = baseline.get(&key) else {
             continue;
         };
@@ -548,8 +653,9 @@ fn check_regression(
         let delta_pct = ((current_value - base_value) / base_value) * 100.0;
         if delta_pct > max_regression_pct {
             regressions.push(format!(
-                "{} {} regressed by {:.2}% (baseline {:.3} ms -> current {:.3} ms, limit {:.2}%)",
-                key,
+                "{} [{}] {} regressed by {:.2}% (baseline {:.3} ms -> current {:.3} ms, limit {:.2}%)",
+                backend_name(result.backend),
+                result.target_label,
                 metric.as_str(),
                 delta_pct,
                 base_value,
@@ -571,12 +677,22 @@ fn check_regression(
 
 fn print_results(results: &[BenchResult]) {
     println!(
-        "{:<6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "backend", "avg_ms", "p50_ms", "p95_ms", "p99_ms", "min_ms", "max_ms", "stddev", "fps"
+        "{:<32} {:<6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "target",
+        "backend",
+        "avg_ms",
+        "p50_ms",
+        "p95_ms",
+        "p99_ms",
+        "min_ms",
+        "max_ms",
+        "stddev",
+        "fps"
     );
     for r in results {
         println!(
-            "{:<6} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.2}",
+            "{:<32} {:<6} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.2}",
+            r.target_label,
             backend_name(r.backend),
             r.avg_ms,
             r.p50_ms,

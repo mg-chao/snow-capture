@@ -1,0 +1,64 @@
+[package]
+name = "snow-capture"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+tokio-stream = ["dep:tokio"]
+
+[dependencies]
+anyhow = "1.0.97"
+rustc-hash = "2"
+half = "2.4.1"
+rayon = "1.10.0"
+tokio = { version = "1", features = ["sync", "rt", "macros"], optional = true }
+windows = { version = "0.58.0", features = [
+    "Foundation",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Devices_Display",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_Storage_Xps",
+    "Win32_UI",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Performance",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+
+[profile.dev]
+incremental = false
+
+[dev-dependencies]
+image = { version = "0.25.6", default-features = false, features = ["png"] }
+
+[[example]]
+name = "capture"
+
+[[example]]
+name = "benchmark"
+
+[[example]]
+name = "stream"
+
+[[example]]
+name = "window_capture"
+
+[[example]]
+name = "region_capture"

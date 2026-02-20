@@ -13,7 +13,7 @@ use crate::convert::{
     self, HdrToSdrParams, SurfaceConversionOptions, SurfaceLayout, SurfacePixelFormat,
 };
 use crate::error::{CaptureError, CaptureResult};
-use crate::frame::Frame;
+use crate::frame::{DirtyRect, Frame};
 
 pub(crate) enum StagingSampleDesc {
     Source,
@@ -32,13 +32,17 @@ fn source_surface_format(format: DXGI_FORMAT) -> Option<SurfacePixelFormat> {
 }
 
 fn source_row_bytes(format: SurfacePixelFormat, pixel_count: usize) -> CaptureResult<usize> {
-    let bytes_per_pixel = match format {
-        SurfacePixelFormat::Bgra8 | SurfacePixelFormat::Rgba8 => 4usize,
-        SurfacePixelFormat::Rgba16Float => 8usize,
-    };
+    let bytes_per_pixel = source_bytes_per_pixel(format);
     pixel_count
         .checked_mul(bytes_per_pixel)
         .ok_or(CaptureError::BufferOverflow)
+}
+
+fn source_bytes_per_pixel(format: SurfacePixelFormat) -> usize {
+    match format {
+        SurfacePixelFormat::Bgra8 | SurfacePixelFormat::Rgba8 => 4usize,
+        SurfacePixelFormat::Rgba16Float => 8usize,
+    }
 }
 
 pub(crate) fn ensure_staging_texture<'a>(
@@ -178,4 +182,144 @@ pub(crate) fn map_staging_to_frame(
         context.Unmap(resource, 0);
     }
     result
+}
+
+/// Map an already-populated staging texture and apply only the provided
+/// dirty rectangles to the output frame.
+///
+/// Returns the number of dirty rectangles that were actually converted.
+pub(crate) fn map_staging_dirty_rects_to_frame(
+    context: &ID3D11DeviceContext,
+    staging: &ID3D11Texture2D,
+    staging_resource: Option<&ID3D11Resource>,
+    desc: &D3D11_TEXTURE2D_DESC,
+    frame: &mut Frame,
+    dirty_rects: &[DirtyRect],
+    hdr_to_sdr: Option<HdrToSdrParams>,
+    map_context: &'static str,
+) -> CaptureResult<usize> {
+    if dirty_rects.is_empty() {
+        return Ok(0);
+    }
+
+    let width_u32 = desc.Width;
+    let height_u32 = desc.Height;
+    frame.ensure_rgba_capacity(width_u32, height_u32)?;
+    let width = usize::try_from(width_u32).map_err(|_| CaptureError::BufferOverflow)?;
+    let height = usize::try_from(height_u32).map_err(|_| CaptureError::BufferOverflow)?;
+
+    let owned_resource;
+    let resource = match staging_resource {
+        Some(r) => r,
+        None => {
+            owned_resource = staging
+                .cast::<ID3D11Resource>()
+                .context("failed to cast staging texture to ID3D11Resource")
+                .map_err(CaptureError::Platform)?;
+            &owned_resource
+        }
+    };
+
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    // D3D11_MAP_FLAG_DO_NOT_WAIT = 0x100000
+    const DO_NOT_WAIT: u32 = 0x100000;
+    let non_blocking =
+        unsafe { context.Map(resource, 0, D3D11_MAP_READ, DO_NOT_WAIT, Some(&mut mapped)) };
+    if non_blocking.is_err() {
+        mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe { context.Map(resource, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
+            .context(map_context)
+            .map_err(CaptureError::Platform)?;
+    }
+
+    let convert_result = (|| -> CaptureResult<usize> {
+        let src_pitch = mapped.RowPitch as usize;
+        let src_base = mapped.pData as *const u8;
+        let format = source_surface_format(desc.Format)
+            .ok_or_else(|| CaptureError::UnsupportedFormat(format!("{:?}", desc.Format)))?;
+        let src_row_len = source_row_bytes(format, width)?;
+        src_pitch
+            .checked_mul(height.saturating_sub(1))
+            .and_then(|base| base.checked_add(src_row_len))
+            .ok_or(CaptureError::BufferOverflow)?;
+
+        let src_bytes_per_pixel = source_bytes_per_pixel(format);
+        let dst_pitch = width.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+        let dst_base = frame.as_mut_rgba_ptr();
+
+        let mut converted = 0usize;
+
+        for rect in dirty_rects {
+            let x = usize::try_from(rect.x).map_err(|_| CaptureError::BufferOverflow)?;
+            let y = usize::try_from(rect.y).map_err(|_| CaptureError::BufferOverflow)?;
+            let rect_w = usize::try_from(rect.width).map_err(|_| CaptureError::BufferOverflow)?;
+            let rect_h = usize::try_from(rect.height).map_err(|_| CaptureError::BufferOverflow)?;
+
+            if rect_w == 0 || rect_h == 0 || x >= width || y >= height {
+                continue;
+            }
+
+            let end_x = x.saturating_add(rect_w).min(width);
+            let end_y = y.saturating_add(rect_h).min(height);
+            if end_x <= x || end_y <= y {
+                continue;
+            }
+
+            let copy_w = end_x - x;
+            let copy_h = end_y - y;
+            let src_row_bytes = source_row_bytes(format, copy_w)?;
+            let src_end_in_row = x
+                .checked_mul(src_bytes_per_pixel)
+                .and_then(|offset| offset.checked_add(src_row_bytes))
+                .ok_or(CaptureError::BufferOverflow)?;
+            if src_end_in_row > src_pitch {
+                return Err(CaptureError::BufferOverflow);
+            }
+
+            let dst_row_bytes = copy_w.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+            let dst_end_in_row = x
+                .checked_mul(4)
+                .and_then(|offset| offset.checked_add(dst_row_bytes))
+                .ok_or(CaptureError::BufferOverflow)?;
+            if dst_end_in_row > dst_pitch {
+                return Err(CaptureError::BufferOverflow);
+            }
+
+            let src_offset = y
+                .checked_mul(src_pitch)
+                .and_then(|base| {
+                    x.checked_mul(src_bytes_per_pixel)
+                        .and_then(|xoff| base.checked_add(xoff))
+                })
+                .ok_or(CaptureError::BufferOverflow)?;
+
+            let dst_offset = y
+                .checked_mul(dst_pitch)
+                .and_then(|base| x.checked_mul(4).and_then(|xoff| base.checked_add(xoff)))
+                .ok_or(CaptureError::BufferOverflow)?;
+
+            unsafe {
+                convert::convert_surface_to_rgba_unchecked(
+                    format,
+                    SurfaceLayout::new(
+                        src_base.add(src_offset),
+                        src_pitch,
+                        dst_base.add(dst_offset),
+                        dst_pitch,
+                        copy_w,
+                        copy_h,
+                    ),
+                    SurfaceConversionOptions { hdr_to_sdr },
+                );
+            }
+            converted += 1;
+        }
+
+        Ok(converted)
+    })();
+
+    unsafe {
+        context.Unmap(resource, 0);
+    }
+    convert_result
 }

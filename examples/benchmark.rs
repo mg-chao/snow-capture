@@ -6,17 +6,25 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use snow_capture::backend::CaptureBackendKind;
 use snow_capture::frame::Frame;
-use snow_capture::{CaptureMode, CaptureSession, CaptureTarget};
+use snow_capture::{CaptureMode, CaptureSession, CaptureTarget, WindowId};
 
 const DEFAULT_WARMUP_FRAMES: usize = 30;
 const DEFAULT_MEASURE_FRAMES: usize = 240;
+const DEFAULT_ROUNDS: usize = 3;
 const DEFAULT_MAX_REGRESSION_PCT: f64 = 10.0;
+
+#[derive(Clone, Debug)]
+enum BenchTarget {
+    PrimaryMonitor,
+    Window(WindowId),
+}
 
 #[derive(Clone, Copy, Debug)]
 enum RegressionMetric {
     Avg,
     P50,
     P95,
+    P99,
 }
 
 impl RegressionMetric {
@@ -25,6 +33,7 @@ impl RegressionMetric {
             "avg" | "average" => Some(Self::Avg),
             "p50" | "median" => Some(Self::P50),
             "p95" => Some(Self::P95),
+            "p99" => Some(Self::P99),
             _ => None,
         }
     }
@@ -34,6 +43,7 @@ impl RegressionMetric {
             Self::Avg => "avg",
             Self::P50 => "p50",
             Self::P95 => "p95",
+            Self::P99 => "p99",
         }
     }
 
@@ -42,6 +52,7 @@ impl RegressionMetric {
             Self::Avg => result.avg_ms,
             Self::P50 => result.p50_ms,
             Self::P95 => result.p95_ms,
+            Self::P99 => result.p99_ms,
         }
     }
 
@@ -50,6 +61,7 @@ impl RegressionMetric {
             Self::Avg => entry.avg_ms,
             Self::P50 => entry.p50_ms,
             Self::P95 => entry.p95_ms,
+            Self::P99 => entry.p99_ms,
         }
     }
 }
@@ -65,7 +77,9 @@ impl Default for RegressionMetric {
 struct Config {
     warmup_frames: usize,
     measure_frames: usize,
+    rounds: usize,
     backends: Vec<CaptureBackendKind>,
+    target: BenchTarget,
     baseline_path: Option<PathBuf>,
     save_baseline_path: Option<PathBuf>,
     max_regression_pct: f64,
@@ -78,8 +92,10 @@ struct BenchResult {
     avg_ms: f64,
     p50_ms: f64,
     p95_ms: f64,
+    p99_ms: f64,
     min_ms: f64,
     max_ms: f64,
+    stddev_ms: f64,
     fps: f64,
 }
 
@@ -88,6 +104,7 @@ struct BaselineEntry {
     avg_ms: f64,
     p50_ms: f64,
     p95_ms: f64,
+    p99_ms: f64,
 }
 
 fn backend_name(kind: CaptureBackendKind) -> &'static str {
@@ -146,14 +163,68 @@ fn parse_f64_arg(flag: &str, value: Option<&str>) -> Result<f64> {
         .with_context(|| format!("failed to parse {flag} value: {raw}"))
 }
 
+fn parse_window_handle(raw: &str) -> Result<isize> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("window handle cannot be empty");
+    }
+
+    let parsed_u64 = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16)
+            .with_context(|| format!("failed to parse hex window handle: {trimmed}"))?
+    } else {
+        trimmed
+            .parse::<u64>()
+            .with_context(|| format!("failed to parse window handle: {trimmed}"))?
+    };
+
+    if parsed_u64 > isize::MAX as u64 {
+        bail!("window handle out of range for this platform: {trimmed}");
+    }
+    Ok(parsed_u64 as isize)
+}
+
+fn window_under_cursor() -> Result<WindowId> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GA_ROOT, GetAncestor, GetCursorPos, WindowFromPoint,
+    };
+
+    let mut pt = POINT::default();
+    unsafe { GetCursorPos(&mut pt) }
+        .ok()
+        .context("GetCursorPos failed while resolving benchmark window")?;
+
+    let hwnd = unsafe { WindowFromPoint(pt) };
+    if hwnd.0.is_null() {
+        bail!("no window found under cursor at ({}, {})", pt.x, pt.y);
+    }
+
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    let handle = if root.0.is_null() { hwnd } else { root };
+    Ok(WindowId::from_raw_handle(handle.0 as isize))
+}
+
+fn target_label(target: &BenchTarget) -> String {
+    match target {
+        BenchTarget::PrimaryMonitor => "primary-monitor".to_string(),
+        BenchTarget::Window(window) => format!("window:{}", window.stable_id()),
+    }
+}
+
 fn parse_args() -> Result<Config> {
     let mut warmup_frames = DEFAULT_WARMUP_FRAMES;
     let mut measure_frames = DEFAULT_MEASURE_FRAMES;
+    let mut rounds = DEFAULT_ROUNDS;
     let mut backends = vec![
         CaptureBackendKind::DxgiDuplication,
         CaptureBackendKind::WindowsGraphicsCapture,
         CaptureBackendKind::Gdi,
     ];
+    let mut target = BenchTarget::PrimaryMonitor;
     let mut baseline_path = None;
     let mut save_baseline_path = None;
     let mut max_regression_pct = DEFAULT_MAX_REGRESSION_PCT;
@@ -171,11 +242,26 @@ fn parse_args() -> Result<Config> {
                 measure_frames = parse_usize_arg("--frames", args.get(i + 1).map(String::as_str))?;
                 i += 2;
             }
+            "--rounds" => {
+                rounds = parse_usize_arg("--rounds", args.get(i + 1).map(String::as_str))?;
+                i += 2;
+            }
             "--backends" => {
                 let Some(raw) = args.get(i + 1).map(String::as_str) else {
                     bail!("--backends requires a comma-separated value");
                 };
                 backends = parse_backends(raw)?;
+                i += 2;
+            }
+            "--window-under-cursor" => {
+                target = BenchTarget::Window(window_under_cursor()?);
+                i += 1;
+            }
+            "--window-handle" => {
+                let Some(raw) = args.get(i + 1).map(String::as_str) else {
+                    bail!("--window-handle requires a value (decimal or hex, e.g. 0x1234)");
+                };
+                target = BenchTarget::Window(WindowId::from_raw_handle(parse_window_handle(raw)?));
                 i += 2;
             }
             "--baseline" => {
@@ -199,10 +285,10 @@ fn parse_args() -> Result<Config> {
             }
             "--regression-metric" => {
                 let Some(raw) = args.get(i + 1).map(String::as_str) else {
-                    bail!("--regression-metric requires one of: avg, p50, p95");
+                    bail!("--regression-metric requires one of: avg, p50, p95, p99");
                 };
                 let Some(metric) = RegressionMetric::parse(raw) else {
-                    bail!("invalid --regression-metric: {raw}. Use avg, p50, or p95");
+                    bail!("invalid --regression-metric: {raw}. Use avg, p50, p95, or p99");
                 };
                 regression_metric = metric;
                 i += 2;
@@ -212,11 +298,14 @@ fn parse_args() -> Result<Config> {
                     "Usage: cargo run --release --example benchmark -- [options]
   --warmup <n>               Warmup frames per backend (default: {DEFAULT_WARMUP_FRAMES})
   --frames <n>               Measured frames per backend (default: {DEFAULT_MEASURE_FRAMES})
+  --rounds <n>               Benchmark rounds per backend (default: {DEFAULT_ROUNDS})
   --backends <csv>           Backends list, e.g. dxgi,wgc,gdi
+  --window-under-cursor      Benchmark window capture for the window under the cursor
+  --window-handle <value>    Benchmark window capture for an HWND (decimal or 0xHEX)
   --baseline <path>          Compare current run to baseline CSV
   --save-baseline <path>     Save current run as baseline CSV
   --max-regression-pct <f>   Allowed metric increase vs baseline (default: {DEFAULT_MAX_REGRESSION_PCT})
-  --regression-metric <m>    Metric for regression checks: avg | p50 | p95 (default: p50)"
+  --regression-metric <m>    Metric for regression checks: avg | p50 | p95 | p99 (default: p50)"
                 );
                 std::process::exit(0);
             }
@@ -232,6 +321,9 @@ fn parse_args() -> Result<Config> {
     if measure_frames == 0 {
         bail!("--frames must be >= 1");
     }
+    if rounds == 0 {
+        bail!("--rounds must be >= 1");
+    }
     if max_regression_pct < 0.0 {
         bail!("--max-regression-pct must be >= 0");
     }
@@ -239,7 +331,9 @@ fn parse_args() -> Result<Config> {
     Ok(Config {
         warmup_frames,
         measure_frames,
+        rounds,
         backends,
+        target,
         baseline_path,
         save_baseline_path,
         max_regression_pct,
@@ -257,10 +351,19 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[idx]
 }
 
+fn capture_target_for(target: &BenchTarget) -> CaptureTarget {
+    match target {
+        BenchTarget::PrimaryMonitor => CaptureTarget::PrimaryMonitor,
+        BenchTarget::Window(window) => CaptureTarget::Window(*window),
+    }
+}
+
 fn run_backend(
     kind: CaptureBackendKind,
     warmup_frames: usize,
     measure_frames: usize,
+    rounds: usize,
+    bench_target: &BenchTarget,
 ) -> Result<BenchResult> {
     let mut session = CaptureSession::builder()
         .with_backend_kind(kind)
@@ -272,51 +375,70 @@ fn run_backend(
                 backend_name(kind)
             )
         })?;
-    let target = CaptureTarget::PrimaryMonitor;
+    let target = capture_target_for(bench_target);
     let mut frame = Frame::empty();
 
-    for _ in 0..warmup_frames {
-        session
-            .capture_frame_into(&target, &mut frame)
-            .with_context(|| format!("warmup capture failed for {}", backend_name(kind)))?;
-    }
+    let total_samples = measure_frames
+        .checked_mul(rounds)
+        .context("benchmark sample count overflow")?;
+    let mut samples_ms = Vec::with_capacity(total_samples);
 
-    let mut samples_ms = Vec::with_capacity(measure_frames);
-    for _ in 0..measure_frames {
-        let t0 = Instant::now();
-        session
-            .capture_frame_into(&target, &mut frame)
-            .with_context(|| format!("capture failed for {}", backend_name(kind)))?;
-        samples_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+    for _round in 0..rounds {
+        for _ in 0..warmup_frames {
+            session
+                .capture_frame_into(&target, &mut frame)
+                .with_context(|| format!("warmup capture failed for {}", backend_name(kind)))?;
+        }
+
+        for _ in 0..measure_frames {
+            let t0 = Instant::now();
+            session
+                .capture_frame_into(&target, &mut frame)
+                .with_context(|| format!("capture failed for {}", backend_name(kind)))?;
+            samples_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
     }
 
     let mut sorted = samples_ms.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let sum_ms: f64 = samples_ms.iter().sum();
     let avg_ms = sum_ms / samples_ms.len() as f64;
+    let variance = samples_ms
+        .iter()
+        .map(|sample| {
+            let d = *sample - avg_ms;
+            d * d
+        })
+        .sum::<f64>()
+        / samples_ms.len() as f64;
+    let stddev_ms = variance.sqrt();
 
     Ok(BenchResult {
         backend: kind,
         avg_ms,
         p50_ms: percentile(&sorted, 0.50),
         p95_ms: percentile(&sorted, 0.95),
+        p99_ms: percentile(&sorted, 0.99),
         min_ms: *sorted.first().unwrap(),
         max_ms: *sorted.last().unwrap(),
+        stddev_ms,
         fps: if avg_ms > 0.0 { 1000.0 / avg_ms } else { 0.0 },
     })
 }
 
 fn save_baseline(path: &PathBuf, results: &[BenchResult]) -> Result<()> {
-    let mut out = String::from("backend,avg_ms,p50_ms,p95_ms,min_ms,max_ms,fps\n");
+    let mut out = String::from("backend,avg_ms,p50_ms,p95_ms,p99_ms,min_ms,max_ms,stddev_ms,fps\n");
     for result in results {
         out.push_str(&format!(
-            "{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}\n",
+            "{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}\n",
             backend_name(result.backend),
             result.avg_ms,
             result.p50_ms,
             result.p95_ms,
+            result.p99_ms,
             result.min_ms,
             result.max_ms,
+            result.stddev_ms,
             result.fps
         ));
     }
@@ -327,34 +449,79 @@ fn save_baseline(path: &PathBuf, results: &[BenchResult]) -> Result<()> {
 fn load_baseline(path: &PathBuf) -> Result<HashMap<String, BaselineEntry>> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read baseline file {}", path.display()))?;
+    let mut lines = text.lines();
+    let header_line = lines
+        .next()
+        .context("baseline file is empty (missing header row)")?;
+    let header: Vec<&str> = header_line.split(',').map(|column| column.trim()).collect();
+
+    let column_index = |name: &str| {
+        header
+            .iter()
+            .position(|column| column.eq_ignore_ascii_case(name))
+    };
+    let backend_idx =
+        column_index("backend").context("baseline header is missing required `backend` column")?;
+    let avg_idx =
+        column_index("avg_ms").context("baseline header is missing required `avg_ms` column")?;
+    let p50_idx =
+        column_index("p50_ms").context("baseline header is missing required `p50_ms` column")?;
+    let p95_idx =
+        column_index("p95_ms").context("baseline header is missing required `p95_ms` column")?;
+    let p99_idx = column_index("p99_ms");
+
     let mut out = HashMap::new();
-    for (line_idx, line) in text.lines().enumerate() {
-        if line_idx == 0 {
-            continue;
-        }
+    for (line_offset, line) in lines.enumerate() {
+        let line_number = line_offset + 2;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         let parts: Vec<&str> = trimmed.split(',').collect();
-        if parts.len() < 4 {
-            bail!("invalid baseline line {}: {line}", line_idx + 1);
+        if parts.len() <= p95_idx || parts.len() <= backend_idx {
+            bail!("invalid baseline line {line_number}: {line}");
         }
-        let avg_ms = parts[1].parse::<f64>().with_context(|| {
-            format!("invalid avg_ms in baseline line {}: {}", line_idx + 1, line)
-        })?;
-        let p50_ms = parts[2].parse::<f64>().with_context(|| {
-            format!("invalid p50_ms in baseline line {}: {}", line_idx + 1, line)
-        })?;
-        let p95_ms = parts[3].parse::<f64>().with_context(|| {
-            format!("invalid p95_ms in baseline line {}: {}", line_idx + 1, line)
-        })?;
+
+        let parse_metric = |column_name: &str, index: usize| -> Result<f64> {
+            parts
+                .get(index)
+                .context(format!(
+                    "baseline line {line_number} is missing `{column_name}` value"
+                ))?
+                .trim()
+                .parse::<f64>()
+                .with_context(|| {
+                    format!(
+                        "invalid {column_name} in baseline line {line_number}: {}",
+                        line
+                    )
+                })
+        };
+
+        let avg_ms = parse_metric("avg_ms", avg_idx)?;
+        let p50_ms = parse_metric("p50_ms", p50_idx)?;
+        let p95_ms = parse_metric("p95_ms", p95_idx)?;
+        let p99_ms = if let Some(index) = p99_idx {
+            if index < parts.len() && !parts[index].trim().is_empty() {
+                parse_metric("p99_ms", index)?
+            } else {
+                p95_ms
+            }
+        } else {
+            p95_ms
+        };
+        let backend = parts[backend_idx].trim();
+        if backend.is_empty() {
+            bail!("baseline line {line_number} has empty backend value");
+        }
+
         out.insert(
-            parts[0].to_string(),
+            backend.to_string(),
             BaselineEntry {
                 avg_ms,
                 p50_ms,
                 p95_ms,
+                p99_ms,
             },
         );
     }
@@ -404,18 +571,20 @@ fn check_regression(
 
 fn print_results(results: &[BenchResult]) {
     println!(
-        "{:<6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "backend", "avg_ms", "p50_ms", "p95_ms", "min_ms", "max_ms", "fps"
+        "{:<6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "backend", "avg_ms", "p50_ms", "p95_ms", "p99_ms", "min_ms", "max_ms", "stddev", "fps"
     );
     for r in results {
         println!(
-            "{:<6} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.2}",
+            "{:<6} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.2}",
             backend_name(r.backend),
             r.avg_ms,
             r.p50_ms,
             r.p95_ms,
+            r.p99_ms,
             r.min_ms,
             r.max_ms,
+            r.stddev_ms,
             r.fps
         );
     }
@@ -424,9 +593,11 @@ fn print_results(results: &[BenchResult]) {
 fn main() -> Result<()> {
     let config = parse_args()?;
     println!(
-        "Running benchmark: warmup={} frames={} backends={} regression_metric={}",
+        "Running benchmark: target={} warmup={} frames={} rounds={} backends={} regression_metric={}",
+        target_label(&config.target),
         config.warmup_frames,
         config.measure_frames,
+        config.rounds,
         config
             .backends
             .iter()
@@ -439,7 +610,13 @@ fn main() -> Result<()> {
     let mut results = Vec::with_capacity(config.backends.len());
     for backend in &config.backends {
         println!("Benchmarking {}...", backend_name(*backend));
-        let result = run_backend(*backend, config.warmup_frames, config.measure_frames)?;
+        let result = run_backend(
+            *backend,
+            config.warmup_frames,
+            config.measure_frames,
+            config.rounds,
+            &config.target,
+        )?;
         results.push(result);
     }
     print_results(&results);

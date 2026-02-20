@@ -4,14 +4,16 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
 use windows::Graphics::Capture::{
-    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureDirtyRegionMode,
+    GraphicsCaptureItem, GraphicsCaptureSession,
 };
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
+    D3D11_BOX, D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext, ID3D11Resource,
+    ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
 use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_ACCESS_LOST, IDXGIDevice};
@@ -21,10 +23,10 @@ use windows::Win32::System::WinRT::Direct3D11::{
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::core::{IInspectable, Interface};
 
-use crate::backend::CaptureMode;
+use crate::backend::{CaptureMode, CursorCaptureConfig};
 use crate::convert::HdrToSdrParams;
 use crate::error::{CaptureError, CaptureResult};
-use crate::frame::Frame;
+use crate::frame::{DirtyRect, Frame};
 use crate::monitor::MonitorId;
 use crate::window::WindowId;
 
@@ -37,6 +39,8 @@ use super::surface::{self, StagingSampleDesc};
 const WGC_FRAME_TIMEOUT: Duration = Duration::from_millis(250);
 const WGC_STALE_FRAME_TIMEOUT: Duration = Duration::from_millis(8);
 const WGC_FRAME_POOL_BUFFERS: i32 = 2;
+const WGC_DIRTY_COPY_MAX_RECTS: usize = 192;
+const WGC_DIRTY_COPY_MAX_AREA_PERCENT: u64 = 70;
 
 fn hdr_to_sdr_params(hdr: HdrMonitorMetadata) -> Option<HdrToSdrParams> {
     if !hdr.advanced_color_enabled {
@@ -55,6 +59,133 @@ fn hdr_to_sdr_params(hdr: HdrMonitorMetadata) -> Option<HdrToSdrParams> {
         hdr_maximum_nits: hdr.hdr_maximum_nits.unwrap_or(1000.0),
         sdr_white_level_nits,
     })
+}
+
+fn clamp_dirty_rect(rect: DirtyRect, width: u32, height: u32) -> Option<DirtyRect> {
+    let x = rect.x.min(width);
+    let y = rect.y.min(height);
+    if x >= width || y >= height {
+        return None;
+    }
+
+    let max_w = width - x;
+    let max_h = height - y;
+    let clamped_w = rect.width.min(max_w);
+    let clamped_h = rect.height.min(max_h);
+    if clamped_w == 0 || clamped_h == 0 {
+        return None;
+    }
+
+    Some(DirtyRect {
+        x,
+        y,
+        width: clamped_w,
+        height: clamped_h,
+    })
+}
+
+fn extract_dirty_rects(
+    frame: &Direct3D11CaptureFrame,
+    width: u32,
+    height: u32,
+    out: &mut Vec<DirtyRect>,
+) -> Option<GraphicsCaptureDirtyRegionMode> {
+    out.clear();
+    let mode = frame.DirtyRegionMode().ok()?;
+    let regions = frame.DirtyRegions().ok()?;
+    let count = regions.Size().ok()?;
+
+    for idx in 0..count {
+        let Ok(rect) = regions.GetAt(idx) else {
+            continue;
+        };
+
+        if rect.Width <= 0 || rect.Height <= 0 {
+            continue;
+        }
+
+        let x = rect.X.max(0) as u32;
+        let y = rect.Y.max(0) as u32;
+        let rect_width = rect.Width as u32;
+        let rect_height = rect.Height as u32;
+
+        if let Some(clamped) = clamp_dirty_rect(
+            DirtyRect {
+                x,
+                y,
+                width: rect_width,
+                height: rect_height,
+            },
+            width,
+            height,
+        ) {
+            out.push(clamped);
+        }
+    }
+
+    Some(mode)
+}
+
+fn should_use_dirty_copy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
+    if rects.is_empty() || rects.len() > WGC_DIRTY_COPY_MAX_RECTS {
+        return false;
+    }
+
+    let total_pixels = (width as u64).saturating_mul(height as u64);
+    if total_pixels == 0 {
+        return false;
+    }
+
+    let mut dirty_pixels = 0u64;
+    for rect in rects {
+        dirty_pixels =
+            dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+        if dirty_pixels.saturating_mul(100)
+            > total_pixels.saturating_mul(WGC_DIRTY_COPY_MAX_AREA_PERCENT)
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn copy_dirty_rects_to_staging(
+    context: &ID3D11DeviceContext,
+    source_resource: &ID3D11Resource,
+    staging_resource: &ID3D11Resource,
+    rects: &[DirtyRect],
+) {
+    for rect in rects {
+        if rect.width == 0 || rect.height == 0 {
+            continue;
+        }
+        let right = rect.x.saturating_add(rect.width);
+        let bottom = rect.y.saturating_add(rect.height);
+        if right <= rect.x || bottom <= rect.y {
+            continue;
+        }
+        let src_box = D3D11_BOX {
+            left: rect.x,
+            top: rect.y,
+            front: 0,
+            right,
+            bottom,
+            back: 1,
+        };
+        unsafe {
+            context.CopySubresourceRegion(
+                staging_resource,
+                0,
+                rect.x,
+                rect.y,
+                0,
+                source_resource,
+                0,
+                Some(&src_box),
+            );
+        }
+    }
 }
 
 /// WGC FrameArrived stores the system-relative time alongside the frame.
@@ -159,6 +290,8 @@ struct WindowsGraphicsCaptureCapturer {
     gpu_tonemapper: Option<GpuTonemapper>,
     /// GPU F16→sRGB converter for when source is F16 but no HDR tonemap needed.
     gpu_f16_converter: Option<GpuF16Converter>,
+    cursor_config: CursorCaptureConfig,
+    has_frame_history: bool,
 }
 
 // SAFETY: WGC COM objects are not Send, but we only access them from
@@ -205,6 +338,12 @@ impl WindowsGraphicsCaptureCapturer {
             .CreateCaptureSession(&item)
             .context("Direct3D11CaptureFramePool::CreateCaptureSession failed")
             .map_err(CaptureError::Platform)?;
+        let cursor_config = CursorCaptureConfig::default();
+        // Best-effort session tuning:
+        // - Disable cursor composition unless explicitly requested.
+        // - Disable the capture border where allowed by the OS.
+        let _ = session.SetIsCursorCaptureEnabled(cursor_config.capture_cursor);
+        let _ = session.SetIsBorderRequired(false);
 
         let signal = Arc::new(FrameSignal::default());
         let signal_for_frames = signal.clone();
@@ -296,6 +435,8 @@ impl WindowsGraphicsCaptureCapturer {
             hdr_to_sdr,
             gpu_tonemapper,
             gpu_f16_converter,
+            cursor_config,
+            has_frame_history: false,
         })
     }
 
@@ -368,6 +509,7 @@ impl WindowsGraphicsCaptureCapturer {
             self.staging = None;
             self.staging_resource = None;
             self.cached_src_desc = None;
+            self.has_frame_history = false;
         }
         Ok(())
     }
@@ -462,6 +604,28 @@ impl WindowsGraphicsCaptureCapturer {
             (frame_texture.clone(), src_desc, self.hdr_to_sdr)
         };
 
+        let out_matches_source =
+            out.width() == effective_desc.Width && out.height() == effective_desc.Height;
+        if self.has_frame_history && out.metadata.is_duplicate && out_matches_source {
+            out.metadata.dirty_rects.clear();
+            let _ = capture_frame.Close();
+            return Ok(out);
+        }
+
+        let dirty_mode = extract_dirty_rects(
+            &capture_frame,
+            effective_desc.Width,
+            effective_desc.Height,
+            &mut out.metadata.dirty_rects,
+        );
+        let had_compatible_staging = self.staging.as_ref().is_some_and(|existing| {
+            let mut existing_desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { existing.GetDesc(&mut existing_desc) };
+            existing_desc.Width == effective_desc.Width
+                && existing_desc.Height == effective_desc.Height
+                && existing_desc.Format == effective_desc.Format
+        });
+
         let staging = surface::ensure_staging_texture(
             &self.device,
             &mut self.staging,
@@ -486,28 +650,97 @@ impl WindowsGraphicsCaptureCapturer {
             .cast()
             .context("failed to cast WGC frame texture to ID3D11Resource")
             .map_err(CaptureError::Platform)?;
-        unsafe {
-            self.context
-                .CopyResource(staging_resource, &source_resource);
+        let use_dirty_copy = self.has_frame_history
+            && had_compatible_staging
+            && out_matches_source
+            && dirty_mode.is_some()
+            && !out.metadata.dirty_rects.is_empty()
+            && should_use_dirty_copy(
+                &out.metadata.dirty_rects,
+                effective_desc.Width,
+                effective_desc.Height,
+            );
+        let dirty_rects_for_copy = if use_dirty_copy {
+            Some(out.metadata.dirty_rects.clone())
+        } else {
+            None
+        };
+
+        if use_dirty_copy {
+            copy_dirty_rects_to_staging(
+                &self.context,
+                &source_resource,
+                staging_resource,
+                dirty_rects_for_copy.as_ref().unwrap(),
+            );
         }
 
-        let copy_result = surface::map_staging_to_frame(
-            &self.context,
-            staging,
-            Some(staging_resource),
-            &effective_desc,
-            &mut out,
-            effective_hdr,
-            "failed to map WGC staging texture",
-        );
+        let copy_result = if use_dirty_copy {
+            match surface::map_staging_dirty_rects_to_frame(
+                &self.context,
+                staging,
+                Some(staging_resource),
+                &effective_desc,
+                &mut out,
+                dirty_rects_for_copy.as_ref().unwrap(),
+                effective_hdr,
+                "failed to map WGC staging texture (dirty regions)",
+            ) {
+                Ok(converted) if converted > 0 => Ok(()),
+                Ok(_) | Err(_) => {
+                    unsafe {
+                        self.context
+                            .CopyResource(staging_resource, &source_resource);
+                    }
+                    surface::map_staging_to_frame(
+                        &self.context,
+                        staging,
+                        Some(staging_resource),
+                        &effective_desc,
+                        &mut out,
+                        effective_hdr,
+                        "failed to map WGC staging texture",
+                    )
+                }
+            }
+        } else {
+            unsafe {
+                self.context
+                    .CopyResource(staging_resource, &source_resource);
+            }
+            surface::map_staging_to_frame(
+                &self.context,
+                staging,
+                Some(staging_resource),
+                &effective_desc,
+                &mut out,
+                effective_hdr,
+                "failed to map WGC staging texture",
+            )
+        };
+
+        if dirty_mode.is_none() {
+            out.metadata.dirty_rects.clear();
+        }
 
         let _ = capture_frame.Close();
-        copy_result?;
+        if let Err(err) = copy_result {
+            self.has_frame_history = false;
+            return Err(err);
+        }
+        self.has_frame_history = true;
         Ok(out)
     }
 
     fn set_capture_mode(&mut self, mode: CaptureMode) {
         self.capture_mode = mode;
+    }
+
+    fn set_cursor_config(&mut self, config: CursorCaptureConfig) {
+        self.cursor_config = config;
+        let _ = self
+            .session
+            .SetIsCursorCaptureEnabled(self.cursor_config.capture_cursor);
     }
 }
 
@@ -532,8 +765,13 @@ impl WindowsMonitorCapturer {
         let (device, context) = d3d11::create_d3d11_device_for_adapter(&resolved.adapter, false)
             .map_err(CaptureError::Platform)?;
         let item = create_monitor_capture_item(resolved.handle)?;
-        let inner =
-            WindowsGraphicsCaptureCapturer::new(com, device, context, item, Some(resolved.hdr_metadata))?;
+        let inner = WindowsGraphicsCaptureCapturer::new(
+            com,
+            device,
+            context,
+            item,
+            Some(resolved.hdr_metadata),
+        )?;
         Ok(Self { inner })
     }
 }
@@ -545,6 +783,10 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
 
     fn set_capture_mode(&mut self, mode: CaptureMode) {
         self.inner.set_capture_mode(mode);
+    }
+
+    fn set_cursor_config(&mut self, config: CursorCaptureConfig) {
+        self.inner.set_cursor_config(config);
     }
 }
 
@@ -578,5 +820,9 @@ impl crate::backend::MonitorCapturer for WindowsWindowCapturer {
 
     fn set_capture_mode(&mut self, mode: CaptureMode) {
         self.inner.set_capture_mode(mode);
+    }
+
+    fn set_cursor_config(&mut self, config: CursorCaptureConfig) {
+        self.inner.set_cursor_config(config);
     }
 }

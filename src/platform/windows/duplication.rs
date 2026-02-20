@@ -44,6 +44,8 @@ const PRESENT_TIMEOUT_MS: u32 = 16;
 const FALLBACK_TIMEOUT_MS: u32 = 250;
 const STEADY_STATE_ATTEMPTS: usize = 20;
 const STEADY_STATE_TIMEOUT_MS: u32 = 100;
+const DXGI_DIRTY_COPY_MAX_RECTS: usize = 192;
+const DXGI_DIRTY_COPY_MAX_AREA_PERCENT: u64 = 70;
 
 fn hdr_to_sdr_params(hdr: HdrMonitorMetadata) -> Option<HdrToSdrParams> {
     if !hdr.advanced_color_enabled {
@@ -382,14 +384,23 @@ impl StagingRing {
     /// call.  The spin is cheaper than the driver's internal kernel wait
     /// for the common case where the copy finishes within a few hundred
     /// nanoseconds of our check.
-    fn read_slot(
+    fn read_slot_with_strategy(
         &mut self,
         context: &ID3D11DeviceContext,
         slot: usize,
         desc: &D3D11_TEXTURE2D_DESC,
         frame: &mut Frame,
         hdr_to_sdr: Option<HdrToSdrParams>,
+        dirty_rects: &[DirtyRect],
+        use_dirty_copy: bool,
+        skip_readback: bool,
     ) -> CaptureResult<()> {
+        // The caller keeps the previous output pixels for duplicate frames,
+        // so we can skip both query polling and CPU mapping entirely.
+        if skip_readback {
+            return Ok(());
+        }
+
         // D3D11_ASYNC_GETDATA_DONOTFLUSH = 0x1 -- avoids an implicit
         // Flush() inside GetData which would stall the GPU pipeline.
         const DO_NOT_FLUSH: u32 = 0x1;
@@ -431,15 +442,39 @@ impl StagingRing {
 
         let staging = self.slots[slot].as_ref().unwrap();
         let staging_res = self.slot_resources[slot].as_ref();
-        surface::map_staging_to_frame(
-            context,
-            staging,
-            staging_res,
-            desc,
-            frame,
-            hdr_to_sdr,
-            "failed to map staging texture",
-        )
+        if use_dirty_copy {
+            match surface::map_staging_dirty_rects_to_frame(
+                context,
+                staging,
+                staging_res,
+                desc,
+                frame,
+                dirty_rects,
+                hdr_to_sdr,
+                "failed to map staging texture (dirty regions)",
+            ) {
+                Ok(converted) if converted > 0 => Ok(()),
+                Ok(_) | Err(_) => surface::map_staging_to_frame(
+                    context,
+                    staging,
+                    staging_res,
+                    desc,
+                    frame,
+                    hdr_to_sdr,
+                    "failed to map staging texture",
+                ),
+            }
+        } else {
+            surface::map_staging_to_frame(
+                context,
+                staging,
+                staging_res,
+                desc,
+                frame,
+                hdr_to_sdr,
+                "failed to map staging texture",
+            )
+        }
     }
 
     /// Synchronous single-shot: copy + flush + spin-wait + map + convert.
@@ -545,6 +580,30 @@ fn extract_dirty_rects(
     }
 }
 
+fn should_use_dirty_copy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
+    if rects.is_empty() || rects.len() > DXGI_DIRTY_COPY_MAX_RECTS {
+        return false;
+    }
+
+    let total_pixels = (width as u64).saturating_mul(height as u64);
+    if total_pixels == 0 {
+        return false;
+    }
+
+    let mut dirty_pixels = 0u64;
+    for rect in rects {
+        dirty_pixels =
+            dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+        if dirty_pixels.saturating_mul(100)
+            > total_pixels.saturating_mul(DXGI_DIRTY_COPY_MAX_AREA_PERCENT)
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// Extract cursor shape and position from the DXGI duplication frame.
 /// Returns `None` if cursor data is unavailable or extraction fails.
 fn extract_cursor_data(
@@ -635,6 +694,10 @@ struct OutputCapturer {
     /// read back the pipelined staging slot on the next capture call.
     pending_desc: Option<D3D11_TEXTURE2D_DESC>,
     pending_hdr: Option<HdrToSdrParams>,
+    /// Whether the pending pipelined frame was marked duplicate by DXGI.
+    pending_is_duplicate: bool,
+    /// Dirty rectangles associated with the pending pipelined frame.
+    pending_dirty_rects: Vec<DirtyRect>,
     /// Cached descriptor of the desktop texture from the duplication
     /// interface.  DXGI duplication textures don't change format/size
     /// mid-session, so we only need to query once (and re-query after
@@ -686,6 +749,8 @@ impl OutputCapturer {
             staging_ring: StagingRing::new(),
             pending_desc: None,
             pending_hdr: None,
+            pending_is_duplicate: false,
+            pending_dirty_rects: Vec::new(),
             cached_src_desc: None,
             spare_frame: None,
             region_staging: None,
@@ -706,6 +771,8 @@ impl OutputCapturer {
         self.staging_ring.invalidate();
         self.pending_desc = None;
         self.pending_hdr = None;
+        self.pending_is_duplicate = false;
+        self.pending_dirty_rects.clear();
         self.cached_src_desc = None;
         self.region_staging = None;
         self.region_staging_resource = None;
@@ -723,6 +790,8 @@ impl OutputCapturer {
         // Drop any in-flight pipeline state when switching modes.
         self.pending_desc = None;
         self.pending_hdr = None;
+        self.pending_is_duplicate = false;
+        self.pending_dirty_rects.clear();
         self.staging_ring.reset_pipeline();
     }
 
@@ -816,6 +885,8 @@ impl OutputCapturer {
         // capture don't consume stale pending slots when callers switch targets.
         self.pending_desc = None;
         self.pending_hdr = None;
+        self.pending_is_duplicate = false;
+        self.pending_dirty_rects.clear();
         self.staging_ring.reset_pipeline();
 
         let capture_time = Instant::now();
@@ -952,6 +1023,8 @@ impl OutputCapturer {
         let mut frame = reuse
             .or_else(|| self.spare_frame.take())
             .unwrap_or_else(Frame::empty);
+        let has_frame_history =
+            frame.metadata.capture_time.is_some() && !frame.as_rgba_bytes().is_empty();
         frame.reset_metadata();
 
         let capture_time = Instant::now();
@@ -1019,12 +1092,27 @@ impl OutputCapturer {
             if let (Some(slot), Some(prev_desc)) = (read_slot, self.pending_desc.as_ref()) {
                 // Read back the previous slot while the next copy is in flight.
                 let prev_hdr = self.pending_hdr;
-                self.staging_ring.read_slot(
+                let output_matches_source = has_frame_history
+                    && frame.width() == prev_desc.Width
+                    && frame.height() == prev_desc.Height;
+                let skip_readback = output_matches_source && self.pending_is_duplicate;
+                let use_dirty_copy = output_matches_source
+                    && !skip_readback
+                    && !self.pending_dirty_rects.is_empty()
+                    && should_use_dirty_copy(
+                        &self.pending_dirty_rects,
+                        prev_desc.Width,
+                        prev_desc.Height,
+                    );
+                self.staging_ring.read_slot_with_strategy(
                     &self.context,
                     slot,
                     prev_desc,
                     &mut frame,
                     prev_hdr,
+                    &self.pending_dirty_rects,
+                    use_dirty_copy,
+                    skip_readback,
                 )?;
             } else {
                 self.staging_ring.copy_and_read(
@@ -1038,10 +1126,16 @@ impl OutputCapturer {
 
             self.pending_desc = Some(effective_desc);
             self.pending_hdr = effective_hdr;
+            self.pending_is_duplicate = frame.metadata.is_duplicate;
+            self.pending_dirty_rects.clear();
+            self.pending_dirty_rects
+                .extend_from_slice(&frame.metadata.dirty_rects);
         } else {
             // Screenshot mode avoids recording-only buffering.
             self.pending_desc = None;
             self.pending_hdr = None;
+            self.pending_is_duplicate = false;
+            self.pending_dirty_rects.clear();
             self.staging_ring.reset_pipeline();
             self.staging_ring.copy_and_read(
                 &self.context,
@@ -1389,5 +1483,54 @@ impl crate::backend::MonitorCapturer for WindowsDxgiWindowCapturer {
     fn set_cursor_config(&mut self, config: CursorCaptureConfig) {
         self.cursor_config = config;
         self.output.cursor_config = config;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dirty_copy_heuristic_accepts_small_sparse_updates() {
+        let rects = vec![
+            DirtyRect {
+                x: 0,
+                y: 0,
+                width: 120,
+                height: 80,
+            },
+            DirtyRect {
+                x: 600,
+                y: 420,
+                width: 96,
+                height: 64,
+            },
+        ];
+        assert!(should_use_dirty_copy(&rects, 1920, 1080));
+    }
+
+    #[test]
+    fn dirty_copy_heuristic_rejects_large_dirty_area() {
+        let rects = vec![DirtyRect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 900,
+        }];
+        assert!(!should_use_dirty_copy(&rects, 1920, 1080));
+    }
+
+    #[test]
+    fn dirty_copy_heuristic_rejects_excessive_rect_count() {
+        let rects = vec![
+            DirtyRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            };
+            DXGI_DIRTY_COPY_MAX_RECTS + 1
+        ];
+        assert!(!should_use_dirty_copy(&rects, 1920, 1080));
     }
 }

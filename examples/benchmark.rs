@@ -87,6 +87,7 @@ struct Config {
     save_baseline_path: Option<PathBuf>,
     max_regression_pct: f64,
     regression_metric: RegressionMetric,
+    max_duplicate_pct: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +102,8 @@ struct BenchResult {
     max_ms: f64,
     stddev_ms: f64,
     fps: f64,
+    duplicate_pct: f64,
+    fresh_fps: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -306,6 +309,7 @@ fn parse_args() -> Result<Config> {
     let mut save_baseline_path = None;
     let mut max_regression_pct = DEFAULT_MAX_REGRESSION_PCT;
     let mut regression_metric = RegressionMetric::default();
+    let mut max_duplicate_pct = None;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1usize;
@@ -385,6 +389,15 @@ fn parse_args() -> Result<Config> {
                 regression_metric = metric;
                 i += 2;
             }
+            "--max-duplicate-pct" => {
+                let value =
+                    parse_f64_arg("--max-duplicate-pct", args.get(i + 1).map(String::as_str))?;
+                if !(0.0..=100.0).contains(&value) {
+                    bail!("--max-duplicate-pct must be between 0 and 100");
+                }
+                max_duplicate_pct = Some(value);
+                i += 2;
+            }
             "--help" | "-h" => {
                 println!(
                     "Usage: cargo run --release --example benchmark -- [options]
@@ -399,7 +412,8 @@ fn parse_args() -> Result<Config> {
   --baseline <path>          Compare current run to baseline CSV
   --save-baseline <path>     Save current run as baseline CSV
   --max-regression-pct <f>   Allowed metric increase vs baseline (default: {DEFAULT_MAX_REGRESSION_PCT})
-  --regression-metric <m>    Metric for regression checks: avg | p50 | p95 | p99 (default: p50)"
+  --regression-metric <m>    Metric for regression checks: avg | p50 | p95 | p99 (default: p50)
+  --max-duplicate-pct <f>    Fail if duplicate-frame percentage exceeds this threshold"
                 );
                 std::process::exit(0);
             }
@@ -432,6 +446,7 @@ fn parse_args() -> Result<Config> {
         save_baseline_path,
         max_regression_pct,
         regression_metric,
+        max_duplicate_pct,
     })
 }
 
@@ -478,6 +493,7 @@ fn run_backend(
         .checked_mul(rounds)
         .context("benchmark sample count overflow")?;
     let mut samples_ms = Vec::with_capacity(total_samples);
+    let mut duplicate_samples = 0usize;
 
     for _round in 0..rounds {
         for _ in 0..warmup_frames {
@@ -492,6 +508,9 @@ fn run_backend(
                 .capture_frame_into(&target, &mut frame)
                 .with_context(|| format!("capture failed for {}", backend_name(kind)))?;
             samples_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+            if frame.metadata.is_duplicate {
+                duplicate_samples = duplicate_samples.saturating_add(1);
+            }
         }
     }
 
@@ -508,6 +527,17 @@ fn run_backend(
         .sum::<f64>()
         / samples_ms.len() as f64;
     let stddev_ms = variance.sqrt();
+    let duplicate_pct = if samples_ms.is_empty() {
+        0.0
+    } else {
+        (duplicate_samples as f64 * 100.0) / samples_ms.len() as f64
+    };
+    let fresh_samples = samples_ms.len().saturating_sub(duplicate_samples);
+    let fresh_fps = if sum_ms > 0.0 {
+        (fresh_samples as f64 * 1000.0) / sum_ms
+    } else {
+        0.0
+    };
 
     Ok(BenchResult {
         backend: kind,
@@ -520,15 +550,18 @@ fn run_backend(
         max_ms: *sorted.last().unwrap(),
         stddev_ms,
         fps: if avg_ms > 0.0 { 1000.0 / avg_ms } else { 0.0 },
+        duplicate_pct,
+        fresh_fps,
     })
 }
 
 fn save_baseline(path: &PathBuf, results: &[BenchResult]) -> Result<()> {
-    let mut out =
-        String::from("target,backend,avg_ms,p50_ms,p95_ms,p99_ms,min_ms,max_ms,stddev_ms,fps\n");
+    let mut out = String::from(
+        "target,backend,avg_ms,p50_ms,p95_ms,p99_ms,min_ms,max_ms,stddev_ms,fps,duplicate_pct,fresh_fps\n",
+    );
     for result in results {
         out.push_str(&format!(
-            "{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}\n",
+            "{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.3},{:.6}\n",
             result.target_label,
             backend_name(result.backend),
             result.avg_ms,
@@ -538,7 +571,9 @@ fn save_baseline(path: &PathBuf, results: &[BenchResult]) -> Result<()> {
             result.min_ms,
             result.max_ms,
             result.stddev_ms,
-            result.fps
+            result.fps,
+            result.duplicate_pct,
+            result.fresh_fps
         ));
     }
     fs::write(path, out)
@@ -675,9 +710,28 @@ fn check_regression(
     )
 }
 
+fn check_duplicate_budget(current: &[BenchResult], max_duplicate_pct: f64) -> Result<()> {
+    let mut offenders = Vec::new();
+    for result in current {
+        if result.duplicate_pct > max_duplicate_pct {
+            offenders.push(format!(
+                "{} [{}] duplicate_pct {:.2}% exceeded limit {:.2}%",
+                backend_name(result.backend),
+                result.target_label,
+                result.duplicate_pct,
+                max_duplicate_pct
+            ));
+        }
+    }
+    if offenders.is_empty() {
+        return Ok(());
+    }
+    bail!("duplicate frame budget exceeded:\n{}", offenders.join("\n"));
+}
+
 fn print_results(results: &[BenchResult]) {
     println!(
-        "{:<32} {:<6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "{:<32} {:<6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
         "target",
         "backend",
         "avg_ms",
@@ -687,11 +741,13 @@ fn print_results(results: &[BenchResult]) {
         "min_ms",
         "max_ms",
         "stddev",
-        "fps"
+        "fps",
+        "dup_%",
+        "fresh_fps"
     );
     for r in results {
         println!(
-            "{:<32} {:<6} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.2}",
+            "{:<32} {:<6} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.2} {:>10.2} {:>10.2}",
             r.target_label,
             backend_name(r.backend),
             r.avg_ms,
@@ -701,7 +757,9 @@ fn print_results(results: &[BenchResult]) {
             r.min_ms,
             r.max_ms,
             r.stddev_ms,
-            r.fps
+            r.fps,
+            r.duplicate_pct,
+            r.fresh_fps
         );
     }
 }
@@ -709,7 +767,7 @@ fn print_results(results: &[BenchResult]) {
 fn main() -> Result<()> {
     let config = parse_args()?;
     println!(
-        "Running benchmark: target={} warmup={} frames={} rounds={} backends={} regression_metric={}",
+        "Running benchmark: target={} warmup={} frames={} rounds={} backends={} regression_metric={} max_duplicate_pct={}",
         target_label(&config.target),
         config.warmup_frames,
         config.measure_frames,
@@ -721,6 +779,10 @@ fn main() -> Result<()> {
             .collect::<Vec<_>>()
             .join(","),
         config.regression_metric.as_str(),
+        config
+            .max_duplicate_pct
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "none".to_string()),
     );
 
     let mut results = Vec::with_capacity(config.backends.len());
@@ -754,6 +816,14 @@ fn main() -> Result<()> {
             "Regression check passed ({}, max allowed regression: {:.2}%)",
             config.regression_metric.as_str(),
             config.max_regression_pct
+        );
+    }
+
+    if let Some(max_duplicate_pct) = config.max_duplicate_pct {
+        check_duplicate_budget(&results, max_duplicate_pct)?;
+        println!(
+            "Duplicate budget check passed (max allowed duplicate frames: {:.2}%)",
+            max_duplicate_pct
         );
     }
 

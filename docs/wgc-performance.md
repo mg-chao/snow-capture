@@ -36,3 +36,13 @@ The command exits with a non-zero code when the selected metric regresses more t
 - `p50` is the default guard because it is stable across runs and tracks steady-state capture throughput.
 - Keep `--warmup` at least 30 frames to absorb shader/LUT/JIT warmup costs.
 - Tune `--max-regression-pct` per machine if your capture source has large timing variance.
+- Benchmark output now includes:
+  - `dup_%`: percentage of duplicate frames reported by backend metadata.
+  - `fresh_fps`: effective FPS for non-duplicate frames.
+- Optional freshness guard:
+
+```powershell
+cargo run --release --example benchmark -- --backends wgc --region-center 1280x720 --warmup 30 --frames 240 --rounds 3 --max-duplicate-pct 95
+```
+
+Use this when validating low-latency changes so throughput wins do not silently come from excessive duplicate delivery.

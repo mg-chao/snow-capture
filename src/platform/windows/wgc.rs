@@ -37,7 +37,7 @@ use super::monitor::{HdrMonitorMetadata, MonitorResolver};
 use super::surface::{self, StagingSampleDesc};
 
 const WGC_FRAME_TIMEOUT: Duration = Duration::from_millis(250);
-const WGC_STALE_FRAME_TIMEOUT: Duration = Duration::from_millis(8);
+const WGC_STALE_FRAME_TIMEOUT: Duration = Duration::from_millis(1);
 const WGC_FRAME_POOL_BUFFERS: i32 = 2;
 const WGC_STAGING_SLOTS: usize = 2;
 const WGC_DIRTY_COPY_MAX_RECTS: usize = 192;
@@ -447,15 +447,51 @@ impl WindowsGraphicsCaptureCapturer {
         })
     }
 
-    fn wait_for_next_frame(
+    fn try_take_latest_frame(&mut self) -> CaptureResult<Option<(Direct3D11CaptureFrame, i64)>> {
+        let mut state = self
+            .signal
+            .state
+            .lock()
+            .map_err(|_| poisoned_lock_error())?;
+        if state.closed {
+            return Err(CaptureError::MonitorLost);
+        }
+        if state.sequence != self.last_sequence {
+            self.last_sequence = state.sequence;
+            if let Some(frame) = state.latest.take() {
+                let time_ticks = state.latest_time_ticks;
+                return Ok(Some((frame, time_ticks)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn acquire_next_frame_or_stale(
         &mut self,
         allow_stale_return: bool,
+    ) -> CaptureResult<Option<(Direct3D11CaptureFrame, i64)>> {
+        if allow_stale_return {
+            if let Some(fresh) = self.try_take_latest_frame()? {
+                return Ok(Some(fresh));
+            }
+
+            // In recording mode, don't sit on a full frame interval when we
+            // already have a previously converted slot. Wait briefly for a
+            // just-about-to-arrive frame, then fall back to stale reuse.
+            match self.wait_for_next_frame(WGC_STALE_FRAME_TIMEOUT) {
+                Ok(fresh) => return Ok(Some(fresh)),
+                Err(CaptureError::Timeout) if self.pending_slot.is_some() => return Ok(None),
+                Err(CaptureError::Timeout) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.wait_for_next_frame(WGC_FRAME_TIMEOUT).map(Some)
+    }
+
+    fn wait_for_next_frame(
+        &mut self,
+        timeout: Duration,
     ) -> CaptureResult<(Direct3D11CaptureFrame, i64)> {
-        let timeout = if allow_stale_return {
-            WGC_STALE_FRAME_TIMEOUT
-        } else {
-            WGC_FRAME_TIMEOUT
-        };
         let deadline = Instant::now() + timeout;
         let mut state = self
             .signal
@@ -834,31 +870,28 @@ impl WindowsGraphicsCaptureCapturer {
             self.capture_mode == CaptureMode::ScreenRecording && destination_has_history;
         let capture_time = Instant::now();
 
-        let (capture_frame, time_ticks) = match self.wait_for_next_frame(allow_stale_return) {
-            Ok(result) => result,
-            Err(CaptureError::Timeout) => {
-                if allow_stale_return {
-                    if let Some(slot_idx) = self.pending_slot {
-                        if let Ok(sample) = self.read_slot_region_into_output(
-                            slot_idx,
-                            out,
-                            blit,
-                            destination_has_history,
-                        ) {
-                            self.has_frame_history = true;
-                            return Ok(sample);
-                        }
-                        self.has_frame_history = false;
-                    }
-                    return Ok(CaptureSampleMetadata {
-                        capture_time: Some(capture_time),
-                        present_time_qpc: None,
-                        is_duplicate: true,
-                    });
-                }
-                return Err(CaptureError::Timeout);
+        let maybe_capture = self.acquire_next_frame_or_stale(allow_stale_return)?;
+        let (capture_frame, time_ticks) = if let Some(capture) = maybe_capture {
+            capture
+        } else if let Some(slot_idx) = self.pending_slot {
+            if let Ok(sample) =
+                self.read_slot_region_into_output(slot_idx, out, blit, destination_has_history)
+            {
+                self.has_frame_history = true;
+                return Ok(sample);
             }
-            Err(error) => return Err(error),
+            self.has_frame_history = false;
+            return Ok(CaptureSampleMetadata {
+                capture_time: Some(capture_time),
+                present_time_qpc: None,
+                is_duplicate: true,
+            });
+        } else {
+            return Ok(CaptureSampleMetadata {
+                capture_time: Some(capture_time),
+                present_time_qpc: None,
+                is_duplicate: true,
+            });
         };
 
         let source_is_duplicate = time_ticks != 0 && time_ticks == self.last_present_time;
@@ -1008,24 +1041,22 @@ impl WindowsGraphicsCaptureCapturer {
             && out.height() > 0;
         let capture_time = Instant::now();
 
-        let (capture_frame, time_ticks) = match self.wait_for_next_frame(allow_stale_return) {
-            Ok(result) => result,
-            Err(CaptureError::Timeout) => {
-                if allow_stale_return {
-                    if let Some(slot_idx) = self.pending_slot {
-                        if self.read_slot_into_output(slot_idx, &mut out).is_ok() {
-                            self.has_frame_history = true;
-                            return Ok(out);
-                        }
-                        self.has_frame_history = false;
-                    }
-                    out.metadata.capture_time = Some(capture_time);
-                    out.metadata.is_duplicate = true;
-                    return Ok(out);
-                }
-                return Err(CaptureError::Timeout);
+        let maybe_capture = self.acquire_next_frame_or_stale(allow_stale_return)?;
+        let (capture_frame, time_ticks) = if let Some(capture) = maybe_capture {
+            capture
+        } else if let Some(slot_idx) = self.pending_slot {
+            if self.read_slot_into_output(slot_idx, &mut out).is_ok() {
+                self.has_frame_history = true;
+                return Ok(out);
             }
-            Err(error) => return Err(error),
+            self.has_frame_history = false;
+            out.metadata.capture_time = Some(capture_time);
+            out.metadata.is_duplicate = true;
+            return Ok(out);
+        } else {
+            out.metadata.capture_time = Some(capture_time);
+            out.metadata.is_duplicate = true;
+            return Ok(out);
         };
 
         let source_is_duplicate = time_ticks != 0 && time_ticks == self.last_present_time;

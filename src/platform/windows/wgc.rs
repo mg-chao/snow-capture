@@ -105,6 +105,12 @@ fn region_duplicate_short_circuit_enabled() -> bool {
 }
 
 #[inline]
+fn duplicate_short_circuit_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_DUPLICATE_SHORTCIRCUIT"))
+}
+
+#[inline]
 fn borrowed_source_resource_cast_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_BORROWED_SOURCE_RESOURCE"))
@@ -460,6 +466,23 @@ fn should_use_dirty_copy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
 
 #[inline(always)]
 fn should_short_circuit_region_duplicate(
+    optimization_enabled: bool,
+    capture_mode: CaptureMode,
+    destination_has_history: bool,
+    source_is_duplicate: bool,
+    pending_slot_available: bool,
+) -> bool {
+    should_short_circuit_duplicate(
+        optimization_enabled,
+        capture_mode,
+        destination_has_history,
+        source_is_duplicate,
+        pending_slot_available,
+    )
+}
+
+#[inline(always)]
+fn should_short_circuit_duplicate(
     optimization_enabled: bool,
     capture_mode: CaptureMode,
     destination_has_history: bool,
@@ -1777,6 +1800,52 @@ impl WindowsGraphicsCaptureCapturer {
         })
     }
 
+    fn try_short_circuit_duplicate(
+        &mut self,
+        capture_time: Instant,
+        present_time_ticks: i64,
+        out: &mut Frame,
+    ) -> bool {
+        let Some(slot_idx) = self.pending_slot else {
+            return false;
+        };
+        if !self.staging_slots[slot_idx].populated {
+            return false;
+        }
+        let out_width = out.width();
+        let out_height = out.height();
+        let out_matches_source = self.staging_slots[slot_idx]
+            .source_desc
+            .is_some_and(|desc| out_width == desc.Width && out_height == desc.Height);
+        if !out_matches_source {
+            return false;
+        }
+
+        {
+            let slot = &mut self.staging_slots[slot_idx];
+            slot.capture_time = Some(capture_time);
+            slot.present_time_ticks = present_time_ticks;
+            slot.is_duplicate = true;
+            slot.dirty_mode_available = true;
+            slot.dirty_copy_preferred = false;
+            slot.dirty_rects.clear();
+        }
+
+        out.metadata.capture_time = Some(capture_time);
+        out.metadata.present_time_qpc = if present_time_ticks != 0 {
+            Some(present_time_ticks)
+        } else {
+            None
+        };
+        out.metadata.is_duplicate = true;
+        out.metadata.dirty_rects.clear();
+
+        if present_time_ticks != 0 {
+            self.last_emitted_present_time = present_time_ticks;
+        }
+        true
+    }
+
     fn read_slot_into_output(
         &mut self,
         slot_idx: usize,
@@ -2217,6 +2286,19 @@ impl WindowsGraphicsCaptureCapturer {
             self.last_present_time = time_ticks;
         }
 
+        if should_short_circuit_duplicate(
+            duplicate_short_circuit_enabled(),
+            self.capture_mode,
+            destination_has_history,
+            source_is_duplicate,
+            self.pending_slot.is_some(),
+        ) && self.try_short_circuit_duplicate(capture_time, time_ticks, &mut out)
+        {
+            let _ = capture_frame.Close();
+            self.has_frame_history = true;
+            return Ok(out);
+        }
+
         let mut source_dirty_rects = std::mem::take(&mut self.source_dirty_rects_scratch);
         let capture_result = (|| -> CaptureResult<()> {
             self.recreate_pool_if_needed(&capture_frame)?;
@@ -2574,6 +2656,60 @@ mod tests {
             WGC_DIRTY_COPY_MAX_RECTS + 1
         ];
         assert!(!should_use_dirty_copy(&rects, 1920, 1080));
+    }
+
+    #[test]
+    fn duplicate_short_circuit_requires_recording_mode() {
+        assert!(!should_short_circuit_duplicate(
+            true,
+            CaptureMode::Screenshot,
+            true,
+            true,
+            true,
+        ));
+        assert!(should_short_circuit_duplicate(
+            true,
+            CaptureMode::ScreenRecording,
+            true,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn duplicate_short_circuit_requires_duplicate_with_history() {
+        assert!(!should_short_circuit_duplicate(
+            true,
+            CaptureMode::ScreenRecording,
+            false,
+            true,
+            true,
+        ));
+        assert!(!should_short_circuit_duplicate(
+            true,
+            CaptureMode::ScreenRecording,
+            true,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn duplicate_short_circuit_requires_enabled_and_pending_slot() {
+        assert!(!should_short_circuit_duplicate(
+            false,
+            CaptureMode::ScreenRecording,
+            true,
+            true,
+            true,
+        ));
+        assert!(!should_short_circuit_duplicate(
+            true,
+            CaptureMode::ScreenRecording,
+            true,
+            true,
+            false,
+        ));
     }
 
     #[test]

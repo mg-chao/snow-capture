@@ -63,3 +63,6 @@ name = "window_capture"
 
 [[example]]
 name = "region_capture"
+
+[[example]]
+name = "convert_benchmark"

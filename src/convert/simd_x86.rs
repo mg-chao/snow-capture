@@ -30,7 +30,7 @@ pub(crate) unsafe fn convert_bgra_to_rgba_avx512_unchecked(
     dst: *mut u8,
     pixel_count: usize,
 ) {
-    unsafe { avx512_bgra_core(src, dst, pixel_count, false) }
+    unsafe { avx512_bgra_core(src, dst, pixel_count, false, false) }
 }
 
 /// Streaming-store variant — uses non-temporal writes to bypass the cache.
@@ -42,11 +42,26 @@ pub(crate) unsafe fn convert_bgra_to_rgba_avx512_nt_unchecked(
     dst: *mut u8,
     pixel_count: usize,
 ) {
-    unsafe { avx512_bgra_core(src, dst, pixel_count, true) }
+    unsafe { avx512_bgra_core(src, dst, pixel_count, true, true) }
 }
 
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn avx512_bgra_core(src: *const u8, dst: *mut u8, pixel_count: usize, nontemporal: bool) {
+pub(crate) unsafe fn convert_bgra_to_rgba_avx512_nt_nofence_unchecked(
+    src: *const u8,
+    dst: *mut u8,
+    pixel_count: usize,
+) {
+    unsafe { avx512_bgra_core(src, dst, pixel_count, true, false) }
+}
+
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn avx512_bgra_core(
+    src: *const u8,
+    dst: *mut u8,
+    pixel_count: usize,
+    nontemporal: bool,
+    fence: bool,
+) {
     use std::arch::x86_64::{
         __m512i, _MM_HINT_T0, _mm_prefetch, _mm_sfence, _mm512_loadu_si512, _mm512_shuffle_epi8,
         _mm512_storeu_si512, _mm512_stream_si512,
@@ -137,7 +152,7 @@ unsafe fn avx512_bgra_core(src: *const u8, dst: *mut u8, pixel_count: usize, non
         x += 16;
     }
 
-    if nontemporal {
+    if nontemporal && fence {
         unsafe { _mm_sfence() };
     }
 
@@ -158,7 +173,7 @@ pub(crate) unsafe fn convert_bgra_to_rgba_avx2_unchecked(
     dst: *mut u8,
     pixel_count: usize,
 ) {
-    unsafe { avx2_bgra_core(src, dst, pixel_count, false) }
+    unsafe { avx2_bgra_core(src, dst, pixel_count, false, false) }
 }
 
 /// Streaming-store variant for AVX2.
@@ -168,11 +183,26 @@ pub(crate) unsafe fn convert_bgra_to_rgba_avx2_nt_unchecked(
     dst: *mut u8,
     pixel_count: usize,
 ) {
-    unsafe { avx2_bgra_core(src, dst, pixel_count, true) }
+    unsafe { avx2_bgra_core(src, dst, pixel_count, true, true) }
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn avx2_bgra_core(src: *const u8, dst: *mut u8, pixel_count: usize, nontemporal: bool) {
+pub(crate) unsafe fn convert_bgra_to_rgba_avx2_nt_nofence_unchecked(
+    src: *const u8,
+    dst: *mut u8,
+    pixel_count: usize,
+) {
+    unsafe { avx2_bgra_core(src, dst, pixel_count, true, false) }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_bgra_core(
+    src: *const u8,
+    dst: *mut u8,
+    pixel_count: usize,
+    nontemporal: bool,
+    fence: bool,
+) {
     use std::arch::x86_64::{
         __m256i, _MM_HINT_T0, _mm_prefetch, _mm_sfence, _mm256_loadu_si256, _mm256_setr_epi8,
         _mm256_shuffle_epi8, _mm256_storeu_si256, _mm256_stream_si256,
@@ -245,7 +275,7 @@ unsafe fn avx2_bgra_core(src: *const u8, dst: *mut u8, pixel_count: usize, nonte
         x += 8;
     }
 
-    if nontemporal {
+    if nontemporal && fence {
         unsafe { _mm_sfence() };
     }
 
@@ -266,7 +296,7 @@ pub(crate) unsafe fn convert_bgra_to_rgba_ssse3_unchecked(
     dst: *mut u8,
     pixel_count: usize,
 ) {
-    unsafe { ssse3_bgra_core(src, dst, pixel_count, false) }
+    unsafe { ssse3_bgra_core(src, dst, pixel_count, false, false) }
 }
 
 /// Streaming-store variant for SSSE3.
@@ -276,11 +306,26 @@ pub(crate) unsafe fn convert_bgra_to_rgba_ssse3_nt_unchecked(
     dst: *mut u8,
     pixel_count: usize,
 ) {
-    unsafe { ssse3_bgra_core(src, dst, pixel_count, true) }
+    unsafe { ssse3_bgra_core(src, dst, pixel_count, true, true) }
 }
 
 #[target_feature(enable = "ssse3")]
-unsafe fn ssse3_bgra_core(src: *const u8, dst: *mut u8, pixel_count: usize, nontemporal: bool) {
+pub(crate) unsafe fn convert_bgra_to_rgba_ssse3_nt_nofence_unchecked(
+    src: *const u8,
+    dst: *mut u8,
+    pixel_count: usize,
+) {
+    unsafe { ssse3_bgra_core(src, dst, pixel_count, true, false) }
+}
+
+#[target_feature(enable = "ssse3")]
+unsafe fn ssse3_bgra_core(
+    src: *const u8,
+    dst: *mut u8,
+    pixel_count: usize,
+    nontemporal: bool,
+    fence: bool,
+) {
     use std::arch::x86_64::{
         __m128i, _mm_loadu_si128, _mm_setr_epi8, _mm_sfence, _mm_shuffle_epi8, _mm_storeu_si128,
         _mm_stream_si128,
@@ -340,7 +385,7 @@ unsafe fn ssse3_bgra_core(src: *const u8, dst: *mut u8, pixel_count: usize, nont
         x += 4;
     }
 
-    if nontemporal {
+    if nontemporal && fence {
         unsafe { _mm_sfence() };
     }
 
@@ -383,7 +428,7 @@ pub(crate) unsafe fn convert_f16_rgba_to_srgb_f16c_unchecked(
     pixel_count: usize,
 ) {
     unsafe {
-        convert_f16_rgba_to_srgb_f16c_inner(src, dst, pixel_count, false);
+        convert_f16_rgba_to_srgb_f16c_inner(src, dst, pixel_count, false, false);
     }
 }
 
@@ -395,7 +440,18 @@ pub(crate) unsafe fn convert_f16_rgba_to_srgb_f16c_nt_unchecked(
     pixel_count: usize,
 ) {
     unsafe {
-        convert_f16_rgba_to_srgb_f16c_inner(src, dst, pixel_count, true);
+        convert_f16_rgba_to_srgb_f16c_inner(src, dst, pixel_count, true, true);
+    }
+}
+
+#[target_feature(enable = "avx2,f16c")]
+pub(crate) unsafe fn convert_f16_rgba_to_srgb_f16c_nt_nofence_unchecked(
+    src: *const u8,
+    dst: *mut u8,
+    pixel_count: usize,
+) {
+    unsafe {
+        convert_f16_rgba_to_srgb_f16c_inner(src, dst, pixel_count, true, false);
     }
 }
 
@@ -405,6 +461,7 @@ unsafe fn convert_f16_rgba_to_srgb_f16c_inner(
     dst: *mut u8,
     pixel_count: usize,
     nontemporal: bool,
+    fence: bool,
 ) {
     use std::arch::x86_64::*;
 
@@ -536,7 +593,7 @@ unsafe fn convert_f16_rgba_to_srgb_f16c_inner(
             remaining -= 8;
         }
 
-        if nontemporal {
+        if nontemporal && fence {
             _mm_sfence();
         }
 
@@ -804,7 +861,7 @@ pub(crate) unsafe fn convert_f16_rgba_to_srgb_avx512_unchecked(
     dst: *mut u8,
     pixel_count: usize,
 ) {
-    unsafe { convert_f16_rgba_to_srgb_avx512_inner(src, dst, pixel_count, false) }
+    unsafe { convert_f16_rgba_to_srgb_avx512_inner(src, dst, pixel_count, false, false) }
 }
 
 /// Non-temporal store variant for AVX-512 F16→sRGB.
@@ -814,7 +871,16 @@ pub(crate) unsafe fn convert_f16_rgba_to_srgb_avx512_nt_unchecked(
     dst: *mut u8,
     pixel_count: usize,
 ) {
-    unsafe { convert_f16_rgba_to_srgb_avx512_inner(src, dst, pixel_count, true) }
+    unsafe { convert_f16_rgba_to_srgb_avx512_inner(src, dst, pixel_count, true, true) }
+}
+
+#[target_feature(enable = "avx512f,avx512bw,f16c")]
+pub(crate) unsafe fn convert_f16_rgba_to_srgb_avx512_nt_nofence_unchecked(
+    src: *const u8,
+    dst: *mut u8,
+    pixel_count: usize,
+) {
+    unsafe { convert_f16_rgba_to_srgb_avx512_inner(src, dst, pixel_count, true, false) }
 }
 
 #[target_feature(enable = "avx512f,avx512bw,f16c")]
@@ -823,6 +889,7 @@ unsafe fn convert_f16_rgba_to_srgb_avx512_inner(
     dst: *mut u8,
     pixel_count: usize,
     nontemporal: bool,
+    fence: bool,
 ) {
     use std::arch::x86_64::*;
 
@@ -952,7 +1019,7 @@ unsafe fn convert_f16_rgba_to_srgb_avx512_inner(
             remaining -= 8;
         }
 
-        if nontemporal {
+        if nontemporal && fence {
             _mm_sfence();
         }
 

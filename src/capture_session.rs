@@ -608,6 +608,34 @@ impl CaptureSession {
             out_frame.as_mut_rgba_bytes().fill(0);
         }
 
+        let full_region_area = u64::from(out_w) * u64::from(out_h);
+        let covered_region_area = plan.entries.iter().fold(0u64, |area, entry| {
+            area.saturating_add(u64::from(entry.blit.width) * u64::from(entry.blit.height))
+        });
+        let region_fully_covered = covered_region_area == full_region_area;
+
+        if region_fully_covered && let Some(first_entry) = plan.entries.first() {
+            let direct_sample = {
+                let capturer = self.get_or_create_capturer(&first_entry.monitor)?;
+                capturer.capture_desktop_region_into(
+                    region.x,
+                    region.y,
+                    out_w,
+                    out_h,
+                    &mut out_frame,
+                    destination_has_history,
+                )
+            };
+            if let Ok(Some(sample)) = direct_sample {
+                out_frame.metadata.sequence = seq;
+                out_frame.metadata.capture_time = sample.capture_time;
+                out_frame.metadata.present_time_qpc = sample.present_time_qpc;
+                out_frame.metadata.is_duplicate = destination_has_history && sample.is_duplicate;
+                self.region_output_history_valid = true;
+                return Ok(out_frame);
+            }
+        }
+
         let mut latest_capture_time = None;
         let mut latest_present_qpc = None;
         let mut all_duplicate = destination_has_history;
@@ -664,6 +692,7 @@ impl CaptureSession {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     struct MockBackend {
         monitor: MonitorId,
@@ -723,6 +752,104 @@ mod tests {
         }
     }
 
+    struct DirectRegionBackend {
+        monitor: MonitorId,
+        desktop_calls: Arc<Mutex<usize>>,
+        region_calls: Arc<Mutex<usize>>,
+        supports_desktop_direct: bool,
+        desktop_should_error: bool,
+    }
+
+    struct DirectRegionCapturer {
+        desktop_calls: Arc<Mutex<usize>>,
+        region_calls: Arc<Mutex<usize>>,
+        supports_desktop_direct: bool,
+        desktop_should_error: bool,
+    }
+
+    impl MonitorCapturer for DirectRegionCapturer {
+        fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
+            Ok(reuse.unwrap_or_else(Frame::empty))
+        }
+
+        fn capture_region_into(
+            &mut self,
+            _blit: CaptureBlitRegion,
+            _destination: &mut Frame,
+            _destination_has_history: bool,
+        ) -> CaptureResult<Option<CaptureSampleMetadata>> {
+            *self.region_calls.lock().unwrap() += 1;
+            Ok(Some(CaptureSampleMetadata {
+                capture_time: Some(Instant::now()),
+                present_time_qpc: Some(0),
+                is_duplicate: false,
+            }))
+        }
+
+        fn capture_desktop_region_into(
+            &mut self,
+            _x: i32,
+            _y: i32,
+            _width: u32,
+            _height: u32,
+            _destination: &mut Frame,
+            _destination_has_history: bool,
+        ) -> CaptureResult<Option<CaptureSampleMetadata>> {
+            *self.desktop_calls.lock().unwrap() += 1;
+            if self.desktop_should_error {
+                return Err(CaptureError::Platform(anyhow::anyhow!(
+                    "mock desktop direct failure"
+                )));
+            }
+            if !self.supports_desktop_direct {
+                return Ok(None);
+            }
+            Ok(Some(CaptureSampleMetadata {
+                capture_time: Some(Instant::now()),
+                present_time_qpc: Some(0),
+                is_duplicate: true,
+            }))
+        }
+    }
+
+    impl CaptureBackend for DirectRegionBackend {
+        fn enumerate_monitors(&self) -> CaptureResult<Vec<MonitorId>> {
+            Ok(vec![self.monitor.clone()])
+        }
+
+        fn primary_monitor(&self) -> CaptureResult<MonitorId> {
+            Ok(self.monitor.clone())
+        }
+
+        fn create_monitor_capturer(
+            &self,
+            _monitor: &MonitorId,
+        ) -> CaptureResult<Box<dyn MonitorCapturer>> {
+            Ok(Box::new(DirectRegionCapturer {
+                desktop_calls: Arc::clone(&self.desktop_calls),
+                region_calls: Arc::clone(&self.region_calls),
+                supports_desktop_direct: self.supports_desktop_direct,
+                desktop_should_error: self.desktop_should_error,
+            }))
+        }
+    }
+
+    fn mock_layout(monitor: &MonitorId, x: i32, y: i32, width: u32, height: u32) -> MonitorLayout {
+        MonitorLayout {
+            monitors: vec![crate::region::MonitorGeometry {
+                monitor: monitor.clone(),
+                x,
+                y,
+                width,
+                height,
+            }],
+            virtual_left: x,
+            virtual_top: y,
+            virtual_width: width,
+            virtual_height: height,
+        }
+    }
+
     #[test]
     fn monitor_reuse_history_hint_requires_matching_sequence() -> CaptureResult<()> {
         let history_hints = Arc::new(Mutex::new(Vec::new()));
@@ -755,6 +882,104 @@ mod tests {
 
         let recorded = history_hints.lock().unwrap().clone();
         assert_eq!(recorded, vec![false, false]);
+        Ok(())
+    }
+
+    #[test]
+    fn region_capture_uses_desktop_direct_path_when_supported() -> CaptureResult<()> {
+        let desktop_calls = Arc::new(Mutex::new(0usize));
+        let region_calls = Arc::new(Mutex::new(0usize));
+        let monitor = MonitorId::from_parts(1, 2, 0, "mock-monitor", true);
+        let backend: Arc<dyn CaptureBackend> = Arc::new(DirectRegionBackend {
+            monitor: monitor.clone(),
+            desktop_calls: Arc::clone(&desktop_calls),
+            region_calls: Arc::clone(&region_calls),
+            supports_desktop_direct: true,
+            desktop_should_error: false,
+        });
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        session.layout = Some(mock_layout(&monitor, 0, 0, 1920, 1080));
+
+        let target = CaptureTarget::Region(CaptureRegion::new(100, 50, 640, 360)?);
+        let frame = session.capture_frame(&target)?;
+        assert!(!frame.metadata.is_duplicate);
+        let next_frame = session.capture_frame_reuse(&target, frame)?;
+
+        assert!(next_frame.metadata.is_duplicate);
+        assert_eq!(*desktop_calls.lock().unwrap(), 2);
+        assert_eq!(*region_calls.lock().unwrap(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn region_capture_falls_back_when_desktop_direct_path_is_unavailable() -> CaptureResult<()> {
+        let desktop_calls = Arc::new(Mutex::new(0usize));
+        let region_calls = Arc::new(Mutex::new(0usize));
+        let monitor = MonitorId::from_parts(1, 2, 0, "mock-monitor", true);
+        let backend: Arc<dyn CaptureBackend> = Arc::new(DirectRegionBackend {
+            monitor: monitor.clone(),
+            desktop_calls: Arc::clone(&desktop_calls),
+            region_calls: Arc::clone(&region_calls),
+            supports_desktop_direct: false,
+            desktop_should_error: false,
+        });
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        session.layout = Some(mock_layout(&monitor, 0, 0, 1920, 1080));
+
+        let target = CaptureTarget::Region(CaptureRegion::new(100, 50, 640, 360)?);
+        let _frame = session.capture_frame(&target)?;
+
+        assert_eq!(*desktop_calls.lock().unwrap(), 1);
+        assert_eq!(*region_calls.lock().unwrap(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn region_capture_falls_back_when_desktop_direct_path_errors() -> CaptureResult<()> {
+        let desktop_calls = Arc::new(Mutex::new(0usize));
+        let region_calls = Arc::new(Mutex::new(0usize));
+        let monitor = MonitorId::from_parts(1, 2, 0, "mock-monitor", true);
+        let backend: Arc<dyn CaptureBackend> = Arc::new(DirectRegionBackend {
+            monitor: monitor.clone(),
+            desktop_calls: Arc::clone(&desktop_calls),
+            region_calls: Arc::clone(&region_calls),
+            supports_desktop_direct: true,
+            desktop_should_error: true,
+        });
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        session.layout = Some(mock_layout(&monitor, 0, 0, 1920, 1080));
+
+        let target = CaptureTarget::Region(CaptureRegion::new(100, 50, 640, 360)?);
+        let _frame = session.capture_frame(&target)?;
+
+        assert_eq!(*desktop_calls.lock().unwrap(), 1);
+        assert_eq!(*region_calls.lock().unwrap(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn region_capture_skips_desktop_direct_path_for_partial_coverage() -> CaptureResult<()> {
+        let desktop_calls = Arc::new(Mutex::new(0usize));
+        let region_calls = Arc::new(Mutex::new(0usize));
+        let monitor = MonitorId::from_parts(1, 2, 0, "mock-monitor", true);
+        let backend: Arc<dyn CaptureBackend> = Arc::new(DirectRegionBackend {
+            monitor: monitor.clone(),
+            desktop_calls: Arc::clone(&desktop_calls),
+            region_calls: Arc::clone(&region_calls),
+            supports_desktop_direct: true,
+            desktop_should_error: false,
+        });
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        session.layout = Some(mock_layout(&monitor, 0, 0, 128, 128));
+
+        // Region extends beyond monitor bounds, so only a partial overlap is
+        // covered by monitor entries and the desktop-direct fast path should
+        // not run.
+        let target = CaptureTarget::Region(CaptureRegion::new(-16, -16, 128, 128)?);
+        let _frame = session.capture_frame(&target)?;
+
+        assert_eq!(*desktop_calls.lock().unwrap(), 0);
+        assert_eq!(*region_calls.lock().unwrap(), 1);
         Ok(())
     }
 }

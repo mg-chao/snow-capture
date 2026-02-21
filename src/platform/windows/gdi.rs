@@ -110,6 +110,23 @@ fn gdi_direct_region_capture_enabled() -> bool {
 }
 
 #[inline]
+fn gdi_desktop_direct_region_capture_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_DISABLE_GDI_DESKTOP_REGION_DIRECT")
+            .map(|raw| {
+                let normalized = raw.trim().to_ascii_lowercase();
+                !(normalized == "1"
+                    || normalized == "true"
+                    || normalized == "yes"
+                    || normalized == "on")
+            })
+            .unwrap_or(true)
+    })
+}
+
+#[inline]
 fn gdi_window_state_cache_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -186,6 +203,18 @@ fn select_row_compare_kernel() -> RowCompareKernel {
         }
     }
     row_equal_scalar
+}
+
+#[inline(always)]
+fn bgra_row_converter() -> convert::SurfaceRowConverter {
+    use std::sync::OnceLock;
+    static CONVERTER: OnceLock<convert::SurfaceRowConverter> = OnceLock::new();
+    *CONVERTER.get_or_init(|| {
+        convert::SurfaceRowConverter::new(
+            convert::SurfacePixelFormat::Bgra8,
+            convert::SurfaceConversionOptions::default(),
+        )
+    })
 }
 
 unsafe fn row_equal_scalar(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
@@ -488,13 +517,17 @@ impl GdiResources {
         }
     }
 
-    fn try_convert_incremental_rows(
+    fn try_convert_incremental_rows_into(
         &mut self,
-        frame: &mut Frame,
+        dst_ptr: *mut u8,
+        dst_pitch: usize,
         width: usize,
         height: usize,
     ) -> CaptureResult<Option<bool>> {
         let row_bytes = width.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+        if dst_pitch < row_bytes {
+            return Err(CaptureError::BufferOverflow);
+        }
         let total_bytes = row_bytes
             .checked_mul(height)
             .ok_or(CaptureError::BufferOverflow)?;
@@ -509,19 +542,10 @@ impl GdiResources {
 
         let mut dirty_rows = 0usize;
         let mut run_start = None::<usize>;
-        let src_base = self.bits.cast_const();
-        let history_base = self.bgra_history.as_mut_ptr();
+        let mut src_row = self.bits.cast_const();
+        let mut history_row = self.bgra_history.as_mut_ptr();
 
         for row in 0..height {
-            let src_offset = row
-                .checked_mul(self.stride)
-                .ok_or(CaptureError::BufferOverflow)?;
-            let src_row = unsafe { src_base.add(src_offset) };
-            let history_offset = row
-                .checked_mul(row_bytes)
-                .ok_or(CaptureError::BufferOverflow)?;
-            let history_row = unsafe { history_base.add(history_offset) };
-
             let changed = unsafe { !compare_row(src_row, history_row.cast_const(), row_bytes) };
             if !changed {
                 if let Some(start) = run_start.take() {
@@ -530,19 +554,23 @@ impl GdiResources {
                         row_count: row - start,
                     });
                 }
-                continue;
+            } else {
+                dirty_rows = dirty_rows.saturating_add(1);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src_row, history_row, row_bytes);
+                }
+                if run_start.is_none() {
+                    run_start = Some(row);
+                }
+
+                if dirty_rows > max_dirty_rows {
+                    return Ok(None);
+                }
             }
 
-            dirty_rows = dirty_rows.saturating_add(1);
             unsafe {
-                std::ptr::copy_nonoverlapping(src_row, history_row, row_bytes);
-            }
-            if run_start.is_none() {
-                run_start = Some(row);
-            }
-
-            if dirty_rows > max_dirty_rows {
-                return Ok(None);
+                src_row = src_row.add(self.stride);
+                history_row = history_row.add(row_bytes);
             }
         }
 
@@ -557,13 +585,9 @@ impl GdiResources {
             return Ok(Some(true));
         }
 
-        let dst_pitch = width.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
-        let converter = convert::SurfaceRowConverter::new(
-            convert::SurfacePixelFormat::Bgra8,
-            convert::SurfaceConversionOptions::default(),
-        );
-        let src_addr = src_base as usize;
-        let dst_addr = frame.as_mut_rgba_ptr() as usize;
+        let converter = bgra_row_converter();
+        let src_base = self.bits.cast_const();
+        let dst_addr = dst_ptr as usize;
 
         for run in &self.dirty_row_runs {
             let src_offset = run
@@ -574,9 +598,7 @@ impl GdiResources {
                 .start_row
                 .checked_mul(dst_pitch)
                 .ok_or(CaptureError::BufferOverflow)?;
-            let src_ptr = src_addr
-                .checked_add(src_offset)
-                .ok_or(CaptureError::BufferOverflow)? as *const u8;
+            let src_ptr = unsafe { src_base.add(src_offset) };
             let dst_ptr = dst_addr
                 .checked_add(dst_offset)
                 .ok_or(CaptureError::BufferOverflow)? as *mut u8;
@@ -617,6 +639,7 @@ impl GdiResources {
         let pixel_count = width
             .checked_mul(height)
             .ok_or(CaptureError::BufferOverflow)?;
+        let dst_pitch = width.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
 
         let mut frame = reuse.unwrap_or_else(Frame::empty);
         frame.reset_metadata();
@@ -626,8 +649,12 @@ impl GdiResources {
             && gdi_incremental_convert_enabled()
             && pixel_count >= GDI_INCREMENTAL_MIN_PIXELS;
         if incremental_enabled
-            && let Some(is_duplicate) =
-                self.try_convert_incremental_rows(&mut frame, width, height)?
+            && let Some(is_duplicate) = self.try_convert_incremental_rows_into(
+                frame.as_mut_rgba_ptr(),
+                dst_pitch,
+                width,
+                height,
+            )?
         {
             frame.metadata.is_duplicate = is_duplicate;
             return Ok(frame);
@@ -700,63 +727,39 @@ impl GdiResources {
         )
     }
 
-    /// Capture a monitor sub-rectangle and write it directly into an
-    /// already allocated destination frame at `blit.dst_x/dst_y`.
-    ///
-    /// This avoids the legacy region fallback path of:
-    /// 1) full monitor BitBlt + full monitor BGRA->RGBA conversion
-    /// 2) CPU crop/copy into the region output frame
-    ///
-    /// Instead, we only BitBlt the requested source rectangle and convert
-    /// those pixels straight into the destination slice.
-    fn capture_region_into_rgba(
+    /// Capture a desktop-space rectangle and write it directly into an
+    /// already allocated destination frame at `dst_x/dst_y`.
+    fn capture_rect_into_rgba(
         &mut self,
-        geometry: MonitorGeometry,
-        blit: CaptureBlitRegion,
+        source_x: i32,
+        source_y: i32,
+        copy_width: u32,
+        copy_height: u32,
         destination: &mut Frame,
+        dst_x: u32,
+        dst_y: u32,
         mode: CaptureMode,
-    ) -> CaptureResult<()> {
-        if blit.width == 0 || blit.height == 0 {
-            return Ok(());
-        }
-
-        let src_width = u32::try_from(geometry.width).map_err(|_| CaptureError::BufferOverflow)?;
-        let src_height =
-            u32::try_from(geometry.height).map_err(|_| CaptureError::BufferOverflow)?;
-        let src_right = blit
-            .src_x
-            .checked_add(blit.width)
-            .ok_or(CaptureError::BufferOverflow)?;
-        let src_bottom = blit
-            .src_y
-            .checked_add(blit.height)
-            .ok_or(CaptureError::BufferOverflow)?;
-        if src_right > src_width || src_bottom > src_height {
-            return Err(CaptureError::BufferOverflow);
+        destination_has_history: bool,
+    ) -> CaptureResult<bool> {
+        if copy_width == 0 || copy_height == 0 {
+            return Ok(true);
         }
 
         let dst_width = destination.width();
         let dst_height = destination.height();
-        let dst_right = blit
-            .dst_x
-            .checked_add(blit.width)
+        let dst_right = dst_x
+            .checked_add(copy_width)
             .ok_or(CaptureError::BufferOverflow)?;
-        let dst_bottom = blit
-            .dst_y
-            .checked_add(blit.height)
+        let dst_bottom = dst_y
+            .checked_add(copy_height)
             .ok_or(CaptureError::BufferOverflow)?;
         if dst_right > dst_width || dst_bottom > dst_height {
             return Err(CaptureError::BufferOverflow);
         }
 
-        let copy_w_i32 = i32::try_from(blit.width).map_err(|_| CaptureError::BufferOverflow)?;
-        let copy_h_i32 = i32::try_from(blit.height).map_err(|_| CaptureError::BufferOverflow)?;
+        let copy_w_i32 = i32::try_from(copy_width).map_err(|_| CaptureError::BufferOverflow)?;
+        let copy_h_i32 = i32::try_from(copy_height).map_err(|_| CaptureError::BufferOverflow)?;
         self.ensure_surface(copy_w_i32, copy_h_i32)?;
-
-        let source_x = i32::try_from(i64::from(geometry.left) + i64::from(blit.src_x))
-            .map_err(|_| CaptureError::BufferOverflow)?;
-        let source_y = i32::try_from(i64::from(geometry.top) + i64::from(blit.src_y))
-            .map_err(|_| CaptureError::BufferOverflow)?;
 
         unsafe {
             BitBlt(
@@ -774,8 +777,8 @@ impl GdiResources {
         .context("BitBlt failed during GDI region capture")
         .map_err(CaptureError::Platform)?;
 
-        let copy_w = usize::try_from(blit.width).map_err(|_| CaptureError::BufferOverflow)?;
-        let copy_h = usize::try_from(blit.height).map_err(|_| CaptureError::BufferOverflow)?;
+        let copy_w = usize::try_from(copy_width).map_err(|_| CaptureError::BufferOverflow)?;
+        let copy_h = usize::try_from(copy_height).map_err(|_| CaptureError::BufferOverflow)?;
         let dst_pitch = usize::try_from(dst_width)
             .map_err(|_| CaptureError::BufferOverflow)?
             .checked_mul(4)
@@ -788,15 +791,32 @@ impl GdiResources {
         if destination.as_rgba_bytes().len() < dst_required_len {
             return Err(CaptureError::BufferOverflow);
         }
-        let dst_x = usize::try_from(blit.dst_x).map_err(|_| CaptureError::BufferOverflow)?;
-        let dst_y = usize::try_from(blit.dst_y).map_err(|_| CaptureError::BufferOverflow)?;
-        let dst_offset = dst_y
+        let dst_x_usize = usize::try_from(dst_x).map_err(|_| CaptureError::BufferOverflow)?;
+        let dst_y_usize = usize::try_from(dst_y).map_err(|_| CaptureError::BufferOverflow)?;
+        let dst_offset = dst_y_usize
             .checked_mul(dst_pitch)
-            .and_then(|base| dst_x.checked_mul(4).and_then(|xoff| base.checked_add(xoff)))
+            .and_then(|base| {
+                dst_x_usize
+                    .checked_mul(4)
+                    .and_then(|xoff| base.checked_add(xoff))
+            })
             .ok_or(CaptureError::BufferOverflow)?;
 
         let dst_ptr = unsafe { destination.as_mut_rgba_ptr().add(dst_offset) };
         let row_bytes = copy_w.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+        let pixel_count = copy_w
+            .checked_mul(copy_h)
+            .ok_or(CaptureError::BufferOverflow)?;
+        let incremental_enabled = mode == CaptureMode::ScreenRecording
+            && destination_has_history
+            && gdi_incremental_convert_enabled()
+            && pixel_count >= GDI_INCREMENTAL_MIN_PIXELS;
+        if incremental_enabled
+            && let Some(is_duplicate) =
+                self.try_convert_incremental_rows_into(dst_ptr, dst_pitch, copy_w, copy_h)?
+        {
+            return Ok(is_duplicate);
+        }
 
         // Fast path: contiguous destination rows (single-monitor region output)
         // can use the dedicated contiguous kernels directly.
@@ -806,39 +826,125 @@ impl GdiResources {
                     CaptureMode::ScreenRecording => convert::convert_bgra_to_rgba_nt_unchecked(
                         self.bits.cast_const(),
                         dst_ptr,
-                        copy_w
-                            .checked_mul(copy_h)
-                            .ok_or(CaptureError::BufferOverflow)?,
+                        pixel_count,
                     ),
                     CaptureMode::Screenshot => convert::convert_bgra_to_rgba_unchecked(
                         self.bits.cast_const(),
                         dst_ptr,
-                        copy_w
-                            .checked_mul(copy_h)
-                            .ok_or(CaptureError::BufferOverflow)?,
+                        pixel_count,
                     ),
                 }
             }
-            return Ok(());
+        } else {
+            // General path for multi-monitor composites where destination rows
+            // include padding to the full region width.
+            unsafe {
+                convert::convert_surface_to_rgba_unchecked(
+                    convert::SurfacePixelFormat::Bgra8,
+                    convert::SurfaceLayout::new(
+                        self.bits.cast_const(),
+                        self.stride,
+                        dst_ptr,
+                        dst_pitch,
+                        copy_w,
+                        copy_h,
+                    ),
+                    convert::SurfaceConversionOptions::default(),
+                );
+            }
         }
 
-        // General path for multi-monitor composites where destination rows
-        // include padding to the full region width.
-        unsafe {
-            convert::convert_surface_to_rgba_unchecked(
-                convert::SurfacePixelFormat::Bgra8,
-                convert::SurfaceLayout::new(
-                    self.bits.cast_const(),
-                    self.stride,
-                    dst_ptr,
-                    dst_pitch,
-                    copy_w,
-                    copy_h,
-                ),
-                convert::SurfaceConversionOptions::default(),
-            );
+        if mode == CaptureMode::ScreenRecording
+            && gdi_incremental_convert_enabled()
+            && pixel_count >= GDI_INCREMENTAL_MIN_PIXELS
+        {
+            let total_bytes = pixel_count
+                .checked_mul(4)
+                .ok_or(CaptureError::BufferOverflow)?;
+            self.ensure_bgra_history(total_bytes);
+            unsafe {
+                self.copy_surface_to_history_unchecked(total_bytes);
+            }
         }
-        Ok(())
+
+        Ok(false)
+    }
+
+    /// Capture a monitor sub-rectangle and write it directly into an
+    /// already allocated destination frame at `blit.dst_x/dst_y`.
+    ///
+    /// This avoids the legacy region fallback path of:
+    /// 1) full monitor BitBlt + full monitor BGRA->RGBA conversion
+    /// 2) CPU crop/copy into the region output frame
+    ///
+    /// Instead, we only BitBlt the requested source rectangle and convert
+    /// those pixels straight into the destination slice.
+    fn capture_region_into_rgba(
+        &mut self,
+        geometry: MonitorGeometry,
+        blit: CaptureBlitRegion,
+        destination: &mut Frame,
+        mode: CaptureMode,
+        destination_has_history: bool,
+    ) -> CaptureResult<bool> {
+        if blit.width == 0 || blit.height == 0 {
+            return Ok(true);
+        }
+
+        let src_width = u32::try_from(geometry.width).map_err(|_| CaptureError::BufferOverflow)?;
+        let src_height =
+            u32::try_from(geometry.height).map_err(|_| CaptureError::BufferOverflow)?;
+        let src_right = blit
+            .src_x
+            .checked_add(blit.width)
+            .ok_or(CaptureError::BufferOverflow)?;
+        let src_bottom = blit
+            .src_y
+            .checked_add(blit.height)
+            .ok_or(CaptureError::BufferOverflow)?;
+        if src_right > src_width || src_bottom > src_height {
+            return Err(CaptureError::BufferOverflow);
+        }
+
+        let source_x = i32::try_from(i64::from(geometry.left) + i64::from(blit.src_x))
+            .map_err(|_| CaptureError::BufferOverflow)?;
+        let source_y = i32::try_from(i64::from(geometry.top) + i64::from(blit.src_y))
+            .map_err(|_| CaptureError::BufferOverflow)?;
+
+        self.capture_rect_into_rgba(
+            source_x,
+            source_y,
+            blit.width,
+            blit.height,
+            destination,
+            blit.dst_x,
+            blit.dst_y,
+            mode,
+            destination_has_history,
+        )
+    }
+
+    fn capture_desktop_region_into_rgba(
+        &mut self,
+        source_x: i32,
+        source_y: i32,
+        width: u32,
+        height: u32,
+        destination: &mut Frame,
+        mode: CaptureMode,
+        destination_has_history: bool,
+    ) -> CaptureResult<bool> {
+        self.capture_rect_into_rgba(
+            source_x,
+            source_y,
+            width,
+            height,
+            destination,
+            0,
+            0,
+            mode,
+            destination_has_history,
+        )
     }
 
     /// Capture a window directly into the backing DIB.
@@ -1046,7 +1152,7 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
         &mut self,
         blit: CaptureBlitRegion,
         destination: &mut Frame,
-        _destination_has_history: bool,
+        destination_has_history: bool,
     ) -> CaptureResult<Option<CaptureSampleMetadata>> {
         if !gdi_direct_region_capture_enabled() {
             return Ok(None);
@@ -1054,16 +1160,55 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
 
         self.refresh_geometry()?;
         let capture_time = Instant::now();
-        self.resources.capture_region_into_rgba(
+        let is_duplicate = self.resources.capture_region_into_rgba(
             self.geometry,
             blit,
             destination,
             self.capture_mode,
+            destination_has_history,
         )?;
         Ok(Some(CaptureSampleMetadata {
             capture_time: Some(capture_time),
             present_time_qpc: crate::frame::query_qpc_now(),
-            is_duplicate: false,
+            is_duplicate,
+        }))
+    }
+
+    fn capture_desktop_region_into(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        destination: &mut Frame,
+        destination_has_history: bool,
+    ) -> CaptureResult<Option<CaptureSampleMetadata>> {
+        if !gdi_desktop_direct_region_capture_enabled() {
+            return Ok(None);
+        }
+        if width == 0 || height == 0 {
+            return Ok(Some(CaptureSampleMetadata {
+                capture_time: Some(Instant::now()),
+                present_time_qpc: crate::frame::query_qpc_now(),
+                is_duplicate: true,
+            }));
+        }
+
+        self.refresh_geometry()?;
+        let capture_time = Instant::now();
+        let is_duplicate = self.resources.capture_desktop_region_into_rgba(
+            x,
+            y,
+            width,
+            height,
+            destination,
+            self.capture_mode,
+            destination_has_history,
+        )?;
+        Ok(Some(CaptureSampleMetadata {
+            capture_time: Some(capture_time),
+            present_time_qpc: crate::frame::query_qpc_now(),
+            is_duplicate,
         }))
     }
 

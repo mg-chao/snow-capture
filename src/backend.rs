@@ -139,6 +139,23 @@ pub trait MonitorCapturer: Send {
         Ok(None)
     }
 
+    /// Optional accelerated path for capturing a desktop-space region
+    /// directly into an already-allocated destination frame.
+    ///
+    /// Coordinates are in virtual desktop space. The captured pixels are
+    /// written starting at destination origin (0,0) for `width x height`.
+    fn capture_desktop_region_into(
+        &mut self,
+        _x: i32,
+        _y: i32,
+        _width: u32,
+        _height: u32,
+        _destination: &mut Frame,
+        _destination_has_history: bool,
+    ) -> CaptureResult<Option<CaptureSampleMetadata>> {
+        Ok(None)
+    }
+
     /// Set capture mode so backends can tune buffering/conversion policy.
     fn set_capture_mode(&mut self, _mode: CaptureMode) {}
 

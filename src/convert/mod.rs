@@ -259,6 +259,139 @@ struct SurfaceFormatPlan {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) struct SurfaceRowConverter {
+    format: SurfacePixelFormat,
+    plan: SurfaceFormatPlan,
+    hdr_params: Option<HdrToSdrParams>,
+}
+
+impl SurfaceRowConverter {
+    #[inline]
+    pub(crate) fn new(format: SurfacePixelFormat, options: SurfaceConversionOptions) -> Self {
+        let hdr_params = if format == SurfacePixelFormat::Rgba16Float {
+            options.hdr_to_sdr.map(HdrToSdrParams::sanitized)
+        } else {
+            None
+        };
+        Self {
+            format,
+            plan: surface_format_plan(format),
+            hdr_params,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn convert_rows_unchecked(
+        self,
+        src: *const u8,
+        src_pitch: usize,
+        dst: *mut u8,
+        dst_pitch: usize,
+        width: usize,
+        height: usize,
+    ) {
+        unsafe {
+            self.convert_rows_impl(src, src_pitch, dst, dst_pitch, width, height, false);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn convert_rows_maybe_parallel_unchecked(
+        self,
+        src: *const u8,
+        src_pitch: usize,
+        dst: *mut u8,
+        dst_pitch: usize,
+        width: usize,
+        height: usize,
+    ) {
+        unsafe {
+            self.convert_rows_impl(src, src_pitch, dst, dst_pitch, width, height, true);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn convert_rows_impl(
+        self,
+        src: *const u8,
+        src_pitch: usize,
+        dst: *mut u8,
+        dst_pitch: usize,
+        width: usize,
+        height: usize,
+        allow_parallel: bool,
+    ) {
+        let layout = SurfaceLayout::new(src, src_pitch, dst, dst_pitch, width, height);
+        if layout.is_empty() {
+            return;
+        }
+
+        if self.format == SurfacePixelFormat::Rgba16Float
+            && let Some(params) = self.hdr_params
+        {
+            let _ = layout.assert_pitches(self.plan.src_bytes_per_pixel);
+            let total_pixels = layout.total_pixels();
+            let kernel = f16_hdr_kernel();
+            if allow_parallel
+                && let Some(chunks) =
+                    maybe_parallel_row_chunks(layout, self.plan.parallel, total_pixels)
+            {
+                unsafe {
+                    run_rows_parallel_with(
+                        layout,
+                        chunks,
+                        self.plan.parallel.max_workers,
+                        move |row_src, row_dst, row_width| {
+                            kernel(row_src, row_dst, row_width, params);
+                        },
+                    );
+                }
+                return;
+            }
+            unsafe {
+                run_rows_serial_with(layout, move |row_src, row_dst, row_width| {
+                    kernel(row_src, row_dst, row_width, params);
+                });
+            }
+            return;
+        }
+
+        let _ = layout.assert_pitches(self.plan.src_bytes_per_pixel);
+        let total_pixels = layout.total_pixels();
+        let bgra_row_nt_kernel = if self.format == SurfacePixelFormat::Bgra8 {
+            bgra_nt_kernel_for_rows(layout.dst as *const u8, layout.dst_pitch)
+        } else {
+            None
+        };
+        let use_nt = layout.allow_parallel_rows()
+            && total_pixels >= NT_STORE_MIN_PIXELS
+            && match self.format {
+                SurfacePixelFormat::Bgra8 => bgra_row_nt_kernel.is_some(),
+                _ => nt_rows_are_aligned(layout.dst as *const u8, layout.dst_pitch),
+            };
+        let kernel = if use_nt {
+            bgra_row_nt_kernel.unwrap_or(self.plan.row_kernel_nt)
+        } else {
+            self.plan.row_kernel
+        };
+
+        if allow_parallel
+            && let Some(chunks) =
+                maybe_parallel_row_chunks(layout, self.plan.parallel, total_pixels)
+        {
+            unsafe {
+                run_rows_parallel(layout, kernel, chunks, self.plan.parallel.max_workers);
+            }
+            return;
+        }
+
+        unsafe {
+            run_rows_serial(layout, kernel);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct RowChunkPlan {
     chunk_rows: usize,
     chunk_count: usize,

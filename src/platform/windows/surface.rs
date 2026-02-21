@@ -101,6 +101,110 @@ fn dirty_rect_parallel_enabled() -> bool {
     })
 }
 
+fn dirty_rect_fastpath_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_DISABLE_DIRTY_RECT_FASTPATH")
+            .map(|raw| {
+                let normalized = raw.trim().to_ascii_lowercase();
+                !(normalized == "1"
+                    || normalized == "true"
+                    || normalized == "yes"
+                    || normalized == "on")
+            })
+            .unwrap_or(true)
+    })
+}
+
+#[inline(always)]
+fn build_dirty_rect_work_item(
+    rect: &DirtyRect,
+    width: usize,
+    height: usize,
+    dst_origin_x: usize,
+    dst_origin_y: usize,
+    dst_width: usize,
+    dst_height: usize,
+    src_pitch: usize,
+    src_bytes_per_pixel: usize,
+    dst_pitch: usize,
+) -> CaptureResult<Option<DirtyRectWorkItem>> {
+    let x = usize::try_from(rect.x).map_err(|_| CaptureError::BufferOverflow)?;
+    let y = usize::try_from(rect.y).map_err(|_| CaptureError::BufferOverflow)?;
+    let rect_w = usize::try_from(rect.width).map_err(|_| CaptureError::BufferOverflow)?;
+    let rect_h = usize::try_from(rect.height).map_err(|_| CaptureError::BufferOverflow)?;
+
+    if rect_w == 0 || rect_h == 0 || x >= width || y >= height {
+        return Ok(None);
+    }
+
+    let end_x = x.saturating_add(rect_w).min(width);
+    let end_y = y.saturating_add(rect_h).min(height);
+    if end_x <= x || end_y <= y {
+        return Ok(None);
+    }
+
+    let copy_w = end_x - x;
+    let copy_h = end_y - y;
+
+    let src_row_bytes = copy_w
+        .checked_mul(src_bytes_per_pixel)
+        .ok_or(CaptureError::BufferOverflow)?;
+    let src_end_in_row = x
+        .checked_mul(src_bytes_per_pixel)
+        .and_then(|offset| offset.checked_add(src_row_bytes))
+        .ok_or(CaptureError::BufferOverflow)?;
+    if src_end_in_row > src_pitch {
+        return Err(CaptureError::BufferOverflow);
+    }
+
+    let dst_x = dst_origin_x
+        .checked_add(x)
+        .ok_or(CaptureError::BufferOverflow)?;
+    let dst_y = dst_origin_y
+        .checked_add(y)
+        .ok_or(CaptureError::BufferOverflow)?;
+    let dst_right = dst_x
+        .checked_add(copy_w)
+        .ok_or(CaptureError::BufferOverflow)?;
+    let dst_bottom = dst_y
+        .checked_add(copy_h)
+        .ok_or(CaptureError::BufferOverflow)?;
+    if dst_right > dst_width || dst_bottom > dst_height {
+        return Err(CaptureError::BufferOverflow);
+    }
+
+    let dst_row_bytes = copy_w.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+    let dst_end_in_row = dst_x
+        .checked_mul(4)
+        .and_then(|offset| offset.checked_add(dst_row_bytes))
+        .ok_or(CaptureError::BufferOverflow)?;
+    if dst_end_in_row > dst_pitch {
+        return Err(CaptureError::BufferOverflow);
+    }
+
+    let src_offset = y
+        .checked_mul(src_pitch)
+        .and_then(|base| {
+            x.checked_mul(src_bytes_per_pixel)
+                .and_then(|xoff| base.checked_add(xoff))
+        })
+        .ok_or(CaptureError::BufferOverflow)?;
+    let dst_offset = dst_y
+        .checked_mul(dst_pitch)
+        .and_then(|base| dst_x.checked_mul(4).and_then(|xoff| base.checked_add(xoff)))
+        .ok_or(CaptureError::BufferOverflow)?;
+
+    Ok(Some(DirtyRectWorkItem {
+        src_offset,
+        dst_offset,
+        x,
+        y,
+        width: copy_w,
+        height: copy_h,
+    }))
+}
+
 pub(crate) fn ensure_staging_texture<'a>(
     device: &ID3D11Device,
     staging: &'a mut Option<ID3D11Texture2D>,
@@ -483,98 +587,76 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
             .checked_mul(4)
             .ok_or(CaptureError::BufferOverflow)?;
         let dst_base = frame.as_mut_rgba_ptr();
+        let options = SurfaceConversionOptions { hdr_to_sdr };
+        let converter = convert::SurfaceRowConverter::new(format, options);
+
+        if dirty_rect_fastpath_enabled() && dirty_rects.len() < DIRTY_RECT_PARALLEL_MIN_RECTS {
+            let mut converted = 0usize;
+            for rect in dirty_rects {
+                let Some(item) = build_dirty_rect_work_item(
+                    rect,
+                    width,
+                    height,
+                    dst_origin_x,
+                    dst_origin_y,
+                    dst_width,
+                    dst_height,
+                    src_pitch,
+                    src_bytes_per_pixel,
+                    dst_pitch,
+                )?
+                else {
+                    continue;
+                };
+                unsafe {
+                    converter.convert_rows_maybe_parallel_unchecked(
+                        src_base.add(item.src_offset),
+                        src_pitch,
+                        dst_base.add(item.dst_offset),
+                        dst_pitch,
+                        item.width,
+                        item.height,
+                    );
+                }
+                converted = converted.saturating_add(1);
+            }
+            return Ok(converted);
+        }
 
         let mut work_items = Vec::with_capacity(dirty_rects.len());
         let mut total_dirty_pixels = 0usize;
 
         for rect in dirty_rects {
-            let x = usize::try_from(rect.x).map_err(|_| CaptureError::BufferOverflow)?;
-            let y = usize::try_from(rect.y).map_err(|_| CaptureError::BufferOverflow)?;
-            let rect_w = usize::try_from(rect.width).map_err(|_| CaptureError::BufferOverflow)?;
-            let rect_h = usize::try_from(rect.height).map_err(|_| CaptureError::BufferOverflow)?;
-
-            if rect_w == 0 || rect_h == 0 || x >= width || y >= height {
+            let Some(item) = build_dirty_rect_work_item(
+                rect,
+                width,
+                height,
+                dst_origin_x,
+                dst_origin_y,
+                dst_width,
+                dst_height,
+                src_pitch,
+                src_bytes_per_pixel,
+                dst_pitch,
+            )?
+            else {
                 continue;
-            }
+            };
 
-            let end_x = x.saturating_add(rect_w).min(width);
-            let end_y = y.saturating_add(rect_h).min(height);
-            if end_x <= x || end_y <= y {
-                continue;
-            }
-
-            let copy_w = end_x - x;
-            let copy_h = end_y - y;
-
-            let src_row_bytes = source_row_bytes(format, copy_w)?;
-            let src_end_in_row = x
-                .checked_mul(src_bytes_per_pixel)
-                .and_then(|offset| offset.checked_add(src_row_bytes))
-                .ok_or(CaptureError::BufferOverflow)?;
-            if src_end_in_row > src_pitch {
-                return Err(CaptureError::BufferOverflow);
-            }
-
-            let dst_x = dst_origin_x
-                .checked_add(x)
-                .ok_or(CaptureError::BufferOverflow)?;
-            let dst_y = dst_origin_y
-                .checked_add(y)
-                .ok_or(CaptureError::BufferOverflow)?;
-            let dst_right = dst_x
-                .checked_add(copy_w)
-                .ok_or(CaptureError::BufferOverflow)?;
-            let dst_bottom = dst_y
-                .checked_add(copy_h)
-                .ok_or(CaptureError::BufferOverflow)?;
-            if dst_right > dst_width || dst_bottom > dst_height {
-                return Err(CaptureError::BufferOverflow);
-            }
-
-            let dst_row_bytes = copy_w.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
-            let dst_end_in_row = dst_x
-                .checked_mul(4)
-                .and_then(|offset| offset.checked_add(dst_row_bytes))
-                .ok_or(CaptureError::BufferOverflow)?;
-            if dst_end_in_row > dst_pitch {
-                return Err(CaptureError::BufferOverflow);
-            }
-
-            let src_offset = y
-                .checked_mul(src_pitch)
-                .and_then(|base| {
-                    x.checked_mul(src_bytes_per_pixel)
-                        .and_then(|xoff| base.checked_add(xoff))
-                })
-                .ok_or(CaptureError::BufferOverflow)?;
-
-            let dst_offset = dst_y
-                .checked_mul(dst_pitch)
-                .and_then(|base| dst_x.checked_mul(4).and_then(|xoff| base.checked_add(xoff)))
-                .ok_or(CaptureError::BufferOverflow)?;
-
-            let dirty_pixels = copy_w
-                .checked_mul(copy_h)
+            let dirty_pixels = item
+                .width
+                .checked_mul(item.height)
                 .ok_or(CaptureError::BufferOverflow)?;
             total_dirty_pixels = total_dirty_pixels
                 .checked_add(dirty_pixels)
                 .ok_or(CaptureError::BufferOverflow)?;
-
-            work_items.push(DirtyRectWorkItem {
-                src_offset,
-                dst_offset,
-                x,
-                y,
-                width: copy_w,
-                height: copy_h,
-            });
+            work_items.push(item);
         }
 
         if work_items.is_empty() {
             return Ok(0);
         }
 
-        let options = SurfaceConversionOptions { hdr_to_sdr };
         let should_parallelize = convert::should_parallelize_work(
             total_dirty_pixels,
             DIRTY_RECT_PARALLEL_MIN_PIXELS,
@@ -593,34 +675,26 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
             let dst_addr = dst_base as usize;
             convert::with_conversion_pool(DIRTY_RECT_PARALLEL_MAX_WORKERS, || {
                 work_items.par_iter().for_each(|item| unsafe {
-                    convert::convert_surface_to_rgba_unchecked(
-                        format,
-                        SurfaceLayout::new(
-                            (src_addr + item.src_offset) as *const u8,
-                            src_pitch,
-                            (dst_addr + item.dst_offset) as *mut u8,
-                            dst_pitch,
-                            item.width,
-                            item.height,
-                        ),
-                        options,
+                    converter.convert_rows_unchecked(
+                        (src_addr + item.src_offset) as *const u8,
+                        src_pitch,
+                        (dst_addr + item.dst_offset) as *mut u8,
+                        dst_pitch,
+                        item.width,
+                        item.height,
                     );
                 });
             });
         } else {
             for item in &work_items {
                 unsafe {
-                    convert::convert_surface_to_rgba_unchecked(
-                        format,
-                        SurfaceLayout::new(
-                            src_base.add(item.src_offset),
-                            src_pitch,
-                            dst_base.add(item.dst_offset),
-                            dst_pitch,
-                            item.width,
-                            item.height,
-                        ),
-                        options,
+                    converter.convert_rows_maybe_parallel_unchecked(
+                        src_base.add(item.src_offset),
+                        src_pitch,
+                        dst_base.add(item.dst_offset),
+                        dst_pitch,
+                        item.width,
+                        item.height,
                     );
                 }
             }
@@ -674,5 +748,34 @@ mod tests {
     fn work_items_non_overlapping_accepts_disjoint_list() {
         let work_items = vec![item(0, 0, 16, 16), item(20, 0, 12, 16), item(0, 20, 8, 8)];
         assert!(work_items_non_overlapping(&work_items));
+    }
+
+    #[test]
+    fn build_dirty_rect_work_item_clamps_to_source_bounds() {
+        let rect = DirtyRect {
+            x: 1910,
+            y: 1075,
+            width: 32,
+            height: 20,
+        };
+        let item = build_dirty_rect_work_item(&rect, 1920, 1080, 0, 0, 1920, 1080, 7680, 4, 7680)
+            .expect("work item build failed")
+            .expect("expected dirty work item");
+        assert_eq!(item.width, 10);
+        assert_eq!(item.height, 5);
+        assert_eq!(item.x, 1910);
+        assert_eq!(item.y, 1075);
+    }
+
+    #[test]
+    fn build_dirty_rect_work_item_rejects_destination_overflow() {
+        let rect = DirtyRect {
+            x: 40,
+            y: 10,
+            width: 32,
+            height: 16,
+        };
+        let result = build_dirty_rect_work_item(&rect, 128, 128, 100, 0, 128, 128, 512, 4, 512);
+        assert!(matches!(result, Err(CaptureError::BufferOverflow)));
     }
 }

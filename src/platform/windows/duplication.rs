@@ -67,6 +67,12 @@ fn region_dirty_gpu_copy_enabled() -> bool {
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_GPU_COPY"))
 }
 
+#[inline]
+fn duplicate_dirty_fastpath_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_DUPLICATE_DIRTY_FASTPATH"))
+}
+
 #[derive(Default)]
 struct RegionStagingSlot {
     staging: Option<ID3D11Texture2D>,
@@ -593,6 +599,11 @@ impl StagingRing {
         read_idx
     }
 
+    #[inline(always)]
+    fn latest_write_slot(&self) -> usize {
+        self.write_idx
+    }
+
     /// Wait for the copy on the given slot to complete, then map and
     /// convert into the frame.
     ///
@@ -853,6 +864,16 @@ fn should_use_dirty_gpu_copy(rects: &[DirtyRect], width: u32, height: u32) -> bo
     }
 
     true
+}
+
+#[inline(always)]
+fn should_skip_screenrecord_submit_copy(
+    fastpath_enabled: bool,
+    has_pending_submission: bool,
+    source_is_duplicate: bool,
+    source_unchanged: bool,
+) -> bool {
+    fastpath_enabled && has_pending_submission && (source_is_duplicate || source_unchanged)
 }
 
 /// Extract cursor shape and position from the DXGI duplication frame.
@@ -1714,18 +1735,22 @@ impl OutputCapturer {
             self.last_present_time = frame_info.LastPresentTime;
         }
 
+        let duplicate_fastpath = duplicate_dirty_fastpath_enabled();
         // Duplicate frames have no new desktop damage. Skip the COM metadata
         // query on this fast path.
-        if frame.metadata.is_duplicate {
+        let source_unchanged = if frame.metadata.is_duplicate {
             frame.metadata.dirty_rects.clear();
+            duplicate_fastpath
+        } else if extract_dirty_rects(
+            &self.duplication,
+            &frame_info,
+            &mut self.dxgi_rect_buffer,
+            &mut frame.metadata.dirty_rects,
+        ) {
+            frame.metadata.dirty_rects.is_empty()
         } else {
-            extract_dirty_rects(
-                &self.duplication,
-                &frame_info,
-                &mut self.dxgi_rect_buffer,
-                &mut frame.metadata.dirty_rects,
-            );
-        }
+            false
+        };
 
         // Extract cursor data if configured.
         if self.cursor_config.capture_cursor {
@@ -1751,57 +1776,95 @@ impl OutputCapturer {
         self.staging_ring
             .ensure_slots(&self.device, &effective_desc)?;
         if self.capture_mode == CaptureMode::ScreenRecording {
-            let read_slot = self
-                .staging_ring
-                .submit_copy(&self.context, &effective_source);
+            let frame_pixels_unchanged = frame.metadata.is_duplicate || source_unchanged;
+            let pending_slot_compatible = self.pending_desc.as_ref().is_some_and(|desc| {
+                desc.Width == effective_desc.Width
+                    && desc.Height == effective_desc.Height
+                    && desc.Format == effective_desc.Format
+            }) && self.pending_hdr == effective_hdr;
+            let skip_submit_copy = should_skip_screenrecord_submit_copy(
+                duplicate_fastpath,
+                pending_slot_compatible,
+                frame.metadata.is_duplicate,
+                source_unchanged,
+            );
 
-            if let (Some(slot), Some(prev_desc)) = (read_slot, self.pending_desc.as_ref()) {
-                // Read back the previous slot while the next copy is in flight.
-                let prev_hdr = self.pending_hdr;
-                let output_matches_source = has_frame_history
-                    && frame.width() == prev_desc.Width
-                    && frame.height() == prev_desc.Height;
-                let skip_readback = output_matches_source && self.pending_is_duplicate;
-                let use_dirty_copy = output_matches_source
-                    && !skip_readback
-                    && !self.pending_dirty_rects.is_empty()
-                    && should_use_dirty_copy(
-                        &self.pending_dirty_rects,
-                        prev_desc.Width,
-                        prev_desc.Height,
-                    );
-                self.staging_ring.read_slot_with_strategy(
-                    &self.context,
-                    slot,
-                    prev_desc,
-                    &mut frame,
-                    prev_hdr,
-                    &self.pending_dirty_rects,
-                    use_dirty_copy,
-                    skip_readback,
-                )?;
+            let mut read_slot = self.staging_ring.latest_write_slot();
+            let mut read_desc = effective_desc;
+            let mut read_hdr = effective_hdr;
+            let mut read_is_duplicate = frame_pixels_unchanged;
+            let mut read_dirty_rects: &[DirtyRect] = &[];
+
+            if skip_submit_copy {
+                if let Some(prev_desc) = self.pending_desc.as_ref() {
+                    read_desc = *prev_desc;
+                    read_hdr = self.pending_hdr;
+                    // The pending slot may still contain new pixels that
+                    // haven't been consumed yet (pipeline catch-up after a
+                    // non-duplicate frame). Respect its duplicate state.
+                    read_is_duplicate = self.pending_is_duplicate;
+                    read_dirty_rects = &self.pending_dirty_rects;
+                }
             } else {
-                self.staging_ring.copy_and_read(
-                    &self.context,
-                    &effective_source,
-                    &effective_desc,
-                    &mut frame,
-                    effective_hdr,
-                )?;
+                let submitted_read_slot = self
+                    .staging_ring
+                    .submit_copy(&self.context, &effective_source);
+                if let (Some(slot), Some(prev_desc)) =
+                    (submitted_read_slot, self.pending_desc.as_ref())
+                {
+                    // Read back the previous slot while the next copy is in flight.
+                    read_slot = slot;
+                    read_desc = *prev_desc;
+                    read_hdr = self.pending_hdr;
+                    read_is_duplicate = self.pending_is_duplicate;
+                    read_dirty_rects = &self.pending_dirty_rects;
+                } else {
+                    // Bootstrap/desync path: read the freshly submitted slot.
+                    read_slot = self.staging_ring.latest_write_slot();
+                    read_desc = effective_desc;
+                    read_hdr = effective_hdr;
+                    read_is_duplicate = frame_pixels_unchanged;
+                }
             }
 
-            self.pending_desc = Some(effective_desc);
-            self.pending_hdr = effective_hdr;
-            self.pending_is_duplicate = frame.metadata.is_duplicate;
-            self.pending_dirty_rects.clear();
-            if !frame.metadata.is_duplicate {
-                self.pending_dirty_rects
-                    .extend_from_slice(&frame.metadata.dirty_rects);
-                normalize_dirty_rects_in_place(
-                    &mut self.pending_dirty_rects,
-                    effective_desc.Width,
-                    effective_desc.Height,
-                );
+            let output_matches_source = has_frame_history
+                && frame.width() == read_desc.Width
+                && frame.height() == read_desc.Height;
+            let skip_readback = output_matches_source && read_is_duplicate;
+            let use_dirty_copy = output_matches_source
+                && !skip_readback
+                && !read_dirty_rects.is_empty()
+                && should_use_dirty_copy(read_dirty_rects, read_desc.Width, read_desc.Height);
+            self.staging_ring.read_slot_with_strategy(
+                &self.context,
+                read_slot,
+                &read_desc,
+                &mut frame,
+                read_hdr,
+                read_dirty_rects,
+                use_dirty_copy,
+                skip_readback,
+            )?;
+
+            if skip_submit_copy {
+                // We intentionally kept the previous pending slot alive;
+                // keep metadata aligned with that slot's unchanged contents.
+                self.pending_is_duplicate = true;
+                self.pending_dirty_rects.clear();
+            } else {
+                self.pending_desc = Some(effective_desc);
+                self.pending_hdr = effective_hdr;
+                self.pending_is_duplicate = frame_pixels_unchanged;
+                self.pending_dirty_rects.clear();
+                if !frame_pixels_unchanged {
+                    self.pending_dirty_rects
+                        .extend_from_slice(&frame.metadata.dirty_rects);
+                    normalize_dirty_rects_in_place(
+                        &mut self.pending_dirty_rects,
+                        effective_desc.Width,
+                        effective_desc.Height,
+                    );
+                }
             }
         } else {
             // Screenshot mode avoids recording-only buffering.
@@ -2162,6 +2225,30 @@ impl crate::backend::MonitorCapturer for WindowsDxgiWindowCapturer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_submit_copy_requires_fastpath_and_pending_state() {
+        assert!(!should_skip_screenrecord_submit_copy(
+            false, true, true, false
+        ));
+        assert!(!should_skip_screenrecord_submit_copy(
+            true, false, true, false
+        ));
+    }
+
+    #[test]
+    fn skip_submit_copy_triggers_for_duplicate_frames() {
+        assert!(should_skip_screenrecord_submit_copy(
+            true, true, true, false
+        ));
+    }
+
+    #[test]
+    fn skip_submit_copy_triggers_for_empty_dirty_updates() {
+        assert!(should_skip_screenrecord_submit_copy(
+            true, true, false, true
+        ));
+    }
 
     #[test]
     fn dirty_copy_heuristic_accepts_small_sparse_updates() {

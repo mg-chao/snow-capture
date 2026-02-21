@@ -173,6 +173,23 @@ fn gdi_incremental_convert_enabled() -> bool {
     })
 }
 
+#[inline]
+fn gdi_swap_history_surfaces_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_DISABLE_GDI_HISTORY_SURFACE_SWAP")
+            .map(|raw| {
+                let normalized = raw.trim().to_ascii_lowercase();
+                !(normalized == "1"
+                    || normalized == "true"
+                    || normalized == "yes"
+                    || normalized == "on")
+            })
+            .unwrap_or(true)
+    })
+}
+
 const GDI_INCREMENTAL_MIN_PIXELS: usize = 160_000;
 const GDI_INCREMENTAL_MAX_DIRTY_ROW_NUMERATOR: usize = 3;
 const GDI_INCREMENTAL_MAX_DIRTY_ROW_DENOMINATOR: usize = 4;
@@ -315,11 +332,14 @@ fn build_window_capture_attempts(
 struct GdiResources {
     screen_dc: HDC,
     mem_dc: HDC,
-    bitmap: Option<HBITMAP>,
-    old_bitmap: Option<HGDIOBJ>,
+    capture_bitmap: Option<HBITMAP>,
+    history_bitmap: Option<HBITMAP>,
+    original_bitmap: Option<HGDIOBJ>,
     window_dc: Option<HDC>,
     window_dc_owner: Option<HWND>,
     bits: *mut u8,
+    history_bits: *mut u8,
+    history_surface_valid: bool,
     width: i32,
     height: i32,
     stride: usize,
@@ -349,11 +369,14 @@ impl GdiResources {
         Ok(Self {
             screen_dc,
             mem_dc,
-            bitmap: None,
-            old_bitmap: None,
+            capture_bitmap: None,
+            history_bitmap: None,
+            original_bitmap: None,
             window_dc: None,
             window_dc_owner: None,
             bits: null_mut(),
+            history_bits: null_mut(),
+            history_surface_valid: false,
             width: 0,
             height: 0,
             stride: 0,
@@ -436,19 +459,7 @@ impl GdiResources {
         Ok(window_dc)
     }
 
-    fn ensure_surface(&mut self, width: i32, height: i32) -> CaptureResult<()> {
-        if width <= 0 || height <= 0 {
-            return Err(CaptureError::Platform(anyhow::anyhow!(
-                "invalid gdi surface size {width}x{height}"
-            )));
-        }
-
-        if self.bitmap.is_some() && self.width == width && self.height == height {
-            return Ok(());
-        }
-
-        self.release_bitmap();
-
+    fn create_dib_bitmap(&self, width: i32, height: i32) -> CaptureResult<(HBITMAP, *mut u8)> {
         let mut info = BITMAPINFO::default();
         info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
         info.bmiHeader.biWidth = width;
@@ -471,6 +482,84 @@ impl GdiResources {
         }
         .context("CreateDIBSection failed")
         .map_err(CaptureError::Platform)?;
+        if bits.is_null() {
+            unsafe {
+                let _ = DeleteObject(bitmap);
+            }
+            return Err(CaptureError::Platform(anyhow::anyhow!(
+                "CreateDIBSection returned a null pixel buffer"
+            )));
+        }
+        Ok((bitmap, bits.cast()))
+    }
+
+    fn ensure_history_surface(&mut self) -> CaptureResult<()> {
+        if !gdi_swap_history_surfaces_enabled() || self.width <= 0 || self.height <= 0 {
+            return Ok(());
+        }
+        if self.history_bitmap.is_some() && !self.history_bits.is_null() {
+            return Ok(());
+        }
+
+        let (history_bitmap, history_bits) = self.create_dib_bitmap(self.width, self.height)?;
+        self.history_bitmap = Some(history_bitmap);
+        self.history_bits = history_bits;
+        self.history_surface_valid = false;
+        Ok(())
+    }
+
+    fn swap_capture_and_history_surfaces(&mut self) -> CaptureResult<()> {
+        if !gdi_swap_history_surfaces_enabled() {
+            return Ok(());
+        }
+        self.ensure_history_surface()?;
+
+        let Some(current_bitmap) = self.capture_bitmap else {
+            return Ok(());
+        };
+        let Some(next_bitmap) = self.history_bitmap else {
+            return Ok(());
+        };
+        if current_bitmap == next_bitmap {
+            return Ok(());
+        }
+
+        let selected = unsafe { SelectObject(self.mem_dc, next_bitmap) };
+        if selected.0.is_null() {
+            return Err(CaptureError::Platform(anyhow::anyhow!(
+                "SelectObject failed during gdi history surface swap"
+            )));
+        }
+        if selected.0 != current_bitmap.0 {
+            unsafe {
+                let _ = SelectObject(self.mem_dc, current_bitmap);
+            }
+            return Err(CaptureError::Platform(anyhow::anyhow!(
+                "unexpected object selected during gdi history surface swap"
+            )));
+        }
+
+        self.capture_bitmap = Some(next_bitmap);
+        self.history_bitmap = Some(current_bitmap);
+        std::mem::swap(&mut self.bits, &mut self.history_bits);
+        self.history_surface_valid = true;
+        Ok(())
+    }
+
+    fn ensure_surface(&mut self, width: i32, height: i32) -> CaptureResult<()> {
+        if width <= 0 || height <= 0 {
+            return Err(CaptureError::Platform(anyhow::anyhow!(
+                "invalid gdi surface size {width}x{height}"
+            )));
+        }
+
+        if self.capture_bitmap.is_some() && self.width == width && self.height == height {
+            return Ok(());
+        }
+
+        self.release_bitmap();
+
+        let (bitmap, bits) = self.create_dib_bitmap(width, height)?;
 
         let selected = unsafe { SelectObject(self.mem_dc, bitmap) };
         if selected.0.is_null() {
@@ -482,9 +571,10 @@ impl GdiResources {
             )));
         }
 
-        self.bitmap = Some(bitmap);
-        self.old_bitmap = Some(selected);
-        self.bits = bits.cast();
+        self.capture_bitmap = Some(bitmap);
+        self.original_bitmap = Some(selected);
+        self.bits = bits;
+        self.history_surface_valid = false;
         self.width = width;
         self.height = height;
         self.stride = usize::try_from(width)
@@ -517,22 +607,22 @@ impl GdiResources {
         }
     }
 
-    fn try_convert_incremental_rows_into(
+    fn scan_dirty_row_runs<F>(
         &mut self,
-        dst_ptr: *mut u8,
-        dst_pitch: usize,
-        width: usize,
+        row_bytes: usize,
         height: usize,
-    ) -> CaptureResult<Option<bool>> {
-        let row_bytes = width.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
-        if dst_pitch < row_bytes {
-            return Err(CaptureError::BufferOverflow);
-        }
-        let total_bytes = row_bytes
-            .checked_mul(height)
-            .ok_or(CaptureError::BufferOverflow)?;
-        if !self.ensure_bgra_history(total_bytes) {
+        history_base: *mut u8,
+        history_stride: usize,
+        mut on_changed_row: F,
+    ) -> CaptureResult<Option<usize>>
+    where
+        F: FnMut(*const u8, *mut u8, usize),
+    {
+        if history_base.is_null() {
             return Ok(None);
+        }
+        if history_stride < row_bytes {
+            return Err(CaptureError::BufferOverflow);
         }
 
         let max_dirty_rows = height.saturating_mul(GDI_INCREMENTAL_MAX_DIRTY_ROW_NUMERATOR)
@@ -543,7 +633,7 @@ impl GdiResources {
         let mut dirty_rows = 0usize;
         let mut run_start = None::<usize>;
         let mut src_row = self.bits.cast_const();
-        let mut history_row = self.bgra_history.as_mut_ptr();
+        let mut history_row = history_base;
 
         for row in 0..height {
             let changed = unsafe { !compare_row(src_row, history_row.cast_const(), row_bytes) };
@@ -556,9 +646,7 @@ impl GdiResources {
                 }
             } else {
                 dirty_rows = dirty_rows.saturating_add(1);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(src_row, history_row, row_bytes);
-                }
+                on_changed_row(src_row, history_row, row_bytes);
                 if run_start.is_none() {
                     run_start = Some(row);
                 }
@@ -570,7 +658,7 @@ impl GdiResources {
 
             unsafe {
                 src_row = src_row.add(self.stride);
-                history_row = history_row.add(row_bytes);
+                history_row = history_row.add(history_stride);
             }
         }
 
@@ -581,10 +669,15 @@ impl GdiResources {
             });
         }
 
-        if dirty_rows == 0 {
-            return Ok(Some(true));
-        }
+        Ok(Some(dirty_rows))
+    }
 
+    fn convert_dirty_row_runs_into(
+        &mut self,
+        dst_ptr: *mut u8,
+        dst_pitch: usize,
+        width: usize,
+    ) -> CaptureResult<()> {
         let converter = bgra_row_converter();
         let src_base = self.bits.cast_const();
         let dst_addr = dst_ptr as usize;
@@ -613,8 +706,91 @@ impl GdiResources {
                 );
             }
         }
+        Ok(())
+    }
 
+    fn try_convert_incremental_rows_with_vec_history_into(
+        &mut self,
+        dst_ptr: *mut u8,
+        dst_pitch: usize,
+        width: usize,
+        height: usize,
+    ) -> CaptureResult<Option<bool>> {
+        let row_bytes = width.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+        if dst_pitch < row_bytes {
+            return Err(CaptureError::BufferOverflow);
+        }
+        let total_bytes = row_bytes
+            .checked_mul(height)
+            .ok_or(CaptureError::BufferOverflow)?;
+        if !self.ensure_bgra_history(total_bytes) {
+            return Ok(None);
+        }
+
+        let history_ptr = self.bgra_history.as_mut_ptr();
+        let dirty_rows = self.scan_dirty_row_runs(
+            row_bytes,
+            height,
+            history_ptr,
+            row_bytes,
+            |src_row, history_row, row_len| unsafe {
+                std::ptr::copy_nonoverlapping(src_row, history_row, row_len);
+            },
+        )?;
+        let Some(dirty_rows) = dirty_rows else {
+            return Ok(None);
+        };
+        if dirty_rows == 0 {
+            return Ok(Some(true));
+        }
+
+        self.convert_dirty_row_runs_into(dst_ptr, dst_pitch, width)?;
         Ok(Some(false))
+    }
+
+    fn try_convert_incremental_rows_with_surface_history_into(
+        &mut self,
+        dst_ptr: *mut u8,
+        dst_pitch: usize,
+        width: usize,
+        height: usize,
+    ) -> CaptureResult<Option<bool>> {
+        let row_bytes = width.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+        if dst_pitch < row_bytes {
+            return Err(CaptureError::BufferOverflow);
+        }
+        if !self.history_surface_valid || self.history_bits.is_null() {
+            return Ok(None);
+        }
+
+        let dirty_rows = self.scan_dirty_row_runs(
+            row_bytes,
+            height,
+            self.history_bits,
+            self.stride,
+            |_src_row, _history_row, _row_len| {},
+        )?;
+        let Some(dirty_rows) = dirty_rows else {
+            return Ok(None);
+        };
+        if dirty_rows == 0 {
+            return Ok(Some(true));
+        }
+
+        self.convert_dirty_row_runs_into(dst_ptr, dst_pitch, width)?;
+        Ok(Some(false))
+    }
+
+    fn commit_incremental_history(&mut self, total_bytes: usize) -> CaptureResult<()> {
+        if gdi_swap_history_surfaces_enabled() {
+            self.swap_capture_and_history_surfaces()?;
+        } else {
+            self.ensure_bgra_history(total_bytes);
+            unsafe {
+                self.copy_surface_to_history_unchecked(total_bytes);
+            }
+        }
+        Ok(())
     }
 
     /// Capture the monitor region and return an RGBA frame.
@@ -644,20 +820,47 @@ impl GdiResources {
         let mut frame = reuse.unwrap_or_else(Frame::empty);
         frame.reset_metadata();
         frame.ensure_rgba_capacity(width_u32, height_u32)?;
-        let incremental_enabled = mode == CaptureMode::ScreenRecording
-            && destination_has_history
+        let track_incremental_history = mode == CaptureMode::ScreenRecording
             && gdi_incremental_convert_enabled()
             && pixel_count >= GDI_INCREMENTAL_MIN_PIXELS;
-        if incremental_enabled
-            && let Some(is_duplicate) = self.try_convert_incremental_rows_into(
-                frame.as_mut_rgba_ptr(),
-                dst_pitch,
-                width,
-                height,
-            )?
-        {
-            frame.metadata.is_duplicate = is_duplicate;
-            return Ok(frame);
+        let total_bytes = if track_incremental_history {
+            Some(
+                width
+                    .checked_mul(height)
+                    .and_then(|pixels| pixels.checked_mul(4))
+                    .ok_or(CaptureError::BufferOverflow)?,
+            )
+        } else {
+            None
+        };
+        let incremental_enabled = track_incremental_history && destination_has_history;
+        let use_surface_history = track_incremental_history && gdi_swap_history_surfaces_enabled();
+        if incremental_enabled {
+            let incremental_result = if use_surface_history {
+                self.try_convert_incremental_rows_with_surface_history_into(
+                    frame.as_mut_rgba_ptr(),
+                    dst_pitch,
+                    width,
+                    height,
+                )
+            } else {
+                self.try_convert_incremental_rows_with_vec_history_into(
+                    frame.as_mut_rgba_ptr(),
+                    dst_pitch,
+                    width,
+                    height,
+                )
+            }?;
+            if let Some(is_duplicate) = incremental_result {
+                frame.metadata.is_duplicate = is_duplicate;
+                if use_surface_history
+                    && !is_duplicate
+                    && let Some(total_bytes) = total_bytes
+                {
+                    self.commit_incremental_history(total_bytes)?;
+                }
+                return Ok(frame);
+            }
         }
 
         // Single-pass: read from DIB section, swizzle BGRA→RGBA, and
@@ -677,18 +880,8 @@ impl GdiResources {
             }
         }
 
-        if mode == CaptureMode::ScreenRecording
-            && gdi_incremental_convert_enabled()
-            && pixel_count >= GDI_INCREMENTAL_MIN_PIXELS
-        {
-            let total_bytes = width
-                .checked_mul(height)
-                .and_then(|pixels| pixels.checked_mul(4))
-                .ok_or(CaptureError::BufferOverflow)?;
-            self.ensure_bgra_history(total_bytes);
-            unsafe {
-                self.copy_surface_to_history_unchecked(total_bytes);
-            }
+        if let Some(total_bytes) = total_bytes {
+            self.commit_incremental_history(total_bytes)?;
         }
 
         Ok(frame)
@@ -807,15 +1000,39 @@ impl GdiResources {
         let pixel_count = copy_w
             .checked_mul(copy_h)
             .ok_or(CaptureError::BufferOverflow)?;
-        let incremental_enabled = mode == CaptureMode::ScreenRecording
-            && destination_has_history
+        let track_incremental_history = mode == CaptureMode::ScreenRecording
             && gdi_incremental_convert_enabled()
             && pixel_count >= GDI_INCREMENTAL_MIN_PIXELS;
-        if incremental_enabled
-            && let Some(is_duplicate) =
-                self.try_convert_incremental_rows_into(dst_ptr, dst_pitch, copy_w, copy_h)?
-        {
-            return Ok(is_duplicate);
+        let total_bytes = if track_incremental_history {
+            Some(
+                pixel_count
+                    .checked_mul(4)
+                    .ok_or(CaptureError::BufferOverflow)?,
+            )
+        } else {
+            None
+        };
+        let incremental_enabled = track_incremental_history && destination_has_history;
+        let use_surface_history = track_incremental_history && gdi_swap_history_surfaces_enabled();
+        if incremental_enabled {
+            let incremental_result = if use_surface_history {
+                self.try_convert_incremental_rows_with_surface_history_into(
+                    dst_ptr, dst_pitch, copy_w, copy_h,
+                )
+            } else {
+                self.try_convert_incremental_rows_with_vec_history_into(
+                    dst_ptr, dst_pitch, copy_w, copy_h,
+                )
+            }?;
+            if let Some(is_duplicate) = incremental_result {
+                if use_surface_history
+                    && !is_duplicate
+                    && let Some(total_bytes) = total_bytes
+                {
+                    self.commit_incremental_history(total_bytes)?;
+                }
+                return Ok(is_duplicate);
+            }
         }
 
         // Fast path: contiguous destination rows (single-monitor region output)
@@ -854,17 +1071,8 @@ impl GdiResources {
             }
         }
 
-        if mode == CaptureMode::ScreenRecording
-            && gdi_incremental_convert_enabled()
-            && pixel_count >= GDI_INCREMENTAL_MIN_PIXELS
-        {
-            let total_bytes = pixel_count
-                .checked_mul(4)
-                .ok_or(CaptureError::BufferOverflow)?;
-            self.ensure_bgra_history(total_bytes);
-            unsafe {
-                self.copy_surface_to_history_unchecked(total_bytes);
-            }
+        if let Some(total_bytes) = total_bytes {
+            self.commit_incremental_history(total_bytes)?;
         }
 
         Ok(false)
@@ -1016,17 +1224,24 @@ impl GdiResources {
     }
 
     fn release_bitmap(&mut self) {
-        if let Some(old_bitmap) = self.old_bitmap.take() {
+        if let Some(original_bitmap) = self.original_bitmap.take() {
             unsafe {
-                let _ = SelectObject(self.mem_dc, old_bitmap);
+                let _ = SelectObject(self.mem_dc, original_bitmap);
             }
         }
-        if let Some(bitmap) = self.bitmap.take() {
+        if let Some(capture_bitmap) = self.capture_bitmap.take() {
             unsafe {
-                let _ = DeleteObject(bitmap);
+                let _ = DeleteObject(capture_bitmap);
+            }
+        }
+        if let Some(history_bitmap) = self.history_bitmap.take() {
+            unsafe {
+                let _ = DeleteObject(history_bitmap);
             }
         }
         self.bits = null_mut();
+        self.history_bits = null_mut();
+        self.history_surface_valid = false;
         self.width = 0;
         self.height = 0;
         self.stride = 0;

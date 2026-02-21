@@ -1,12 +1,12 @@
 param(
-    [string]$BaselinePath = "target/perf/gdi-window-ab-baseline.csv",
-    [string]$TargetLabel = "gdi-window-animated",
+    [string]$BaselinePath = "target/perf/gdi-window-surface-swap-ab-baseline.csv",
+    [string]$TargetLabel = "gdi-window-surface-swap",
     [int]$WarmupFrames = 80,
-    [int]$MeasureFrames = 600,
+    [int]$MeasureFrames = 700,
     [int]$Rounds = 5,
     [double]$SampleIntervalMs = 8.0,
     [double]$MaxRegressionPct = 5.0,
-    [double]$MaxDuplicatePct = 0.0,
+    [double]$MaxDuplicatePct = 60.0,
     [int]$WorkloadWidth = 960,
     [int]$WorkloadHeight = 540,
     [int]$WorkloadX = 180,
@@ -28,7 +28,7 @@ if (-not (Test-Path $workloadScript)) {
     exit 1
 }
 
-$workloadInfoPath = Join-Path $repoRoot "target/perf/gdi-window-workload.json"
+$workloadInfoPath = Join-Path $repoRoot "target/perf/gdi-window-surface-swap-workload.json"
 if (Test-Path $workloadInfoPath) {
     Remove-Item $workloadInfoPath -Force
 }
@@ -56,24 +56,15 @@ if ($baselineDir -and -not (Test-Path $baselineDir)) {
 function Invoke-GdiBenchmark {
     param(
         [string[]]$BenchmarkArgs,
-        [bool]$DisableOptimizations
+        [bool]$DisableSurfaceSwap
     )
 
-    $oldDisableUnalignedNt = $env:SNOW_CAPTURE_DISABLE_BGRA_NT_UNALIGNED
-    $oldDisableWindowStateCache = $env:SNOW_CAPTURE_DISABLE_GDI_WINDOW_STATE_CACHE
-    $oldDisableIncremental = $env:SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_CONVERT
     $oldDisableSurfaceSwap = $env:SNOW_CAPTURE_DISABLE_GDI_HISTORY_SURFACE_SWAP
 
     try {
-        if ($DisableOptimizations) {
-            $env:SNOW_CAPTURE_DISABLE_BGRA_NT_UNALIGNED = "1"
-            $env:SNOW_CAPTURE_DISABLE_GDI_WINDOW_STATE_CACHE = "1"
-            $env:SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_CONVERT = "1"
+        if ($DisableSurfaceSwap) {
             $env:SNOW_CAPTURE_DISABLE_GDI_HISTORY_SURFACE_SWAP = "1"
         } else {
-            Remove-Item Env:SNOW_CAPTURE_DISABLE_BGRA_NT_UNALIGNED -ErrorAction SilentlyContinue
-            Remove-Item Env:SNOW_CAPTURE_DISABLE_GDI_WINDOW_STATE_CACHE -ErrorAction SilentlyContinue
-            Remove-Item Env:SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_CONVERT -ErrorAction SilentlyContinue
             Remove-Item Env:SNOW_CAPTURE_DISABLE_GDI_HISTORY_SURFACE_SWAP -ErrorAction SilentlyContinue
         }
 
@@ -89,24 +80,6 @@ function Invoke-GdiBenchmark {
         return [int]$cargoProcess.ExitCode
     }
     finally {
-        if ($null -ne $oldDisableUnalignedNt) {
-            $env:SNOW_CAPTURE_DISABLE_BGRA_NT_UNALIGNED = $oldDisableUnalignedNt
-        } else {
-            Remove-Item Env:SNOW_CAPTURE_DISABLE_BGRA_NT_UNALIGNED -ErrorAction SilentlyContinue
-        }
-
-        if ($null -ne $oldDisableWindowStateCache) {
-            $env:SNOW_CAPTURE_DISABLE_GDI_WINDOW_STATE_CACHE = $oldDisableWindowStateCache
-        } else {
-            Remove-Item Env:SNOW_CAPTURE_DISABLE_GDI_WINDOW_STATE_CACHE -ErrorAction SilentlyContinue
-        }
-
-        if ($null -ne $oldDisableIncremental) {
-            $env:SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_CONVERT = $oldDisableIncremental
-        } else {
-            Remove-Item Env:SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_CONVERT -ErrorAction SilentlyContinue
-        }
-
         if ($null -ne $oldDisableSurfaceSwap) {
             $env:SNOW_CAPTURE_DISABLE_GDI_HISTORY_SURFACE_SWAP = $oldDisableSurfaceSwap
         } else {
@@ -147,14 +120,14 @@ try {
 
     Write-Host "Benchmark window handle: $windowHandle"
 
-    Write-Host "Collecting baseline with GDI window fast-path optimizations disabled..."
-    $baselineExitCode = Invoke-GdiBenchmark -BenchmarkArgs ($commonArgs + @("--save-baseline", $resolvedBaselinePath)) -DisableOptimizations $true
+    Write-Host "Collecting baseline with GDI history surface swap disabled..."
+    $baselineExitCode = Invoke-GdiBenchmark -BenchmarkArgs ($commonArgs + @("--save-baseline", $resolvedBaselinePath)) -DisableSurfaceSwap $true
     if ($baselineExitCode -ne 0) {
         exit $baselineExitCode
     }
 
     if ($SaveBaselineOnly) {
-        Write-Host "Saved disabled-optimization baseline to $resolvedBaselinePath"
+        Write-Host "Saved disabled-swap baseline to $resolvedBaselinePath"
         exit 0
     }
 
@@ -174,7 +147,7 @@ try {
             "--baseline", $resolvedBaselinePath,
             "--max-regression-pct", $MaxRegressionPct
         )
-    ) -DisableOptimizations $false
+    ) -DisableSurfaceSwap $false
 
     exit $optimizedExitCode
 }

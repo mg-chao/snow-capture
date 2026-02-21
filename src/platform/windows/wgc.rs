@@ -63,6 +63,15 @@ const WGC_QUERY_SPIN_MIN_POLLS: u32 = 2;
 const WGC_QUERY_SPIN_MAX_POLLS: u32 = 64;
 const WGC_QUERY_SPIN_INITIAL_POLLS: u32 = 4;
 const WGC_QUERY_SPIN_INCREASE_STEP: u32 = 4;
+const WGC_DIRTY_RECT_DENSE_MERGE_LEGACY_MIN_RECTS: usize = 64;
+const WGC_DIRTY_RECT_DENSE_MERGE_LEGACY_MAX_VERTICAL_SPAN: u32 = 96;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DirtyCopyStrategy {
+    cpu: bool,
+    gpu: bool,
+    gpu_low_latency: bool,
+}
 
 #[derive(Clone, Copy)]
 struct WgcStaleTimeoutConfig {
@@ -341,23 +350,7 @@ fn merge_dirty_rects(a: DirtyRect, b: DirtyRect) -> DirtyRect {
     }
 }
 
-fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height: u32) {
-    if rects.is_empty() {
-        return;
-    }
-
-    let mut write = 0usize;
-    for read in 0..rects.len() {
-        if let Some(clamped) = clamp_dirty_rect(rects[read], width, height) {
-            rects[write] = clamped;
-            write += 1;
-        }
-    }
-    rects.truncate(write);
-    if rects.len() <= 1 {
-        return;
-    }
-
+fn normalize_dirty_rects_legacy_after_clamp(rects: &mut Vec<DirtyRect>) {
     let mut changed = true;
     while changed {
         changed = false;
@@ -379,6 +372,93 @@ fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height
     }
 
     rects.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
+}
+
+fn should_use_legacy_dense_merge(rects: &[DirtyRect]) -> bool {
+    if rects.len() < WGC_DIRTY_RECT_DENSE_MERGE_LEGACY_MIN_RECTS {
+        return false;
+    }
+
+    let mut min_y = u32::MAX;
+    let mut max_y = 0u32;
+    for rect in rects {
+        min_y = min_y.min(rect.y);
+        max_y = max_y.max(rect.y.saturating_add(rect.height));
+    }
+
+    max_y.saturating_sub(min_y) <= WGC_DIRTY_RECT_DENSE_MERGE_LEGACY_MAX_VERTICAL_SPAN
+}
+
+fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height: u32) {
+    if rects.is_empty() {
+        return;
+    }
+
+    let mut pending = std::mem::take(rects);
+    let mut write = 0usize;
+    for read in 0..pending.len() {
+        if let Some(clamped) = clamp_dirty_rect(pending[read], width, height) {
+            pending[write] = clamped;
+            write += 1;
+        }
+    }
+    pending.truncate(write);
+    if pending.len() <= 1 {
+        *rects = pending;
+        return;
+    }
+
+    if should_use_legacy_dense_merge(&pending) {
+        *rects = pending;
+        normalize_dirty_rects_legacy_after_clamp(rects);
+        return;
+    }
+
+    pending.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
+
+    rects.reserve(pending.len());
+    for rect in pending {
+        let mut candidate = rect;
+        loop {
+            let mut merged_any = false;
+            let candidate_bottom = candidate.y.saturating_add(candidate.height);
+            let mut idx = 0usize;
+
+            while idx < rects.len() {
+                let existing = rects[idx];
+                let existing_bottom = existing.y.saturating_add(existing.height);
+                if existing_bottom < candidate.y {
+                    idx += 1;
+                    continue;
+                }
+                if existing.y > candidate_bottom {
+                    break;
+                }
+
+                if dirty_rects_can_merge(candidate, existing) {
+                    candidate = merge_dirty_rects(candidate, existing);
+                    rects.remove(idx);
+                    merged_any = true;
+                } else {
+                    idx += 1;
+                }
+            }
+
+            if !merged_any {
+                break;
+            }
+        }
+
+        let insert_at = rects
+            .binary_search_by(|probe| {
+                probe
+                    .y
+                    .cmp(&candidate.y)
+                    .then_with(|| probe.x.cmp(&candidate.x))
+            })
+            .unwrap_or_else(|pos| pos);
+        rects.insert(insert_at, candidate);
+    }
 }
 
 fn extract_region_dirty_rects(
@@ -456,76 +536,68 @@ fn extract_region_dirty_rects(
     true
 }
 
+fn evaluate_dirty_copy_strategy(rects: &[DirtyRect], width: u32, height: u32) -> DirtyCopyStrategy {
+    if rects.is_empty() {
+        return DirtyCopyStrategy::default();
+    }
+
+    let total_pixels = (width as u64).saturating_mul(height as u64);
+    if total_pixels == 0 {
+        return DirtyCopyStrategy::default();
+    }
+
+    let mut cpu = rects.len() <= WGC_DIRTY_COPY_MAX_RECTS;
+    let mut gpu = rects.len() <= WGC_DIRTY_GPU_COPY_MAX_RECTS;
+    let mut gpu_low_latency = rects.len() <= WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS;
+    if !cpu && !gpu && !gpu_low_latency {
+        return DirtyCopyStrategy::default();
+    }
+
+    let cpu_limit = total_pixels.saturating_mul(WGC_DIRTY_COPY_MAX_AREA_PERCENT);
+    let gpu_limit = total_pixels.saturating_mul(WGC_DIRTY_GPU_COPY_MAX_AREA_PERCENT);
+    let gpu_low_latency_limit =
+        total_pixels.saturating_mul(WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT);
+
+    let mut dirty_pixels = 0u64;
+    for rect in rects {
+        dirty_pixels =
+            dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+        let dirty_percent_scaled = dirty_pixels.saturating_mul(100);
+
+        if cpu && dirty_percent_scaled > cpu_limit {
+            cpu = false;
+        }
+        if gpu && dirty_percent_scaled > gpu_limit {
+            gpu = false;
+        }
+        if gpu_low_latency && dirty_percent_scaled > gpu_low_latency_limit {
+            gpu_low_latency = false;
+        }
+        if !cpu && !gpu && !gpu_low_latency {
+            break;
+        }
+    }
+
+    DirtyCopyStrategy {
+        cpu,
+        gpu,
+        gpu_low_latency,
+    }
+}
+
+#[cfg(test)]
 fn should_use_dirty_copy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
-    if rects.is_empty() || rects.len() > WGC_DIRTY_COPY_MAX_RECTS {
-        return false;
-    }
-
-    let total_pixels = (width as u64).saturating_mul(height as u64);
-    if total_pixels == 0 {
-        return false;
-    }
-
-    let mut dirty_pixels = 0u64;
-    for rect in rects {
-        dirty_pixels =
-            dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
-        if dirty_pixels.saturating_mul(100)
-            > total_pixels.saturating_mul(WGC_DIRTY_COPY_MAX_AREA_PERCENT)
-        {
-            return false;
-        }
-    }
-
-    true
+    evaluate_dirty_copy_strategy(rects, width, height).cpu
 }
 
+#[cfg(test)]
 fn should_use_dirty_gpu_copy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
-    if rects.is_empty() || rects.len() > WGC_DIRTY_GPU_COPY_MAX_RECTS {
-        return false;
-    }
-
-    let total_pixels = (width as u64).saturating_mul(height as u64);
-    if total_pixels == 0 {
-        return false;
-    }
-
-    let mut dirty_pixels = 0u64;
-    for rect in rects {
-        dirty_pixels =
-            dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
-        if dirty_pixels.saturating_mul(100)
-            > total_pixels.saturating_mul(WGC_DIRTY_GPU_COPY_MAX_AREA_PERCENT)
-        {
-            return false;
-        }
-    }
-
-    true
+    evaluate_dirty_copy_strategy(rects, width, height).gpu
 }
 
+#[cfg(test)]
 fn should_use_low_latency_dirty_gpu_copy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
-    if rects.is_empty() || rects.len() > WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS {
-        return false;
-    }
-
-    let total_pixels = (width as u64).saturating_mul(height as u64);
-    if total_pixels == 0 {
-        return false;
-    }
-
-    let mut dirty_pixels = 0u64;
-    for rect in rects {
-        dirty_pixels =
-            dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
-        if dirty_pixels.saturating_mul(100)
-            > total_pixels.saturating_mul(WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT)
-        {
-            return false;
-        }
-    }
-
-    true
+    evaluate_dirty_copy_strategy(rects, width, height).gpu_low_latency
 }
 
 #[inline(always)]
@@ -571,7 +643,8 @@ struct WgcStagingSlot {
     present_time_ticks: i64,
     is_duplicate: bool,
     dirty_mode_available: bool,
-    dirty_copy_preferred: bool,
+    dirty_cpu_copy_preferred: bool,
+    dirty_gpu_copy_preferred: bool,
     dirty_rects: Vec<DirtyRect>,
     populated: bool,
 }
@@ -587,7 +660,8 @@ impl WgcStagingSlot {
         self.present_time_ticks = 0;
         self.is_duplicate = false;
         self.dirty_mode_available = false;
-        self.dirty_copy_preferred = false;
+        self.dirty_cpu_copy_preferred = false;
+        self.dirty_gpu_copy_preferred = false;
         self.dirty_rects.clear();
         self.populated = false;
     }
@@ -1296,7 +1370,7 @@ impl WindowsGraphicsCaptureCapturer {
             if can_use_dirty_gpu_copy && region_dirty_gpu_copy_enabled() {
                 let use_dirty_copy = {
                     let slot = &self.region_slots[slot_idx];
-                    slot.dirty_copy_preferred
+                    slot.dirty_gpu_copy_preferred
                 };
 
                 if use_dirty_copy {
@@ -1394,7 +1468,7 @@ impl WindowsGraphicsCaptureCapturer {
 
             if can_use_dirty_gpu_copy
                 && region_dirty_gpu_copy_enabled()
-                && slot.dirty_copy_preferred
+                && slot.dirty_gpu_copy_preferred
             {
                 for rect in &slot.dirty_rects {
                     let source_left = blit
@@ -1500,7 +1574,7 @@ impl WindowsGraphicsCaptureCapturer {
             if can_use_dirty_gpu_copy {
                 let use_dirty_copy = {
                     let slot = &self.staging_slots[slot_idx];
-                    slot.dirty_copy_preferred
+                    slot.dirty_gpu_copy_preferred
                 };
 
                 if use_dirty_copy {
@@ -1565,7 +1639,7 @@ impl WindowsGraphicsCaptureCapturer {
                 ))
             })?;
 
-            if can_use_dirty_gpu_copy && slot.dirty_copy_preferred {
+            if can_use_dirty_gpu_copy && slot.dirty_gpu_copy_preferred {
                 for rect in &slot.dirty_rects {
                     let right = rect
                         .x
@@ -1771,8 +1845,9 @@ impl WindowsGraphicsCaptureCapturer {
                 ))
             })?;
 
-            let use_dirty_copy = destination_has_history
-                && slot.dirty_copy_preferred
+            let use_dirty_copy = self.has_frame_history
+                && destination_has_history
+                && slot.dirty_cpu_copy_preferred
                 && !slot.dirty_rects.is_empty();
             let write_full_slot_direct = region_full_slot_map_fastpath_enabled()
                 && blit.dst_x == 0
@@ -1912,7 +1987,8 @@ impl WindowsGraphicsCaptureCapturer {
             slot.present_time_ticks = present_time_ticks;
             slot.is_duplicate = true;
             slot.dirty_mode_available = true;
-            slot.dirty_copy_preferred = false;
+            slot.dirty_cpu_copy_preferred = false;
+            slot.dirty_gpu_copy_preferred = false;
             slot.dirty_rects.clear();
         }
 
@@ -1990,7 +2066,7 @@ impl WindowsGraphicsCaptureCapturer {
             })?;
             let use_dirty_copy = self.has_frame_history
                 && out_matches_source
-                && slot.dirty_copy_preferred
+                && slot.dirty_cpu_copy_preferred
                 && !slot.dirty_rects.is_empty();
 
             if use_dirty_copy {
@@ -2225,15 +2301,16 @@ impl WindowsGraphicsCaptureCapturer {
             }
 
             let recording_mode = self.capture_mode == CaptureMode::ScreenRecording;
+            let region_dirty_strategy = evaluate_dirty_copy_strategy(
+                &region_dirty_rects,
+                region_desc.Width,
+                region_desc.Height,
+            );
             let low_latency_recording = recording_mode
                 && destination_has_history
                 && region_low_latency_slot_enabled()
                 && region_dirty_available
-                && should_use_low_latency_dirty_gpu_copy(
-                    &region_dirty_rects,
-                    region_desc.Width,
-                    region_desc.Height,
-                );
+                && region_dirty_strategy.gpu_low_latency;
             let write_slot = if low_latency_recording {
                 self.region_pending_slot.unwrap_or(0)
             } else if recording_mode {
@@ -2261,7 +2338,8 @@ impl WindowsGraphicsCaptureCapturer {
                 slot.present_time_ticks = time_ticks;
                 slot.is_duplicate = true;
                 slot.dirty_mode_available = region_dirty_available;
-                slot.dirty_copy_preferred = false;
+                slot.dirty_cpu_copy_preferred = false;
+                slot.dirty_gpu_copy_preferred = false;
                 slot.dirty_rects.clear();
                 slot.populated = true;
                 slot_idx
@@ -2287,19 +2365,13 @@ impl WindowsGraphicsCaptureCapturer {
                     slot.dirty_rects.clear();
                     slot.dirty_rects.extend_from_slice(&region_dirty_rects);
                     let dirty_gpu_copy_preferred = if low_latency_recording {
-                        should_use_low_latency_dirty_gpu_copy(
-                            &slot.dirty_rects,
-                            region_desc.Width,
-                            region_desc.Height,
-                        )
+                        region_dirty_strategy.gpu_low_latency
                     } else {
-                        should_use_dirty_gpu_copy(
-                            &slot.dirty_rects,
-                            region_desc.Width,
-                            region_desc.Height,
-                        )
+                        region_dirty_strategy.gpu
                     };
-                    slot.dirty_copy_preferred = can_use_dirty_gpu_copy
+                    slot.dirty_cpu_copy_preferred =
+                        region_dirty_available && region_dirty_strategy.cpu;
+                    slot.dirty_gpu_copy_preferred = can_use_dirty_gpu_copy
                         && region_dirty_available
                         && dirty_gpu_copy_preferred;
                     slot.populated = true;
@@ -2542,7 +2614,8 @@ impl WindowsGraphicsCaptureCapturer {
                 slot.present_time_ticks = time_ticks;
                 slot.is_duplicate = true;
                 slot.dirty_mode_available = source_dirty_available;
-                slot.dirty_copy_preferred = false;
+                slot.dirty_cpu_copy_preferred = false;
+                slot.dirty_gpu_copy_preferred = false;
                 slot.dirty_rects.clear();
                 slot.populated = true;
                 slot_idx
@@ -2559,12 +2632,14 @@ impl WindowsGraphicsCaptureCapturer {
                     slot.dirty_mode_available = source_dirty_available;
                     slot.dirty_rects.clear();
                     slot.dirty_rects.extend_from_slice(&source_dirty_rects);
-                    slot.dirty_copy_preferred = source_dirty_available
-                        && should_use_dirty_copy(
-                            &slot.dirty_rects,
-                            effective_desc.Width,
-                            effective_desc.Height,
-                        );
+                    let strategy = evaluate_dirty_copy_strategy(
+                        &slot.dirty_rects,
+                        effective_desc.Width,
+                        effective_desc.Height,
+                    );
+                    slot.dirty_cpu_copy_preferred = source_dirty_available && strategy.cpu;
+                    slot.dirty_gpu_copy_preferred =
+                        can_use_dirty_gpu_copy && source_dirty_available && strategy.gpu;
                     slot.capture_time = Some(capture_time);
                     slot.present_time_ticks = time_ticks;
                     slot.is_duplicate = source_is_duplicate || source_unchanged;
@@ -2802,6 +2877,37 @@ mod tests {
             height: 1080,
         }];
         assert!(!should_use_dirty_gpu_copy(&rects, 1920, 1080));
+    }
+
+    #[test]
+    fn dirty_copy_strategy_separates_cpu_and_gpu_thresholds() {
+        let rects = vec![DirtyRect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 540,
+        }];
+        let strategy = evaluate_dirty_copy_strategy(&rects, 1920, 1080);
+        assert!(strategy.cpu);
+        assert!(!strategy.gpu);
+        assert!(!strategy.gpu_low_latency);
+    }
+
+    #[test]
+    fn dirty_copy_strategy_applies_rect_count_limits_per_mode() {
+        let rects = vec![
+            DirtyRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            };
+            WGC_DIRTY_GPU_COPY_MAX_RECTS + 1
+        ];
+        let strategy = evaluate_dirty_copy_strategy(&rects, 1920, 1080);
+        assert!(strategy.cpu);
+        assert!(!strategy.gpu);
+        assert!(!strategy.gpu_low_latency);
     }
 
     #[test]

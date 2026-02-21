@@ -494,7 +494,13 @@ Tip: compare the GDI span single-scan incremental path:
   optimized: cargo run --release --example benchmark -- --backends gdi --region-center 1600x900
   legacy (PowerShell): $env:SNOW_CAPTURE_DISABLE_GDI_SPAN_SINGLE_SCAN=1; cargo run --release --example benchmark -- --backends gdi --region-center 1600x900; Remove-Item Env:SNOW_CAPTURE_DISABLE_GDI_SPAN_SINGLE_SCAN
   legacy (cmd.exe):    setlocal && set SNOW_CAPTURE_DISABLE_GDI_SPAN_SINGLE_SCAN=1 && cargo run --release --example benchmark -- --backends gdi --region-center 1600x900 && endlocal
-  legacy (bash):       SNOW_CAPTURE_DISABLE_GDI_SPAN_SINGLE_SCAN=1 cargo run --release --example benchmark -- --backends gdi --region-center 1600x900"
+  legacy (bash):       SNOW_CAPTURE_DISABLE_GDI_SPAN_SINGLE_SCAN=1 cargo run --release --example benchmark -- --backends gdi --region-center 1600x900
+
+Tip: compare the GDI parallel sparse-span hybrid path:
+  optimized: cargo run --release --example benchmark -- --backends gdi --region-center 2560x1440
+  legacy (PowerShell): $env:SNOW_CAPTURE_DISABLE_GDI_PARALLEL_SPAN_SCAN=1; cargo run --release --example benchmark -- --backends gdi --region-center 2560x1440; Remove-Item Env:SNOW_CAPTURE_DISABLE_GDI_PARALLEL_SPAN_SCAN
+  legacy (cmd.exe):    setlocal && set SNOW_CAPTURE_DISABLE_GDI_PARALLEL_SPAN_SCAN=1 && cargo run --release --example benchmark -- --backends gdi --region-center 2560x1440 && endlocal
+  legacy (bash):       SNOW_CAPTURE_DISABLE_GDI_PARALLEL_SPAN_SCAN=1 cargo run --release --example benchmark -- --backends gdi --region-center 2560x1440"
                 );
                 std::process::exit(0);
             }

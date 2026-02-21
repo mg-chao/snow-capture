@@ -310,6 +310,23 @@ fn gdi_parallel_row_scan_enabled() -> bool {
 }
 
 #[inline]
+fn gdi_parallel_span_scan_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_DISABLE_GDI_PARALLEL_SPAN_SCAN")
+            .map(|raw| {
+                let normalized = raw.trim().to_ascii_lowercase();
+                !(normalized == "1"
+                    || normalized == "true"
+                    || normalized == "yes"
+                    || normalized == "on")
+            })
+            .unwrap_or(true)
+    })
+}
+
+#[inline]
 fn gdi_incremental_duplicate_probe_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -433,6 +450,45 @@ fn build_dirty_span_runs_from_spans(spans: &[DirtyRowSpan], runs: &mut Vec<Dirty
     }
 }
 
+fn scan_dirty_row_flags_parallel(
+    flags: &mut [u8],
+    src_base: *const u8,
+    src_stride: usize,
+    history_base: *mut u8,
+    history_stride: usize,
+    row_bytes: usize,
+    compare_row: RowCompareKernel,
+    copy_changed_rows_to_history: bool,
+) -> usize {
+    let src_addr = src_base as usize;
+    let history_addr = history_base as usize;
+    let mut dirty_rows = 0usize;
+    convert::with_conversion_pool(GDI_PARALLEL_ROW_SCAN_MAX_WORKERS, || {
+        use rayon::prelude::*;
+        dirty_rows = flags
+            .par_iter_mut()
+            .enumerate()
+            .map(|(row, flag)| {
+                let src_row = (src_addr + row * src_stride) as *const u8;
+                let history_row = (history_addr + row * history_stride) as *mut u8;
+                let changed = unsafe { !compare_row(src_row, history_row.cast_const(), row_bytes) };
+                *flag = if changed { 1u8 } else { 0u8 };
+                if !changed {
+                    return 0usize;
+                }
+
+                if copy_changed_rows_to_history {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src_row, history_row, row_bytes);
+                    }
+                }
+                1usize
+            })
+            .sum::<usize>();
+    });
+    dirty_rows
+}
+
 unsafe fn row_diff_bounds_scalar(
     lhs: *const u8,
     rhs: *const u8,
@@ -530,7 +586,19 @@ fn incremental_span_convert_eligible(pixel_count: usize, width: usize, height: u
         && width > 1
         && height > 1
         && pixel_count >= GDI_INCREMENTAL_SPAN_MIN_PIXELS
-        && !parallel_row_scan_eligible(pixel_count, height)
+}
+
+#[inline(always)]
+fn parallel_span_scan_eligible(
+    pixel_count: usize,
+    width: usize,
+    height: usize,
+    incremental_too_dirty_hint: bool,
+) -> bool {
+    gdi_parallel_span_scan_enabled()
+        && !incremental_too_dirty_hint
+        && parallel_row_scan_eligible(pixel_count, height)
+        && incremental_span_convert_eligible(pixel_count, width, height)
 }
 
 unsafe fn incremental_too_dirty_probe(
@@ -1361,39 +1429,16 @@ impl GdiResources {
         compare_row: RowCompareKernel,
     ) -> DirtyScanResult {
         self.ensure_dirty_row_flags(height);
-
-        let src_addr = self.bits as usize;
-        let src_stride = self.stride;
-        let history_addr = history_base as usize;
-        let flags = &mut self.dirty_row_flags[..height];
-
-        let mut dirty_rows = 0usize;
-        convert::with_conversion_pool(GDI_PARALLEL_ROW_SCAN_MAX_WORKERS, || {
-            use rayon::prelude::*;
-            dirty_rows = flags
-                .par_iter_mut()
-                .enumerate()
-                .map(|(row, flag)| {
-                    let src_row = (src_addr + row * src_stride) as *const u8;
-                    let history_row = (history_addr + row * history_stride) as *mut u8;
-                    let changed =
-                        unsafe { !compare_row(src_row, history_row.cast_const(), row_bytes) };
-
-                    *flag = if changed { 1u8 } else { 0u8 };
-
-                    if !changed {
-                        return 0usize;
-                    }
-
-                    if copy_changed_rows_to_history {
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(src_row, history_row, row_bytes);
-                        }
-                    }
-                    1usize
-                })
-                .sum::<usize>();
-        });
+        let dirty_rows = scan_dirty_row_flags_parallel(
+            &mut self.dirty_row_flags[..height],
+            self.bits.cast_const(),
+            self.stride,
+            history_base,
+            history_stride,
+            row_bytes,
+            compare_row,
+            copy_changed_rows_to_history,
+        );
 
         self.build_dirty_row_runs_from_flags(height);
         self.dirty_span_runs.clear();
@@ -1401,6 +1446,111 @@ impl GdiResources {
             dirty_rows,
             used_spans: false,
         }
+    }
+
+    fn scan_dirty_span_runs_parallel(
+        &mut self,
+        row_bytes: usize,
+        width: usize,
+        height: usize,
+        history_base: *mut u8,
+        history_stride: usize,
+        copy_changed_rows_to_history: bool,
+        compare_row: RowCompareKernel,
+        max_dirty_pixels: usize,
+    ) -> CaptureResult<Option<DirtyScanResult>> {
+        self.ensure_dirty_row_flags(height);
+        self.dirty_row_runs.clear();
+        self.dirty_span_runs.clear();
+
+        let dirty_rows = scan_dirty_row_flags_parallel(
+            &mut self.dirty_row_flags[..height],
+            self.bits.cast_const(),
+            self.stride,
+            history_base,
+            history_stride,
+            row_bytes,
+            compare_row,
+            false,
+        );
+
+        if dirty_rows == 0 {
+            return Ok(Some(DirtyScanResult {
+                dirty_rows: 0,
+                used_spans: true,
+            }));
+        }
+
+        self.ensure_dirty_row_spans(height);
+        self.dirty_row_spans[..height].fill(DirtyRowSpan::default());
+
+        let mut dirty_pixels = 0usize;
+        let flags = &self.dirty_row_flags[..height];
+        let mut src_row = self.bits.cast_const();
+        let mut history_row = history_base;
+        for (row, &flag) in flags.iter().enumerate() {
+            if flag == 0 {
+                unsafe {
+                    src_row = src_row.add(self.stride);
+                    history_row = history_row.add(history_stride);
+                }
+                continue;
+            }
+
+            let (start_col, end_col) = unsafe {
+                row_diff_span_pixels(src_row, history_row.cast_const(), row_bytes, width)
+            }
+            .unwrap_or((0, width));
+            let span_width = end_col.saturating_sub(start_col);
+            let start_col_u32 =
+                u32::try_from(start_col).map_err(|_| CaptureError::BufferOverflow)?;
+            let span_width_u32 =
+                u32::try_from(span_width).map_err(|_| CaptureError::BufferOverflow)?;
+            self.dirty_row_spans[row] = DirtyRowSpan {
+                start_col: start_col_u32,
+                width: span_width_u32,
+            };
+            dirty_pixels = dirty_pixels.saturating_add(span_width);
+            if dirty_pixels > max_dirty_pixels {
+                self.dirty_span_runs.clear();
+                return Ok(None);
+            }
+
+            if copy_changed_rows_to_history {
+                let span_start_bytes = start_col
+                    .checked_mul(BGRA_BYTES_PER_PIXEL)
+                    .ok_or(CaptureError::BufferOverflow)?;
+                let copy_bytes = span_width
+                    .checked_mul(BGRA_BYTES_PER_PIXEL)
+                    .ok_or(CaptureError::BufferOverflow)?;
+                let span_end_bytes = span_start_bytes
+                    .checked_add(copy_bytes)
+                    .ok_or(CaptureError::BufferOverflow)?;
+                if span_end_bytes > row_bytes {
+                    return Err(CaptureError::BufferOverflow);
+                }
+                if copy_bytes > 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src_row.add(span_start_bytes),
+                            history_row.add(span_start_bytes),
+                            copy_bytes,
+                        );
+                    }
+                }
+            }
+
+            unsafe {
+                src_row = src_row.add(self.stride);
+                history_row = history_row.add(history_stride);
+            }
+        }
+
+        self.build_dirty_span_runs_from_spans(height);
+        Ok(Some(DirtyScanResult {
+            dirty_rows,
+            used_spans: true,
+        }))
     }
 
     fn scan_dirty_row_runs(
@@ -1459,6 +1609,13 @@ impl GdiResources {
         let max_dirty_pixels = pixel_count.saturating_mul(GDI_INCREMENTAL_MAX_DIRTY_ROW_NUMERATOR)
             / GDI_INCREMENTAL_MAX_DIRTY_ROW_DENOMINATOR;
         let spans_enabled = incremental_span_convert_eligible(pixel_count, width, height);
+        let parallel_rows_eligible = parallel_row_scan_eligible(pixel_count, height);
+        let parallel_spans_eligible = parallel_span_scan_eligible(
+            pixel_count,
+            width,
+            height,
+            self.incremental_too_dirty_hint,
+        );
         if incremental_too_dirty_probe_eligible(pixel_count, height)
             && self.incremental_too_dirty_hint
             && unsafe {
@@ -1478,7 +1635,20 @@ impl GdiResources {
             return Ok(None);
         }
 
-        if parallel_row_scan_eligible(pixel_count, height) {
+        if parallel_spans_eligible {
+            return self.scan_dirty_span_runs_parallel(
+                row_bytes,
+                width,
+                height,
+                history_base,
+                history_stride,
+                copy_changed_rows_to_history,
+                compare_row,
+                max_dirty_pixels,
+            );
+        }
+
+        if parallel_rows_eligible {
             let result = self.scan_dirty_row_runs_parallel(
                 row_bytes,
                 height,
@@ -3147,6 +3317,408 @@ mod tests {
             }
         }
         dirty_pixels
+    }
+
+    fn build_sparse_damage_variant(
+        baseline: &[u8],
+        width: usize,
+        height: usize,
+        seed: usize,
+    ) -> Vec<u8> {
+        if width <= 1 || height == 0 {
+            return baseline.to_vec();
+        }
+        let row_bytes = width * BGRA_BYTES_PER_PIXEL;
+        let mut out = baseline.to_vec();
+        let span_width = 96usize.min(width.saturating_sub(1)).max(1);
+        let span_width_bytes = span_width * BGRA_BYTES_PER_PIXEL;
+        for row in (0..height).step_by(2) {
+            let start_col = (row * 37 + seed * 53) % (width - span_width);
+            let start = row
+                .checked_mul(row_bytes)
+                .and_then(|offset| offset.checked_add(start_col * BGRA_BYTES_PER_PIXEL))
+                .unwrap();
+            let end = start + span_width_bytes;
+            for (idx, byte) in out[start..end].iter_mut().enumerate() {
+                *byte ^= ((idx + row + seed * 17) as u8).wrapping_mul(19);
+            }
+        }
+        out
+    }
+
+    unsafe fn incremental_step_parallel_rows_legacy(
+        src_base: *const u8,
+        src_stride: usize,
+        history_base: *mut u8,
+        history_stride: usize,
+        dst_base: *mut u8,
+        dst_stride: usize,
+        width: usize,
+        _height: usize,
+        compare_row: RowCompareKernel,
+        flags: &mut [u8],
+        row_runs: &mut Vec<DirtyRowRun>,
+    ) -> usize {
+        let row_bytes = width * BGRA_BYTES_PER_PIXEL;
+        let dirty_rows = scan_dirty_row_flags_parallel(
+            flags,
+            src_base,
+            src_stride,
+            history_base,
+            history_stride,
+            row_bytes,
+            compare_row,
+            true,
+        );
+        build_dirty_row_runs_from_flags(flags, row_runs);
+
+        let converter = bgra_row_converter();
+        for run in row_runs.iter() {
+            let src_ptr = unsafe { src_base.add(run.start_row * src_stride) };
+            let dst_ptr = unsafe { dst_base.add(run.start_row * dst_stride) };
+            unsafe {
+                converter.convert_rows_maybe_parallel_unchecked(
+                    src_ptr,
+                    src_stride,
+                    dst_ptr,
+                    dst_stride,
+                    width,
+                    run.row_count,
+                );
+            }
+        }
+
+        dirty_rows.saturating_mul(width)
+    }
+
+    unsafe fn incremental_step_parallel_spans(
+        src_base: *const u8,
+        src_stride: usize,
+        history_base: *mut u8,
+        history_stride: usize,
+        dst_base: *mut u8,
+        dst_stride: usize,
+        width: usize,
+        height: usize,
+        compare_row: RowCompareKernel,
+        flags: &mut [u8],
+        row_spans: &mut [DirtyRowSpan],
+        span_runs: &mut Vec<DirtySpanRun>,
+    ) -> usize {
+        let row_bytes = width * BGRA_BYTES_PER_PIXEL;
+        let dirty_rows = scan_dirty_row_flags_parallel(
+            flags,
+            src_base,
+            src_stride,
+            history_base,
+            history_stride,
+            row_bytes,
+            compare_row,
+            false,
+        );
+        if dirty_rows == 0 {
+            span_runs.clear();
+            row_spans.fill(DirtyRowSpan::default());
+            return 0;
+        }
+
+        row_spans.fill(DirtyRowSpan::default());
+        let mut dirty_pixels = 0usize;
+        let mut src_row = src_base;
+        let mut history_row = history_base;
+        for (row, &flag) in flags.iter().enumerate().take(height) {
+            if flag != 0 {
+                let (start_col, end_col) = unsafe {
+                    row_diff_span_pixels(src_row, history_row.cast_const(), row_bytes, width)
+                }
+                .unwrap_or((0, width));
+                let span_width = end_col.saturating_sub(start_col);
+                row_spans[row] = DirtyRowSpan {
+                    start_col: start_col as u32,
+                    width: span_width as u32,
+                };
+                dirty_pixels = dirty_pixels.saturating_add(span_width);
+
+                let start_byte = start_col * BGRA_BYTES_PER_PIXEL;
+                let copy_bytes = span_width * BGRA_BYTES_PER_PIXEL;
+                if copy_bytes > 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src_row.add(start_byte),
+                            history_row.add(start_byte),
+                            copy_bytes,
+                        );
+                    }
+                }
+            }
+
+            unsafe {
+                src_row = src_row.add(src_stride);
+                history_row = history_row.add(history_stride);
+            }
+        }
+
+        build_dirty_span_runs_from_spans(row_spans, span_runs);
+        let converter = bgra_row_converter();
+        for run in span_runs.iter() {
+            let row_offset = run.start_row * src_stride + run.start_col * BGRA_BYTES_PER_PIXEL;
+            let src_ptr = unsafe { src_base.add(row_offset) };
+            let dst_ptr = unsafe {
+                dst_base.add(run.start_row * dst_stride + run.start_col * BGRA_BYTES_PER_PIXEL)
+            };
+            unsafe {
+                converter.convert_rows_maybe_parallel_unchecked(
+                    src_ptr,
+                    src_stride,
+                    dst_ptr,
+                    dst_stride,
+                    run.width,
+                    run.row_count,
+                );
+            }
+        }
+
+        dirty_pixels
+    }
+
+    #[test]
+    fn parallel_span_scan_matches_parallel_row_output_sparse_damage() {
+        let width = 640usize;
+        let height = 360usize;
+        let row_bytes = width * BGRA_BYTES_PER_PIXEL;
+        let total_bytes = row_bytes * height;
+
+        let mut baseline = vec![0u8; total_bytes];
+        for (idx, value) in baseline.iter_mut().enumerate() {
+            *value = (idx as u8).wrapping_mul(13).wrapping_add(7);
+        }
+        let frame_a = build_sparse_damage_variant(&baseline, width, height, 1);
+        let frame_b = build_sparse_damage_variant(&baseline, width, height, 5);
+        let frames = [&frame_a[..], &frame_b[..]];
+
+        let mut history_row = frame_a.clone();
+        let mut history_span = frame_a.clone();
+        let mut dst_row = vec![0u8; total_bytes];
+        let mut dst_span = vec![0u8; total_bytes];
+        unsafe {
+            convert::convert_bgra_to_rgba_unchecked(
+                frame_a.as_ptr(),
+                dst_row.as_mut_ptr(),
+                width * height,
+            );
+            convert::convert_bgra_to_rgba_unchecked(
+                frame_a.as_ptr(),
+                dst_span.as_mut_ptr(),
+                width * height,
+            );
+        }
+
+        let compare = row_compare_kernel();
+        let mut flags_row = vec![0u8; height];
+        let mut flags_span = vec![0u8; height];
+        let mut row_runs = Vec::new();
+        let mut row_spans = vec![DirtyRowSpan::default(); height];
+        let mut span_runs = Vec::new();
+        let mut expected = vec![0u8; total_bytes];
+        let mut phase = 1usize;
+        for _ in 0..10usize {
+            let src = frames[phase];
+            unsafe {
+                incremental_step_parallel_rows_legacy(
+                    src.as_ptr(),
+                    row_bytes,
+                    history_row.as_mut_ptr(),
+                    row_bytes,
+                    dst_row.as_mut_ptr(),
+                    row_bytes,
+                    width,
+                    height,
+                    compare,
+                    &mut flags_row,
+                    &mut row_runs,
+                );
+                incremental_step_parallel_spans(
+                    src.as_ptr(),
+                    row_bytes,
+                    history_span.as_mut_ptr(),
+                    row_bytes,
+                    dst_span.as_mut_ptr(),
+                    row_bytes,
+                    width,
+                    height,
+                    compare,
+                    &mut flags_span,
+                    &mut row_spans,
+                    &mut span_runs,
+                );
+                convert::convert_bgra_to_rgba_unchecked(
+                    src.as_ptr(),
+                    expected.as_mut_ptr(),
+                    width * height,
+                );
+            }
+            assert_eq!(dst_row, expected);
+            assert_eq!(dst_span, expected);
+            phase ^= 1;
+        }
+    }
+
+    #[test]
+    #[ignore = "performance benchmark guard; run explicitly with --ignored --nocapture"]
+    fn bench_parallel_span_scan_vs_parallel_row_sparse_damage() {
+        use std::hint::black_box;
+
+        let width = 2560usize;
+        let height = 1440usize;
+        let row_bytes = width * BGRA_BYTES_PER_PIXEL;
+        let total_bytes = row_bytes * height;
+        let pixel_count = width * height;
+        let compare = row_compare_kernel();
+
+        let mut baseline = vec![0u8; total_bytes];
+        for (idx, value) in baseline.iter_mut().enumerate() {
+            *value = (idx as u8).wrapping_mul(23).wrapping_add(19);
+        }
+        let frame_a = build_sparse_damage_variant(&baseline, width, height, 2);
+        let frame_b = build_sparse_damage_variant(&baseline, width, height, 7);
+        let frames = [&frame_a[..], &frame_b[..]];
+
+        let warmup_iters = 20usize;
+        let measure_iters = 140usize;
+
+        let mut legacy_history = frame_a.clone();
+        let mut legacy_dst = vec![0u8; total_bytes];
+        unsafe {
+            convert::convert_bgra_to_rgba_unchecked(
+                frame_a.as_ptr(),
+                legacy_dst.as_mut_ptr(),
+                pixel_count,
+            );
+        }
+        let mut legacy_flags = vec![0u8; height];
+        let mut legacy_runs = Vec::new();
+        let mut phase = 1usize;
+        let mut sink = 0usize;
+        for _ in 0..warmup_iters {
+            let src = frames[phase];
+            sink ^= unsafe {
+                incremental_step_parallel_rows_legacy(
+                    src.as_ptr(),
+                    row_bytes,
+                    legacy_history.as_mut_ptr(),
+                    row_bytes,
+                    legacy_dst.as_mut_ptr(),
+                    row_bytes,
+                    width,
+                    height,
+                    compare,
+                    &mut legacy_flags,
+                    &mut legacy_runs,
+                )
+            };
+            phase ^= 1;
+        }
+
+        phase = 1usize;
+        let legacy_start = Instant::now();
+        for _ in 0..measure_iters {
+            let src = frames[phase];
+            sink ^= unsafe {
+                incremental_step_parallel_rows_legacy(
+                    src.as_ptr(),
+                    row_bytes,
+                    legacy_history.as_mut_ptr(),
+                    row_bytes,
+                    legacy_dst.as_mut_ptr(),
+                    row_bytes,
+                    width,
+                    height,
+                    compare,
+                    &mut legacy_flags,
+                    &mut legacy_runs,
+                )
+            };
+            phase ^= 1;
+        }
+        let legacy_elapsed = legacy_start.elapsed();
+
+        let mut span_history = frame_a.clone();
+        let mut span_dst = vec![0u8; total_bytes];
+        unsafe {
+            convert::convert_bgra_to_rgba_unchecked(
+                frame_a.as_ptr(),
+                span_dst.as_mut_ptr(),
+                pixel_count,
+            );
+        }
+        let mut span_flags = vec![0u8; height];
+        let mut span_spans = vec![DirtyRowSpan::default(); height];
+        let mut span_runs = Vec::new();
+        phase = 1usize;
+        for _ in 0..warmup_iters {
+            let src = frames[phase];
+            sink ^= unsafe {
+                incremental_step_parallel_spans(
+                    src.as_ptr(),
+                    row_bytes,
+                    span_history.as_mut_ptr(),
+                    row_bytes,
+                    span_dst.as_mut_ptr(),
+                    row_bytes,
+                    width,
+                    height,
+                    compare,
+                    &mut span_flags,
+                    &mut span_spans,
+                    &mut span_runs,
+                )
+            };
+            phase ^= 1;
+        }
+
+        phase = 1usize;
+        let span_start = Instant::now();
+        for _ in 0..measure_iters {
+            let src = frames[phase];
+            sink ^= unsafe {
+                incremental_step_parallel_spans(
+                    src.as_ptr(),
+                    row_bytes,
+                    span_history.as_mut_ptr(),
+                    row_bytes,
+                    span_dst.as_mut_ptr(),
+                    row_bytes,
+                    width,
+                    height,
+                    compare,
+                    &mut span_flags,
+                    &mut span_spans,
+                    &mut span_runs,
+                )
+            };
+            phase ^= 1;
+        }
+        let span_elapsed = span_start.elapsed();
+        black_box(sink);
+
+        let legacy_ms = legacy_elapsed.as_secs_f64() * 1000.0;
+        let span_ms = span_elapsed.as_secs_f64() * 1000.0;
+        let improvement_pct = if legacy_ms > 0.0 {
+            ((legacy_ms - span_ms) / legacy_ms) * 100.0
+        } else {
+            0.0
+        };
+
+        println!(
+            "gdi parallel span benchmark: legacy={legacy_ms:.3} ms span={span_ms:.3} ms improvement={improvement_pct:.2}%"
+        );
+
+        // Guardrail: keep the hybrid path from regressing relative to the
+        // previous parallel full-row incremental strategy.
+        assert!(
+            span_ms <= legacy_ms * 1.03,
+            "parallel span path regressed: legacy={legacy_ms:.3}ms span={span_ms:.3}ms ({improvement_pct:.2}% improvement)"
+        );
     }
 
     #[test]

@@ -55,6 +55,8 @@ const DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS_DEFAULT: u64 = 1_048_576;
 const DXGI_REGION_LOW_LATENCY_MAX_PIXELS_DEFAULT: u64 = 1_048_576;
 const DXGI_REGION_STAGING_SLOTS: usize = 3;
 const DXGI_REGION_DIRTY_TRACK_MAX_RECTS: usize = DXGI_DIRTY_COPY_MAX_RECTS + 1;
+const DXGI_DIRTY_RECT_DENSE_MERGE_LEGACY_MIN_RECTS: usize = 64;
+const DXGI_DIRTY_RECT_DENSE_MERGE_LEGACY_MAX_VERTICAL_SPAN: u32 = 96;
 
 #[inline]
 fn env_var_truthy(var_name: &'static str) -> bool {
@@ -91,6 +93,12 @@ fn region_direct_dirty_extract_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED
         .get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_DIRECT_EXTRACT"))
+}
+
+#[inline]
+fn optimized_dirty_merge_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_OPTIMIZED_DIRTY_MERGE"))
 }
 
 #[inline]
@@ -263,6 +271,7 @@ fn intersect_dirty_rects(a: DirtyRect, b: DirtyRect) -> Option<DirtyRect> {
     })
 }
 
+#[inline(always)]
 fn dirty_rect_bounds(rect: DirtyRect) -> (u32, u32) {
     (
         rect.x.saturating_add(rect.width),
@@ -270,40 +279,121 @@ fn dirty_rect_bounds(rect: DirtyRect) -> (u32, u32) {
     )
 }
 
+#[inline(always)]
 fn intervals_overlap(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> bool {
     a_start < b_end && b_start < a_end
 }
 
+#[inline(always)]
 fn intervals_touch_or_overlap(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> bool {
     a_start <= b_end && b_start <= a_end
 }
 
-fn dirty_rects_can_merge(a: DirtyRect, b: DirtyRect) -> bool {
-    let (a_right, a_bottom) = dirty_rect_bounds(a);
-    let (b_right, b_bottom) = dirty_rect_bounds(b);
-
-    let horizontal_overlap = intervals_overlap(a.x, a_right, b.x, b_right);
-    let vertical_overlap = intervals_overlap(a.y, a_bottom, b.y, b_bottom);
-    let horizontal_touch_or_overlap = intervals_touch_or_overlap(a.x, a_right, b.x, b_right);
-    let vertical_touch_or_overlap = intervals_touch_or_overlap(a.y, a_bottom, b.y, b_bottom);
-
-    (horizontal_overlap && vertical_touch_or_overlap)
-        || (vertical_overlap && horizontal_touch_or_overlap)
+#[derive(Clone, Copy)]
+struct DirtyRectMergeCandidate {
+    rect: DirtyRect,
+    right: u32,
+    bottom: u32,
 }
 
-fn merge_dirty_rects(a: DirtyRect, b: DirtyRect) -> DirtyRect {
-    let x = a.x.min(b.x);
-    let y = a.y.min(b.y);
-    let (a_right, a_bottom) = dirty_rect_bounds(a);
-    let (b_right, b_bottom) = dirty_rect_bounds(b);
-    let right = a_right.max(b_right);
-    let bottom = a_bottom.max(b_bottom);
-    DirtyRect {
-        x,
-        y,
-        width: right.saturating_sub(x),
-        height: bottom.saturating_sub(y),
+impl DirtyRectMergeCandidate {
+    #[inline(always)]
+    fn new(rect: DirtyRect) -> Self {
+        let (right, bottom) = dirty_rect_bounds(rect);
+        Self {
+            rect,
+            right,
+            bottom,
+        }
     }
+
+    #[inline(always)]
+    fn can_merge(self, other: Self) -> bool {
+        let horizontal_overlap =
+            intervals_overlap(self.rect.x, self.right, other.rect.x, other.right);
+        let vertical_overlap =
+            intervals_overlap(self.rect.y, self.bottom, other.rect.y, other.bottom);
+        let horizontal_touch_or_overlap =
+            intervals_touch_or_overlap(self.rect.x, self.right, other.rect.x, other.right);
+        let vertical_touch_or_overlap =
+            intervals_touch_or_overlap(self.rect.y, self.bottom, other.rect.y, other.bottom);
+
+        (horizontal_overlap && vertical_touch_or_overlap)
+            || (vertical_overlap && horizontal_touch_or_overlap)
+    }
+
+    #[inline(always)]
+    fn merge_in_place(&mut self, other: Self) {
+        self.rect.x = self.rect.x.min(other.rect.x);
+        self.rect.y = self.rect.y.min(other.rect.y);
+        self.right = self.right.max(other.right);
+        self.bottom = self.bottom.max(other.bottom);
+        self.rect.width = self.right.saturating_sub(self.rect.x);
+        self.rect.height = self.bottom.saturating_sub(self.rect.y);
+    }
+}
+
+#[inline(always)]
+fn dirty_rects_can_merge(a: DirtyRect, b: DirtyRect) -> bool {
+    DirtyRectMergeCandidate::new(a).can_merge(DirtyRectMergeCandidate::new(b))
+}
+
+#[inline(always)]
+fn merge_dirty_rects(a: DirtyRect, b: DirtyRect) -> DirtyRect {
+    let mut merged = DirtyRectMergeCandidate::new(a);
+    merged.merge_in_place(DirtyRectMergeCandidate::new(b));
+    merged.rect
+}
+
+fn normalize_dirty_rects_legacy_after_clamp(rects: &mut Vec<DirtyRect>) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+
+        let mut i = 0usize;
+        while i < rects.len() {
+            let mut j = i + 1;
+            while j < rects.len() {
+                if dirty_rects_can_merge(rects[i], rects[j]) {
+                    rects[i] = merge_dirty_rects(rects[i], rects[j]);
+                    rects.swap_remove(j);
+                    changed = true;
+                } else {
+                    j += 1;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    rects.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
+}
+
+#[inline(always)]
+unsafe fn remove_dirty_rect_at_unchecked(rects: &mut Vec<DirtyRect>, idx: usize) {
+    let len = rects.len();
+    debug_assert!(idx < len);
+    let ptr = rects.as_mut_ptr();
+    unsafe {
+        std::ptr::copy(ptr.add(idx + 1), ptr.add(idx), len - idx - 1);
+        rects.set_len(len - 1);
+    }
+}
+
+#[inline]
+fn should_use_legacy_dense_merge(rects: &[DirtyRect]) -> bool {
+    if rects.len() < DXGI_DIRTY_RECT_DENSE_MERGE_LEGACY_MIN_RECTS {
+        return false;
+    }
+
+    let mut min_y = u32::MAX;
+    let mut max_y = 0u32;
+    for rect in rects {
+        min_y = min_y.min(rect.y);
+        max_y = max_y.max(rect.y.saturating_add(rect.height));
+    }
+
+    max_y.saturating_sub(min_y) <= DXGI_DIRTY_RECT_DENSE_MERGE_LEGACY_MAX_VERTICAL_SPAN
 }
 
 fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height: u32) {
@@ -311,33 +401,141 @@ fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height
         return;
     }
 
+    let mut pending = std::mem::take(rects);
     let mut write = 0usize;
-    for read in 0..rects.len() {
-        if let Some(clamped) = clamp_dirty_rect(rects[read], width, height) {
-            rects[write] = clamped;
+    for read in 0..pending.len() {
+        if let Some(clamped) = clamp_dirty_rect(pending[read], width, height) {
+            pending[write] = clamped;
             write += 1;
         }
     }
-    rects.truncate(write);
-    if rects.len() <= 1 {
+    pending.truncate(write);
+    if pending.len() <= 1 {
+        *rects = pending;
         return;
     }
 
-    let mut i = 0usize;
-    while i < rects.len() {
-        let mut j = i + 1;
-        while j < rects.len() {
-            if dirty_rects_can_merge(rects[i], rects[j]) {
-                rects[i] = merge_dirty_rects(rects[i], rects[j]);
-                rects.swap_remove(j);
-            } else {
-                j += 1;
-            }
-        }
-        i += 1;
+    if !optimized_dirty_merge_enabled() || should_use_legacy_dense_merge(&pending) {
+        *rects = pending;
+        normalize_dirty_rects_legacy_after_clamp(rects);
+        return;
     }
 
-    rects.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
+    pending.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
+    rects.reserve(pending.len());
+    for rect in pending {
+        let mut candidate = rect;
+        loop {
+            let mut merged_any = false;
+            let candidate_bottom = candidate.y.saturating_add(candidate.height);
+            let mut idx = 0usize;
+            while idx < rects.len() {
+                let existing = rects[idx];
+                let existing_bottom = existing.y.saturating_add(existing.height);
+                if existing_bottom < candidate.y {
+                    idx += 1;
+                    continue;
+                }
+                if existing.y > candidate_bottom {
+                    break;
+                }
+
+                if dirty_rects_can_merge(candidate, existing) {
+                    candidate = merge_dirty_rects(candidate, existing);
+                    unsafe { remove_dirty_rect_at_unchecked(rects, idx) };
+                    merged_any = true;
+                } else {
+                    idx += 1;
+                }
+            }
+
+            if !merged_any {
+                break;
+            }
+        }
+
+        let insert_at = rects
+            .binary_search_by(|probe| {
+                probe
+                    .y
+                    .cmp(&candidate.y)
+                    .then_with(|| probe.x.cmp(&candidate.x))
+            })
+            .unwrap_or_else(|pos| pos);
+        rects.insert(insert_at, candidate);
+    }
+}
+
+#[cfg(test)]
+fn normalize_dirty_rects_reference_in_place(rects: &mut Vec<DirtyRect>, width: u32, height: u32) {
+    if rects.is_empty() {
+        return;
+    }
+
+    let mut pending = std::mem::take(rects);
+    let mut write = 0usize;
+    for read in 0..pending.len() {
+        if let Some(clamped) = clamp_dirty_rect(pending[read], width, height) {
+            pending[write] = clamped;
+            write += 1;
+        }
+    }
+    pending.truncate(write);
+    if pending.len() <= 1 {
+        *rects = pending;
+        return;
+    }
+
+    if should_use_legacy_dense_merge(&pending) {
+        *rects = pending;
+        normalize_dirty_rects_legacy_after_clamp(rects);
+        return;
+    }
+
+    pending.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
+
+    rects.reserve(pending.len());
+    for rect in pending {
+        let mut candidate = rect;
+        loop {
+            let mut merged_any = false;
+            let candidate_bottom = candidate.y.saturating_add(candidate.height);
+            let mut idx = 0usize;
+            while idx < rects.len() {
+                let existing = rects[idx];
+                let existing_bottom = existing.y.saturating_add(existing.height);
+                if existing_bottom < candidate.y {
+                    idx += 1;
+                    continue;
+                }
+                if existing.y > candidate_bottom {
+                    break;
+                }
+
+                if dirty_rects_can_merge(candidate, existing) {
+                    candidate = merge_dirty_rects(candidate, existing);
+                    rects.remove(idx);
+                    merged_any = true;
+                } else {
+                    idx += 1;
+                }
+            }
+
+            if !merged_any {
+                break;
+            }
+        }
+
+        let insert_at = rects
+            .binary_search_by(|probe| {
+                probe
+                    .y
+                    .cmp(&candidate.y)
+                    .then_with(|| probe.x.cmp(&candidate.x))
+            })
+            .unwrap_or_else(|pos| pos);
+        rects.insert(insert_at, candidate);
+    }
 }
 
 fn extract_region_dirty_rects(
@@ -1196,6 +1394,85 @@ fn should_skip_screenrecord_submit_copy(
     fastpath_enabled && has_pending_submission && (source_is_duplicate || source_unchanged)
 }
 
+fn convert_cursor_shape_bgra_to_rgba(
+    shape_buf: &[u8],
+    shape_info: &DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+) -> Vec<u8> {
+    let width = shape_info.Width as usize;
+    let height = shape_info.Height as usize;
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let row_bytes = match width.checked_mul(4) {
+        Some(bytes) => bytes,
+        None => return Vec::new(),
+    };
+    let pitch = shape_info.Pitch as usize;
+
+    let pixel_count = match width.checked_mul(height) {
+        Some(count) => count,
+        None => return Vec::new(),
+    };
+    let rgba_len = match pixel_count.checked_mul(4) {
+        Some(len) => len,
+        None => return Vec::new(),
+    };
+    let mut rgba = vec![0u8; rgba_len];
+
+    if pitch == row_bytes {
+        let required = match row_bytes.checked_mul(height) {
+            Some(bytes) => bytes,
+            None => return Vec::new(),
+        };
+        if shape_buf.len() >= required {
+            unsafe {
+                crate::convert::convert_bgra_to_rgba_unchecked(
+                    shape_buf.as_ptr(),
+                    rgba.as_mut_ptr(),
+                    pixel_count,
+                );
+            }
+            return rgba;
+        }
+    }
+
+    if pitch < 4 {
+        return rgba;
+    }
+
+    for row in 0..height {
+        let src_offset = match row.checked_mul(pitch) {
+            Some(offset) => offset,
+            None => break,
+        };
+        if src_offset >= shape_buf.len() {
+            break;
+        }
+
+        let available_bytes = (shape_buf.len() - src_offset).min(pitch).min(row_bytes);
+        let available_pixels = available_bytes / 4;
+        if available_pixels == 0 {
+            continue;
+        }
+
+        let dst_offset = match row.checked_mul(row_bytes) {
+            Some(offset) => offset,
+            None => return Vec::new(),
+        };
+
+        unsafe {
+            crate::convert::convert_bgra_to_rgba_unchecked(
+                shape_buf.as_ptr().add(src_offset),
+                rgba.as_mut_ptr().add(dst_offset),
+                available_pixels,
+            );
+        }
+    }
+
+    rgba
+}
+
 /// Extract cursor shape and position from the DXGI duplication frame.
 /// Returns `None` if cursor data is unavailable or extraction fails.
 fn extract_cursor_data(
@@ -1232,25 +1509,7 @@ fn extract_cursor_data(
                     t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32
                         || t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32 =>
                     {
-                        // Already BGRA -- swizzle to RGBA.
-                        let pixel_count = (w * h) as usize;
-                        let mut rgba = vec![0u8; pixel_count * 4];
-                        let pitch = shape_info.Pitch as usize;
-                        for row in 0..h as usize {
-                            let src_offset = row * pitch;
-                            let dst_offset = row * (w as usize) * 4;
-                            for col in 0..w as usize {
-                                let si = src_offset + col * 4;
-                                let di = dst_offset + col * 4;
-                                if si + 3 < shape_buf.len() && di + 3 < rgba.len() {
-                                    rgba[di] = shape_buf[si + 2]; // R
-                                    rgba[di + 1] = shape_buf[si + 1]; // G
-                                    rgba[di + 2] = shape_buf[si]; // B
-                                    rgba[di + 3] = shape_buf[si + 3]; // A
-                                }
-                            }
-                        }
-                        rgba
+                        convert_cursor_shape_bgra_to_rgba(&shape_buf, &shape_info)
                     }
                     _ => {
                         // Monochrome or unknown -- skip shape data.
@@ -3140,6 +3399,120 @@ mod tests {
                 width: 60,
                 height: 15,
             }]
+        );
+    }
+
+    #[test]
+    fn normalize_dirty_rects_matches_reference_algorithm_on_randomized_inputs() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+
+        for _case in 0..256 {
+            let mut input = Vec::with_capacity(160);
+            let rect_count = 8 + ((state >> 5) as usize % 152);
+            for _ in 0..rect_count {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let x = ((state >> 12) as u32) % 2600;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let y = ((state >> 20) as u32) % 1500;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let width = ((state >> 24) as u32) % 900;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let height = ((state >> 28) as u32) % 500;
+                input.push(DirtyRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                });
+            }
+
+            let mut optimized = input.clone();
+            let mut reference = input;
+            normalize_dirty_rects_in_place(&mut optimized, 1920, 1080);
+            normalize_dirty_rects_reference_in_place(&mut reference, 1920, 1080);
+            assert_eq!(optimized, reference);
+        }
+    }
+
+    #[test]
+    fn cursor_shape_bgra_to_rgba_converts_contiguous_rows() {
+        let shape = DXGI_OUTDUPL_POINTER_SHAPE_INFO {
+            Width: 2,
+            Height: 1,
+            Pitch: 8,
+            ..Default::default()
+        };
+        let src = vec![
+            0x10, 0x20, 0x30, 0x40, // BGRA
+            0x50, 0x60, 0x70, 0x80, // BGRA
+        ];
+        let rgba = convert_cursor_shape_bgra_to_rgba(&src, &shape);
+        assert_eq!(
+            rgba,
+            vec![
+                0x30, 0x20, 0x10, 0x40, //
+                0x70, 0x60, 0x50, 0x80
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_shape_bgra_to_rgba_converts_with_row_padding() {
+        let shape = DXGI_OUTDUPL_POINTER_SHAPE_INFO {
+            Width: 2,
+            Height: 2,
+            Pitch: 12,
+            ..Default::default()
+        };
+        let src = vec![
+            0x10, 0x20, 0x30, 0xFF, 0x40, 0x50, 0x60, 0xEE, 0, 0, 0, 0, // row 0
+            0x70, 0x80, 0x90, 0xDD, 0xA0, 0xB0, 0xC0, 0xCC, 0, 0, 0, 0, // row 1
+        ];
+        let rgba = convert_cursor_shape_bgra_to_rgba(&src, &shape);
+        assert_eq!(
+            rgba,
+            vec![
+                0x30, 0x20, 0x10, 0xFF, 0x60, 0x50, 0x40, 0xEE, //
+                0x90, 0x80, 0x70, 0xDD, 0xC0, 0xB0, 0xA0, 0xCC
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_shape_bgra_to_rgba_handles_truncated_buffer() {
+        let shape = DXGI_OUTDUPL_POINTER_SHAPE_INFO {
+            Width: 2,
+            Height: 1,
+            Pitch: 8,
+            ..Default::default()
+        };
+        let src = vec![
+            0x10, 0x20, 0x30, 0xAA, // full pixel
+            0x40, 0x50, // partial pixel (ignored)
+        ];
+        let rgba = convert_cursor_shape_bgra_to_rgba(&src, &shape);
+        assert_eq!(rgba, vec![0x30, 0x20, 0x10, 0xAA, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn cursor_shape_bgra_to_rgba_handles_pitch_smaller_than_row() {
+        let shape = DXGI_OUTDUPL_POINTER_SHAPE_INFO {
+            Width: 2,
+            Height: 2,
+            Pitch: 4,
+            ..Default::default()
+        };
+        let src = vec![
+            0x10, 0x20, 0x30, 0xAA, // row 0: one pixel available
+            0x40, 0x50, 0x60, 0xBB, // row 1: one pixel available
+        ];
+        let rgba = convert_cursor_shape_bgra_to_rgba(&src, &shape);
+        assert_eq!(
+            rgba,
+            vec![
+                0x30, 0x20, 0x10, 0xAA, 0, 0, 0, 0, //
+                0x60, 0x50, 0x40, 0xBB, 0, 0, 0, 0
+            ]
         );
     }
 

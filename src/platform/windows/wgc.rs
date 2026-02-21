@@ -322,32 +322,58 @@ fn intervals_touch_or_overlap(a_start: u32, a_end: u32, b_start: u32, b_end: u32
     a_start <= b_end && b_start <= a_end
 }
 
+#[derive(Clone, Copy)]
+struct DirtyRectMergeCandidate {
+    rect: DirtyRect,
+    right: u32,
+    bottom: u32,
+}
+
+impl DirtyRectMergeCandidate {
+    #[inline(always)]
+    fn new(rect: DirtyRect) -> Self {
+        let (right, bottom) = dirty_rect_bounds(rect);
+        Self {
+            rect,
+            right,
+            bottom,
+        }
+    }
+
+    #[inline(always)]
+    fn can_merge(self, other: Self) -> bool {
+        let horizontal_overlap =
+            intervals_overlap(self.rect.x, self.right, other.rect.x, other.right);
+        let vertical_overlap =
+            intervals_overlap(self.rect.y, self.bottom, other.rect.y, other.bottom);
+        let horizontal_touch_or_overlap =
+            intervals_touch_or_overlap(self.rect.x, self.right, other.rect.x, other.right);
+        let vertical_touch_or_overlap =
+            intervals_touch_or_overlap(self.rect.y, self.bottom, other.rect.y, other.bottom);
+
+        (horizontal_overlap && vertical_touch_or_overlap)
+            || (vertical_overlap && horizontal_touch_or_overlap)
+    }
+
+    #[inline(always)]
+    fn merge_in_place(&mut self, other: Self) {
+        self.rect.x = self.rect.x.min(other.rect.x);
+        self.rect.y = self.rect.y.min(other.rect.y);
+        self.right = self.right.max(other.right);
+        self.bottom = self.bottom.max(other.bottom);
+        self.rect.width = self.right.saturating_sub(self.rect.x);
+        self.rect.height = self.bottom.saturating_sub(self.rect.y);
+    }
+}
+
 fn dirty_rects_can_merge(a: DirtyRect, b: DirtyRect) -> bool {
-    let (a_right, a_bottom) = dirty_rect_bounds(a);
-    let (b_right, b_bottom) = dirty_rect_bounds(b);
-
-    let horizontal_overlap = intervals_overlap(a.x, a_right, b.x, b_right);
-    let vertical_overlap = intervals_overlap(a.y, a_bottom, b.y, b_bottom);
-    let horizontal_touch_or_overlap = intervals_touch_or_overlap(a.x, a_right, b.x, b_right);
-    let vertical_touch_or_overlap = intervals_touch_or_overlap(a.y, a_bottom, b.y, b_bottom);
-
-    (horizontal_overlap && vertical_touch_or_overlap)
-        || (vertical_overlap && horizontal_touch_or_overlap)
+    DirtyRectMergeCandidate::new(a).can_merge(DirtyRectMergeCandidate::new(b))
 }
 
 fn merge_dirty_rects(a: DirtyRect, b: DirtyRect) -> DirtyRect {
-    let x = a.x.min(b.x);
-    let y = a.y.min(b.y);
-    let (a_right, a_bottom) = dirty_rect_bounds(a);
-    let (b_right, b_bottom) = dirty_rect_bounds(b);
-    let right = a_right.max(b_right);
-    let bottom = a_bottom.max(b_bottom);
-    DirtyRect {
-        x,
-        y,
-        width: right.saturating_sub(x),
-        height: bottom.saturating_sub(y),
-    }
+    let mut merged = DirtyRectMergeCandidate::new(a);
+    merged.merge_in_place(DirtyRectMergeCandidate::new(b));
+    merged.rect
 }
 
 fn normalize_dirty_rects_legacy_after_clamp(rects: &mut Vec<DirtyRect>) {
@@ -374,6 +400,16 @@ fn normalize_dirty_rects_legacy_after_clamp(rects: &mut Vec<DirtyRect>) {
     rects.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
 }
 
+#[inline(always)]
+unsafe fn remove_dirty_rect_at_unchecked(rects: &mut Vec<DirtyRect>, idx: usize) {
+    let len = rects.len();
+    let ptr = rects.as_mut_ptr();
+    unsafe {
+        std::ptr::copy(ptr.add(idx + 1), ptr.add(idx), len - idx - 1);
+        rects.set_len(len - 1);
+    }
+}
+
 fn should_use_legacy_dense_merge(rects: &[DirtyRect]) -> bool {
     if rects.len() < WGC_DIRTY_RECT_DENSE_MERGE_LEGACY_MIN_RECTS {
         return false;
@@ -390,6 +426,78 @@ fn should_use_legacy_dense_merge(rects: &[DirtyRect]) -> bool {
 }
 
 fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height: u32) {
+    if rects.is_empty() {
+        return;
+    }
+
+    let mut pending = std::mem::take(rects);
+    let mut write = 0usize;
+    for read in 0..pending.len() {
+        if let Some(clamped) = clamp_dirty_rect(pending[read], width, height) {
+            pending[write] = clamped;
+            write += 1;
+        }
+    }
+    pending.truncate(write);
+    if pending.len() <= 1 {
+        *rects = pending;
+        return;
+    }
+
+    if should_use_legacy_dense_merge(&pending) {
+        *rects = pending;
+        normalize_dirty_rects_legacy_after_clamp(rects);
+        return;
+    }
+
+    pending.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
+    rects.reserve(pending.len());
+    for rect in pending {
+        let mut candidate = rect;
+        loop {
+            let mut merged_any = false;
+            let candidate_bottom = candidate.y.saturating_add(candidate.height);
+            let mut idx = 0usize;
+            while idx < rects.len() {
+                let existing = rects[idx];
+                let existing_bottom = existing.y.saturating_add(existing.height);
+                if existing_bottom < candidate.y {
+                    idx += 1;
+                    continue;
+                }
+                if existing.y > candidate_bottom {
+                    break;
+                }
+
+                if dirty_rects_can_merge(candidate, existing) {
+                    candidate = merge_dirty_rects(candidate, existing);
+                    // SAFETY: `idx` is bounded by the loop condition (`idx < rects.len()`).
+                    unsafe { remove_dirty_rect_at_unchecked(rects, idx) };
+                    merged_any = true;
+                } else {
+                    idx += 1;
+                }
+            }
+
+            if !merged_any {
+                break;
+            }
+        }
+
+        let insert_at = rects
+            .binary_search_by(|probe| {
+                probe
+                    .y
+                    .cmp(&candidate.y)
+                    .then_with(|| probe.x.cmp(&candidate.x))
+            })
+            .unwrap_or_else(|pos| pos);
+        rects.insert(insert_at, candidate);
+    }
+}
+
+#[cfg(test)]
+fn normalize_dirty_rects_reference_in_place(rects: &mut Vec<DirtyRect>, width: u32, height: u32) {
     if rects.is_empty() {
         return;
     }
@@ -3182,6 +3290,38 @@ mod tests {
                 height: 4
             }]
         );
+    }
+
+    #[test]
+    fn normalize_dirty_rects_matches_reference_algorithm_on_randomized_inputs() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+
+        for _case in 0..256 {
+            let mut input = Vec::with_capacity(160);
+            let rect_count = 8 + ((state >> 5) as usize % 152);
+            for _ in 0..rect_count {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let x = ((state >> 12) as u32) % 2600;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let y = ((state >> 20) as u32) % 1500;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let width = ((state >> 24) as u32) % 900;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let height = ((state >> 28) as u32) % 500;
+                input.push(DirtyRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                });
+            }
+
+            let mut optimized = input.clone();
+            let mut reference = input;
+            normalize_dirty_rects_in_place(&mut optimized, 1920, 1080);
+            normalize_dirty_rects_reference_in_place(&mut reference, 1920, 1080);
+            assert_eq!(optimized, reference);
+        }
     }
 
     #[test]

@@ -8,7 +8,7 @@ const BENCH_WIDTH: u32 = 1920;
 const BENCH_HEIGHT: u32 = 1080;
 const DEFAULT_ROUNDS: usize = 8;
 const DEFAULT_ITERATIONS: usize = 15_000;
-const DEFAULT_MAX_REGRESSION_PCT: f64 = 8.0;
+const DEFAULT_MAX_REGRESSION_PCT: f64 = 5.0;
 const DENSE_MERGE_LEGACY_MIN_RECTS: usize = 64;
 const DENSE_MERGE_LEGACY_MAX_VERTICAL_SPAN: u32 = 96;
 
@@ -21,7 +21,8 @@ struct Workload {
 #[derive(Clone, Copy)]
 struct CaseTiming {
     legacy: Duration,
-    optimized: Duration,
+    optimized_v1: Duration,
+    optimized_v2: Duration,
 }
 
 fn clamp_dirty_rect(rect: DirtyRect, width: u32, height: u32) -> Option<DirtyRect> {
@@ -65,32 +66,58 @@ fn intervals_touch_or_overlap(a_start: u32, a_end: u32, b_start: u32, b_end: u32
     a_start <= b_end && b_start <= a_end
 }
 
+#[derive(Clone, Copy)]
+struct DirtyRectMergeCandidate {
+    rect: DirtyRect,
+    right: u32,
+    bottom: u32,
+}
+
+impl DirtyRectMergeCandidate {
+    #[inline(always)]
+    fn new(rect: DirtyRect) -> Self {
+        let (right, bottom) = dirty_rect_bounds(rect);
+        Self {
+            rect,
+            right,
+            bottom,
+        }
+    }
+
+    #[inline(always)]
+    fn can_merge(self, other: Self) -> bool {
+        let horizontal_overlap =
+            intervals_overlap(self.rect.x, self.right, other.rect.x, other.right);
+        let vertical_overlap =
+            intervals_overlap(self.rect.y, self.bottom, other.rect.y, other.bottom);
+        let horizontal_touch_or_overlap =
+            intervals_touch_or_overlap(self.rect.x, self.right, other.rect.x, other.right);
+        let vertical_touch_or_overlap =
+            intervals_touch_or_overlap(self.rect.y, self.bottom, other.rect.y, other.bottom);
+
+        (horizontal_overlap && vertical_touch_or_overlap)
+            || (vertical_overlap && horizontal_touch_or_overlap)
+    }
+
+    #[inline(always)]
+    fn merge_in_place(&mut self, other: Self) {
+        self.rect.x = self.rect.x.min(other.rect.x);
+        self.rect.y = self.rect.y.min(other.rect.y);
+        self.right = self.right.max(other.right);
+        self.bottom = self.bottom.max(other.bottom);
+        self.rect.width = self.right.saturating_sub(self.rect.x);
+        self.rect.height = self.bottom.saturating_sub(self.rect.y);
+    }
+}
+
 fn dirty_rects_can_merge(a: DirtyRect, b: DirtyRect) -> bool {
-    let (a_right, a_bottom) = dirty_rect_bounds(a);
-    let (b_right, b_bottom) = dirty_rect_bounds(b);
-
-    let horizontal_overlap = intervals_overlap(a.x, a_right, b.x, b_right);
-    let vertical_overlap = intervals_overlap(a.y, a_bottom, b.y, b_bottom);
-    let horizontal_touch_or_overlap = intervals_touch_or_overlap(a.x, a_right, b.x, b_right);
-    let vertical_touch_or_overlap = intervals_touch_or_overlap(a.y, a_bottom, b.y, b_bottom);
-
-    (horizontal_overlap && vertical_touch_or_overlap)
-        || (vertical_overlap && horizontal_touch_or_overlap)
+    DirtyRectMergeCandidate::new(a).can_merge(DirtyRectMergeCandidate::new(b))
 }
 
 fn merge_dirty_rects(a: DirtyRect, b: DirtyRect) -> DirtyRect {
-    let x = a.x.min(b.x);
-    let y = a.y.min(b.y);
-    let (a_right, a_bottom) = dirty_rect_bounds(a);
-    let (b_right, b_bottom) = dirty_rect_bounds(b);
-    let right = a_right.max(b_right);
-    let bottom = a_bottom.max(b_bottom);
-    DirtyRect {
-        x,
-        y,
-        width: right.saturating_sub(x),
-        height: bottom.saturating_sub(y),
-    }
+    let mut merged = DirtyRectMergeCandidate::new(a);
+    merged.merge_in_place(DirtyRectMergeCandidate::new(b));
+    merged.rect
 }
 
 fn normalize_dirty_rects_legacy(rects: &mut Vec<DirtyRect>, width: u32, height: u32) {
@@ -157,6 +184,16 @@ fn normalize_dirty_rects_legacy_after_clamp(rects: &mut Vec<DirtyRect>) {
     rects.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
 }
 
+#[inline(always)]
+unsafe fn remove_dirty_rect_at_unchecked(rects: &mut Vec<DirtyRect>, idx: usize) {
+    let len = rects.len();
+    let ptr = rects.as_mut_ptr();
+    unsafe {
+        std::ptr::copy(ptr.add(idx + 1), ptr.add(idx), len - idx - 1);
+        rects.set_len(len - 1);
+    }
+}
+
 fn should_use_legacy_dense_merge(rects: &[DirtyRect]) -> bool {
     if rects.len() < DENSE_MERGE_LEGACY_MIN_RECTS {
         return false;
@@ -172,7 +209,7 @@ fn should_use_legacy_dense_merge(rects: &[DirtyRect]) -> bool {
     max_y.saturating_sub(min_y) <= DENSE_MERGE_LEGACY_MAX_VERTICAL_SPAN
 }
 
-fn normalize_dirty_rects_optimized(rects: &mut Vec<DirtyRect>, width: u32, height: u32) {
+fn normalize_dirty_rects_optimized_v1(rects: &mut Vec<DirtyRect>, width: u32, height: u32) {
     if rects.is_empty() {
         return;
     }
@@ -221,6 +258,78 @@ fn normalize_dirty_rects_optimized(rects: &mut Vec<DirtyRect>, width: u32, heigh
                 if dirty_rects_can_merge(candidate, existing) {
                     candidate = merge_dirty_rects(candidate, existing);
                     rects.remove(idx);
+                    merged_any = true;
+                } else {
+                    idx += 1;
+                }
+            }
+
+            if !merged_any {
+                break;
+            }
+        }
+
+        let insert_at = rects
+            .binary_search_by(|probe| {
+                probe
+                    .y
+                    .cmp(&candidate.y)
+                    .then_with(|| probe.x.cmp(&candidate.x))
+            })
+            .unwrap_or_else(|pos| pos);
+        rects.insert(insert_at, candidate);
+    }
+}
+
+fn normalize_dirty_rects_optimized_v2(rects: &mut Vec<DirtyRect>, width: u32, height: u32) {
+    if rects.is_empty() {
+        return;
+    }
+
+    let mut pending = std::mem::take(rects);
+    let mut write = 0usize;
+    for read in 0..pending.len() {
+        if let Some(clamped) = clamp_dirty_rect(pending[read], width, height) {
+            pending[write] = clamped;
+            write += 1;
+        }
+    }
+    pending.truncate(write);
+    if pending.len() <= 1 {
+        *rects = pending;
+        return;
+    }
+
+    if should_use_legacy_dense_merge(&pending) {
+        *rects = pending;
+        normalize_dirty_rects_legacy_after_clamp(rects);
+        return;
+    }
+
+    pending.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
+
+    rects.reserve(pending.len());
+    for rect in pending {
+        let mut candidate = rect;
+        loop {
+            let mut merged_any = false;
+            let candidate_bottom = candidate.y.saturating_add(candidate.height);
+            let mut idx = 0usize;
+            while idx < rects.len() {
+                let existing = rects[idx];
+                let existing_bottom = existing.y.saturating_add(existing.height);
+                if existing_bottom < candidate.y {
+                    idx += 1;
+                    continue;
+                }
+                if existing.y > candidate_bottom {
+                    break;
+                }
+
+                if dirty_rects_can_merge(candidate, existing) {
+                    candidate = merge_dirty_rects(candidate, existing);
+                    // SAFETY: `idx` is bounded by the loop condition (`idx < rects.len()`).
+                    unsafe { remove_dirty_rect_at_unchecked(rects, idx) };
                     merged_any = true;
                 } else {
                     idx += 1;
@@ -377,7 +486,7 @@ fn parse_args() -> Result<(usize, usize, f64)> {
                     "Usage: cargo run --release --example wgc_dirty_rect_benchmark -- [options]
   --rounds <n>               Benchmark rounds per workload (default: {DEFAULT_ROUNDS})
   --iterations <n>           Iterations per workload per round (default: {DEFAULT_ITERATIONS})
-  --max-regression-pct <f>   Allowed optimized slowdown before failing (default: {DEFAULT_MAX_REGRESSION_PCT})"
+  --max-regression-pct <f>   Allowed optimized-v2 slowdown vs optimized-v1 before failing (default: {DEFAULT_MAX_REGRESSION_PCT})"
                 );
                 std::process::exit(0);
             }
@@ -400,16 +509,27 @@ fn parse_args() -> Result<(usize, usize, f64)> {
 
 fn verify_equivalence(workload: &Workload) -> Result<()> {
     let mut legacy = workload.rects.clone();
-    let mut optimized = workload.rects.clone();
+    let mut optimized_v1 = workload.rects.clone();
+    let mut optimized_v2 = workload.rects.clone();
     normalize_dirty_rects_legacy(&mut legacy, BENCH_WIDTH, BENCH_HEIGHT);
-    normalize_dirty_rects_optimized(&mut optimized, BENCH_WIDTH, BENCH_HEIGHT);
+    normalize_dirty_rects_optimized_v1(&mut optimized_v1, BENCH_WIDTH, BENCH_HEIGHT);
+    normalize_dirty_rects_optimized_v2(&mut optimized_v2, BENCH_WIDTH, BENCH_HEIGHT);
 
-    if legacy != optimized {
+    if legacy != optimized_v1 {
         bail!(
-            "normalized output mismatch for workload `{}` (legacy {} rects vs optimized {} rects)",
+            "normalized output mismatch for workload `{}` (legacy {} rects vs optimized-v1 {} rects)",
             workload.name,
             legacy.len(),
-            optimized.len()
+            optimized_v1.len()
+        );
+    }
+
+    if legacy != optimized_v2 {
+        bail!(
+            "normalized output mismatch for workload `{}` (legacy {} rects vs optimized-v2 {} rects)",
+            workload.name,
+            legacy.len(),
+            optimized_v2.len()
         );
     }
 
@@ -423,13 +543,23 @@ fn run_case(workload: &Workload, rounds: usize, iterations: usize) -> CaseTiming
         iterations,
         normalize_dirty_rects_legacy,
     );
-    let optimized = bench_variant(
+    let optimized_v1 = bench_variant(
         &workload.rects,
         rounds,
         iterations,
-        normalize_dirty_rects_optimized,
+        normalize_dirty_rects_optimized_v1,
     );
-    CaseTiming { legacy, optimized }
+    let optimized_v2 = bench_variant(
+        &workload.rects,
+        rounds,
+        iterations,
+        normalize_dirty_rects_optimized_v2,
+    );
+    CaseTiming {
+        legacy,
+        optimized_v1,
+        optimized_v2,
+    }
 }
 
 fn main() -> Result<()> {
@@ -445,8 +575,8 @@ fn main() -> Result<()> {
         rounds, iterations, max_regression_pct
     );
     println!(
-        "{:<20} {:>12} {:>12} {:>11}",
-        "workload", "legacy(ns)", "optimized(ns)", "speedup"
+        "{:<20} {:>12} {:>12} {:>12} {:>11} {:>11}",
+        "workload", "legacy(ns)", "opt-v1(ns)", "opt-v2(ns)", "v2/v1", "v2/legacy"
     );
 
     let mut regressions = Vec::new();
@@ -454,26 +584,32 @@ fn main() -> Result<()> {
         verify_equivalence(workload)?;
         let timing = run_case(workload, rounds, iterations);
         let legacy_ns = ns_per_iter(timing.legacy, iterations);
-        let optimized_ns = ns_per_iter(timing.optimized, iterations);
-        let speedup = if optimized_ns > 0.0 {
-            legacy_ns / optimized_ns
+        let optimized_v1_ns = ns_per_iter(timing.optimized_v1, iterations);
+        let optimized_v2_ns = ns_per_iter(timing.optimized_v2, iterations);
+        let v2_vs_v1 = if optimized_v2_ns > 0.0 {
+            optimized_v1_ns / optimized_v2_ns
+        } else {
+            f64::INFINITY
+        };
+        let v2_vs_legacy = if optimized_v2_ns > 0.0 {
+            legacy_ns / optimized_v2_ns
         } else {
             f64::INFINITY
         };
         println!(
-            "{:<20} {:>12.1} {:>12.1} {:>11.2}x",
-            workload.name, legacy_ns, optimized_ns, speedup
+            "{:<20} {:>12.1} {:>12.1} {:>12.1} {:>10.2}x {:>10.2}x",
+            workload.name, legacy_ns, optimized_v1_ns, optimized_v2_ns, v2_vs_v1, v2_vs_legacy
         );
 
-        let delta_pct = if legacy_ns > 0.0 {
-            ((optimized_ns - legacy_ns) / legacy_ns) * 100.0
+        let delta_pct = if optimized_v1_ns > 0.0 {
+            ((optimized_v2_ns - optimized_v1_ns) / optimized_v1_ns) * 100.0
         } else {
             0.0
         };
         if delta_pct > max_regression_pct {
             regressions.push(format!(
-                "{} regressed by {:.2}% (legacy {:.1} ns -> optimized {:.1} ns)",
-                workload.name, delta_pct, legacy_ns, optimized_ns
+                "{} regressed by {:.2}% (optimized-v1 {:.1} ns -> optimized-v2 {:.1} ns)",
+                workload.name, delta_pct, optimized_v1_ns, optimized_v2_ns
             ));
         }
     }

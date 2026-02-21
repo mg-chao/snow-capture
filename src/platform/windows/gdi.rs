@@ -191,6 +191,23 @@ fn gdi_incremental_span_convert_enabled() -> bool {
 }
 
 #[inline]
+fn gdi_incremental_span_single_scan_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_DISABLE_GDI_SPAN_SINGLE_SCAN")
+            .map(|raw| {
+                let normalized = raw.trim().to_ascii_lowercase();
+                !(normalized == "1"
+                    || normalized == "true"
+                    || normalized == "yes"
+                    || normalized == "on")
+            })
+            .unwrap_or(true)
+    })
+}
+
+#[inline]
 fn gdi_swap_history_surfaces_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1490,9 +1507,22 @@ impl GdiResources {
         let mut run_start = None::<usize>;
         let mut src_row = self.bits.cast_const();
         let mut history_row = history_base;
+        let span_single_scan = spans_enabled && gdi_incremental_span_single_scan_enabled();
 
         for row in 0..height {
-            let changed = unsafe { !compare_row(src_row, history_row.cast_const(), row_bytes) };
+            let mut dirty_span = None::<(usize, usize)>;
+            let changed = if spans_enabled {
+                if span_single_scan {
+                    dirty_span = unsafe {
+                        row_diff_span_pixels(src_row, history_row.cast_const(), row_bytes, width)
+                    };
+                    dirty_span.is_some()
+                } else {
+                    unsafe { !compare_row(src_row, history_row.cast_const(), row_bytes) }
+                }
+            } else {
+                unsafe { !compare_row(src_row, history_row.cast_const(), row_bytes) }
+            };
             if !changed {
                 if !spans_enabled && let Some(start) = run_start.take() {
                     self.dirty_row_runs.push(DirtyRowRun {
@@ -1503,16 +1533,27 @@ impl GdiResources {
             } else {
                 dirty_rows = dirty_rows.saturating_add(1);
 
+                let mut span_start_col = 0usize;
                 let row_dirty_pixels = if spans_enabled {
-                    let (start_col, end_col) = unsafe {
-                        row_diff_span_pixels(src_row, history_row.cast_const(), row_bytes, width)
-                    }
-                    .unwrap_or((0, width));
+                    let (start_col, end_col) = if let Some(span) = dirty_span {
+                        span
+                    } else {
+                        unsafe {
+                            row_diff_span_pixels(
+                                src_row,
+                                history_row.cast_const(),
+                                row_bytes,
+                                width,
+                            )
+                        }
+                        .unwrap_or((0, width))
+                    };
                     let span_width = end_col.saturating_sub(start_col);
                     let start_col_u32 =
                         u32::try_from(start_col).map_err(|_| CaptureError::BufferOverflow)?;
                     let span_width_u32 =
                         u32::try_from(span_width).map_err(|_| CaptureError::BufferOverflow)?;
+                    span_start_col = start_col;
                     self.dirty_row_spans[row] = DirtyRowSpan {
                         start_col: start_col_u32,
                         width: span_width_u32,
@@ -1524,8 +1565,32 @@ impl GdiResources {
                 dirty_pixels = dirty_pixels.saturating_add(row_dirty_pixels);
 
                 if copy_changed_rows_to_history {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(src_row, history_row, row_bytes);
+                    if spans_enabled && span_single_scan {
+                        let span_start_bytes = span_start_col
+                            .checked_mul(BGRA_BYTES_PER_PIXEL)
+                            .ok_or(CaptureError::BufferOverflow)?;
+                        let copy_bytes = row_dirty_pixels
+                            .checked_mul(BGRA_BYTES_PER_PIXEL)
+                            .ok_or(CaptureError::BufferOverflow)?;
+                        let span_end_bytes = span_start_bytes
+                            .checked_add(copy_bytes)
+                            .ok_or(CaptureError::BufferOverflow)?;
+                        if span_end_bytes > row_bytes {
+                            return Err(CaptureError::BufferOverflow);
+                        }
+                        if copy_bytes > 0 {
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    src_row.add(span_start_bytes),
+                                    history_row.add(span_start_bytes),
+                                    copy_bytes,
+                                );
+                            }
+                        }
+                    } else {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(src_row, history_row, row_bytes);
+                        }
                     }
                 }
                 if !spans_enabled && run_start.is_none() {
@@ -3026,5 +3091,202 @@ mod tests {
                 );
             }
         }
+    }
+
+    unsafe fn scan_dirty_pixels_legacy(
+        src_base: *const u8,
+        src_stride: usize,
+        history_base: *const u8,
+        history_stride: usize,
+        row_bytes: usize,
+        width: usize,
+        height: usize,
+        compare_row: RowCompareKernel,
+    ) -> usize {
+        let mut dirty_pixels = 0usize;
+        let mut src_row = src_base;
+        let mut history_row = history_base;
+        for _ in 0..height {
+            let changed = unsafe { !compare_row(src_row, history_row, row_bytes) };
+            if changed {
+                let (start_col, end_col) =
+                    unsafe { row_diff_span_pixels(src_row, history_row, row_bytes, width) }
+                        .unwrap_or((0, width));
+                dirty_pixels = dirty_pixels.saturating_add(end_col.saturating_sub(start_col));
+            }
+
+            unsafe {
+                src_row = src_row.add(src_stride);
+                history_row = history_row.add(history_stride);
+            }
+        }
+        dirty_pixels
+    }
+
+    unsafe fn scan_dirty_pixels_single_scan(
+        src_base: *const u8,
+        src_stride: usize,
+        history_base: *const u8,
+        history_stride: usize,
+        row_bytes: usize,
+        width: usize,
+        height: usize,
+    ) -> usize {
+        let mut dirty_pixels = 0usize;
+        let mut src_row = src_base;
+        let mut history_row = history_base;
+        for _ in 0..height {
+            if let Some((start_col, end_col)) =
+                unsafe { row_diff_span_pixels(src_row, history_row, row_bytes, width) }
+            {
+                dirty_pixels = dirty_pixels.saturating_add(end_col.saturating_sub(start_col));
+            }
+            unsafe {
+                src_row = src_row.add(src_stride);
+                history_row = history_row.add(history_stride);
+            }
+        }
+        dirty_pixels
+    }
+
+    #[test]
+    #[ignore = "performance benchmark guard; run explicitly with --ignored --nocapture"]
+    fn bench_span_single_scan_vs_legacy_sparse_damage() {
+        use std::hint::black_box;
+
+        let width = 1600usize;
+        let height = 900usize;
+        let row_bytes = width * BGRA_BYTES_PER_PIXEL;
+        let total_bytes = row_bytes * height;
+
+        let mut current = vec![0u8; total_bytes];
+        for (idx, value) in current.iter_mut().enumerate() {
+            *value = (idx as u8).wrapping_mul(31).wrapping_add(17);
+        }
+        let history = current.clone();
+
+        // Emulate sparse motion blocks, which is where span-bounded incremental
+        // conversion should dominate.
+        let span_width_pixels = 96usize;
+        let span_width_bytes = span_width_pixels * BGRA_BYTES_PER_PIXEL;
+        for row in (0..height).step_by(3) {
+            let start_col = (row * 37) % (width - span_width_pixels);
+            let row_offset = row * row_bytes;
+            let start = row_offset + start_col * BGRA_BYTES_PER_PIXEL;
+            let end = start + span_width_bytes;
+            for byte in &mut current[start..end] {
+                *byte ^= 0x5D;
+            }
+        }
+
+        let compare = row_compare_kernel();
+        let expected_legacy = unsafe {
+            scan_dirty_pixels_legacy(
+                current.as_ptr(),
+                row_bytes,
+                history.as_ptr(),
+                row_bytes,
+                row_bytes,
+                width,
+                height,
+                compare,
+            )
+        };
+        let expected_single = unsafe {
+            scan_dirty_pixels_single_scan(
+                current.as_ptr(),
+                row_bytes,
+                history.as_ptr(),
+                row_bytes,
+                row_bytes,
+                width,
+                height,
+            )
+        };
+        assert_eq!(expected_single, expected_legacy);
+
+        let warmup_iters = 20usize;
+        let measure_iters = 160usize;
+        let mut sink = 0usize;
+        for _ in 0..warmup_iters {
+            sink ^= unsafe {
+                scan_dirty_pixels_legacy(
+                    current.as_ptr(),
+                    row_bytes,
+                    history.as_ptr(),
+                    row_bytes,
+                    row_bytes,
+                    width,
+                    height,
+                    compare,
+                )
+            };
+            sink ^= unsafe {
+                scan_dirty_pixels_single_scan(
+                    current.as_ptr(),
+                    row_bytes,
+                    history.as_ptr(),
+                    row_bytes,
+                    row_bytes,
+                    width,
+                    height,
+                )
+            };
+        }
+        black_box(sink);
+
+        let legacy_start = Instant::now();
+        for _ in 0..measure_iters {
+            sink ^= unsafe {
+                scan_dirty_pixels_legacy(
+                    current.as_ptr(),
+                    row_bytes,
+                    history.as_ptr(),
+                    row_bytes,
+                    row_bytes,
+                    width,
+                    height,
+                    compare,
+                )
+            };
+        }
+        let legacy_elapsed = legacy_start.elapsed();
+
+        let single_start = Instant::now();
+        for _ in 0..measure_iters {
+            sink ^= unsafe {
+                scan_dirty_pixels_single_scan(
+                    current.as_ptr(),
+                    row_bytes,
+                    history.as_ptr(),
+                    row_bytes,
+                    row_bytes,
+                    width,
+                    height,
+                )
+            };
+        }
+        let single_elapsed = single_start.elapsed();
+        black_box(sink);
+
+        let legacy_ms = legacy_elapsed.as_secs_f64() * 1000.0;
+        let single_ms = single_elapsed.as_secs_f64() * 1000.0;
+        let improvement_pct = if legacy_ms > 0.0 {
+            ((legacy_ms - single_ms) / legacy_ms) * 100.0
+        } else {
+            0.0
+        };
+
+        println!(
+            "gdi span single-scan benchmark: legacy={legacy_ms:.3} ms single={single_ms:.3} ms improvement={improvement_pct:.2}%"
+        );
+
+        // Guardrail: allow minor timing noise, but fail if the optimized
+        // single-scan path regresses materially versus the legacy two-pass
+        // compare+span flow.
+        assert!(
+            single_ms <= legacy_ms * 1.02,
+            "single-scan path regressed: legacy={legacy_ms:.3}ms single={single_ms:.3}ms ({improvement_pct:.2}% improvement)"
+        );
     }
 }

@@ -376,6 +376,23 @@ fn merge_dirty_rects(a: DirtyRect, b: DirtyRect) -> DirtyRect {
     merged.rect
 }
 
+#[inline(always)]
+unsafe fn remove_dirty_rect_candidate_at_unchecked(
+    candidates: &mut Vec<DirtyRectMergeCandidate>,
+    idx: usize,
+) {
+    let len = candidates.len();
+    debug_assert!(idx < len);
+    let ptr = candidates.as_mut_ptr();
+    unsafe {
+        let tail_len = len - idx - 1;
+        if tail_len > 0 {
+            std::ptr::copy(ptr.add(idx + 1), ptr.add(idx), tail_len);
+        }
+        candidates.set_len(len - 1);
+    }
+}
+
 fn normalize_dirty_rects_legacy_after_clamp(rects: &mut Vec<DirtyRect>) {
     let mut changed = true;
     while changed {
@@ -441,27 +458,28 @@ fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height
     }
 
     pending.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
-    rects.reserve(pending.len());
+    let mut merged: Vec<DirtyRectMergeCandidate> = Vec::with_capacity(pending.len());
     for rect in pending {
-        let mut candidate = rect;
+        let mut candidate = DirtyRectMergeCandidate::new(rect);
         loop {
             let mut merged_any = false;
-            let candidate_bottom = candidate.y.saturating_add(candidate.height);
+            let mut candidate_bottom = candidate.bottom;
             let mut idx = 0usize;
-            while idx < rects.len() {
-                let existing = rects[idx];
-                let existing_bottom = existing.y.saturating_add(existing.height);
-                if existing_bottom < candidate.y {
+            while idx < merged.len() {
+                let existing = merged[idx];
+                if existing.bottom < candidate.rect.y {
                     idx += 1;
                     continue;
                 }
-                if existing.y > candidate_bottom {
+                if existing.rect.y > candidate_bottom {
                     break;
                 }
 
-                if dirty_rects_can_merge(candidate, existing) {
-                    candidate = merge_dirty_rects(candidate, existing);
-                    rects.remove(idx);
+                if candidate.can_merge(existing) {
+                    candidate.merge_in_place(existing);
+                    candidate_bottom = candidate.bottom;
+                    // SAFETY: `idx` is bounded by the loop condition (`idx < merged.len()`).
+                    unsafe { remove_dirty_rect_candidate_at_unchecked(&mut merged, idx) };
                     merged_any = true;
                 } else {
                     idx += 1;
@@ -473,16 +491,20 @@ fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height
             }
         }
 
-        let insert_at = rects
+        let insert_at = merged
             .binary_search_by(|probe| {
                 probe
+                    .rect
                     .y
-                    .cmp(&candidate.y)
-                    .then_with(|| probe.x.cmp(&candidate.x))
+                    .cmp(&candidate.rect.y)
+                    .then_with(|| probe.rect.x.cmp(&candidate.rect.x))
             })
             .unwrap_or_else(|pos| pos);
-        rects.insert(insert_at, candidate);
+        merged.insert(insert_at, candidate);
     }
+
+    rects.reserve(merged.len());
+    rects.extend(merged.into_iter().map(|candidate| candidate.rect));
 }
 
 #[cfg(test)]

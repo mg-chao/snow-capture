@@ -23,6 +23,7 @@ struct CaseTiming {
     legacy: Duration,
     optimized_v1: Duration,
     optimized_v2: Duration,
+    optimized_v3: Duration,
 }
 
 fn clamp_dirty_rect(rect: DirtyRect, width: u32, height: u32) -> Option<DirtyRect> {
@@ -187,10 +188,31 @@ fn normalize_dirty_rects_legacy_after_clamp(rects: &mut Vec<DirtyRect>) {
 #[inline(always)]
 unsafe fn remove_dirty_rect_at_unchecked(rects: &mut Vec<DirtyRect>, idx: usize) {
     let len = rects.len();
+    debug_assert!(idx < len);
     let ptr = rects.as_mut_ptr();
     unsafe {
-        std::ptr::copy(ptr.add(idx + 1), ptr.add(idx), len - idx - 1);
+        let tail_len = len - idx - 1;
+        if tail_len > 0 {
+            std::ptr::copy(ptr.add(idx + 1), ptr.add(idx), tail_len);
+        }
         rects.set_len(len - 1);
+    }
+}
+
+#[inline(always)]
+unsafe fn remove_merge_candidate_at_unchecked(
+    candidates: &mut Vec<DirtyRectMergeCandidate>,
+    idx: usize,
+) {
+    let len = candidates.len();
+    debug_assert!(idx < len);
+    let ptr = candidates.as_mut_ptr();
+    unsafe {
+        let tail_len = len - idx - 1;
+        if tail_len > 0 {
+            std::ptr::copy(ptr.add(idx + 1), ptr.add(idx), tail_len);
+        }
+        candidates.set_len(len - 1);
     }
 }
 
@@ -353,6 +375,82 @@ fn normalize_dirty_rects_optimized_v2(rects: &mut Vec<DirtyRect>, width: u32, he
     }
 }
 
+fn normalize_dirty_rects_optimized_v3(rects: &mut Vec<DirtyRect>, width: u32, height: u32) {
+    if rects.is_empty() {
+        return;
+    }
+
+    let mut pending = std::mem::take(rects);
+    let mut write = 0usize;
+    for read in 0..pending.len() {
+        if let Some(clamped) = clamp_dirty_rect(pending[read], width, height) {
+            pending[write] = clamped;
+            write += 1;
+        }
+    }
+    pending.truncate(write);
+    if pending.len() <= 1 {
+        *rects = pending;
+        return;
+    }
+
+    if should_use_legacy_dense_merge(&pending) {
+        *rects = pending;
+        normalize_dirty_rects_legacy_after_clamp(rects);
+        return;
+    }
+
+    pending.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
+
+    let mut merged: Vec<DirtyRectMergeCandidate> = Vec::with_capacity(pending.len());
+    for rect in pending {
+        let mut candidate = DirtyRectMergeCandidate::new(rect);
+        loop {
+            let mut merged_any = false;
+            let mut candidate_bottom = candidate.bottom;
+            let mut idx = 0usize;
+            while idx < merged.len() {
+                let existing = merged[idx];
+                if existing.bottom < candidate.rect.y {
+                    idx += 1;
+                    continue;
+                }
+                if existing.rect.y > candidate_bottom {
+                    break;
+                }
+
+                if candidate.can_merge(existing) {
+                    candidate.merge_in_place(existing);
+                    candidate_bottom = candidate.bottom;
+                    // SAFETY: `idx` is bounded by the loop condition (`idx < merged.len()`).
+                    unsafe { remove_merge_candidate_at_unchecked(&mut merged, idx) };
+                    merged_any = true;
+                } else {
+                    idx += 1;
+                }
+            }
+
+            if !merged_any {
+                break;
+            }
+        }
+
+        let insert_at = merged
+            .binary_search_by(|probe| {
+                probe
+                    .rect
+                    .y
+                    .cmp(&candidate.rect.y)
+                    .then_with(|| probe.rect.x.cmp(&candidate.rect.x))
+            })
+            .unwrap_or_else(|pos| pos);
+        merged.insert(insert_at, candidate);
+    }
+
+    rects.reserve(merged.len());
+    rects.extend(merged.into_iter().map(|candidate| candidate.rect));
+}
+
 fn workload_sparse_grid() -> Workload {
     let mut rects = Vec::new();
     for y in (0..BENCH_HEIGHT).step_by(90) {
@@ -486,7 +584,7 @@ fn parse_args() -> Result<(usize, usize, f64)> {
                     "Usage: cargo run --release --example wgc_dirty_rect_benchmark -- [options]
   --rounds <n>               Benchmark rounds per workload (default: {DEFAULT_ROUNDS})
   --iterations <n>           Iterations per workload per round (default: {DEFAULT_ITERATIONS})
-  --max-regression-pct <f>   Allowed safe-remove slowdown vs unsafe-remove before failing (default: {DEFAULT_MAX_REGRESSION_PCT})"
+  --max-regression-pct <f>   Allowed cached-merge slowdown vs baseline-safe before failing (default: {DEFAULT_MAX_REGRESSION_PCT})"
                 );
                 std::process::exit(0);
             }
@@ -511,9 +609,11 @@ fn verify_equivalence(workload: &Workload) -> Result<()> {
     let mut legacy = workload.rects.clone();
     let mut optimized_v1 = workload.rects.clone();
     let mut optimized_v2 = workload.rects.clone();
+    let mut optimized_v3 = workload.rects.clone();
     normalize_dirty_rects_legacy(&mut legacy, BENCH_WIDTH, BENCH_HEIGHT);
     normalize_dirty_rects_optimized_v1(&mut optimized_v1, BENCH_WIDTH, BENCH_HEIGHT);
     normalize_dirty_rects_optimized_v2(&mut optimized_v2, BENCH_WIDTH, BENCH_HEIGHT);
+    normalize_dirty_rects_optimized_v3(&mut optimized_v3, BENCH_WIDTH, BENCH_HEIGHT);
 
     if legacy != optimized_v1 {
         bail!(
@@ -530,6 +630,15 @@ fn verify_equivalence(workload: &Workload) -> Result<()> {
             workload.name,
             legacy.len(),
             optimized_v2.len()
+        );
+    }
+
+    if legacy != optimized_v3 {
+        bail!(
+            "normalized output mismatch for workload `{}` (legacy {} rects vs optimized-v3 {} rects)",
+            workload.name,
+            legacy.len(),
+            optimized_v3.len()
         );
     }
 
@@ -555,10 +664,17 @@ fn run_case(workload: &Workload, rounds: usize, iterations: usize) -> CaseTiming
         iterations,
         normalize_dirty_rects_optimized_v2,
     );
+    let optimized_v3 = bench_variant(
+        &workload.rects,
+        rounds,
+        iterations,
+        normalize_dirty_rects_optimized_v3,
+    );
     CaseTiming {
         legacy,
         optimized_v1,
         optimized_v2,
+        optimized_v3,
     }
 }
 
@@ -575,8 +691,14 @@ fn main() -> Result<()> {
         rounds, iterations, max_regression_pct
     );
     println!(
-        "{:<20} {:>12} {:>12} {:>12} {:>12} {:>12}",
-        "workload", "legacy(ns)", "safe(ns)", "unsafe(ns)", "safe/unsafe", "safe/legacy"
+        "{:<20} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "workload",
+        "legacy(ns)",
+        "safe(ns)",
+        "unsafe(ns)",
+        "cached(ns)",
+        "safe/cached",
+        "cached/legacy"
     );
 
     let mut regressions = Vec::new();
@@ -586,30 +708,37 @@ fn main() -> Result<()> {
         let legacy_ns = ns_per_iter(timing.legacy, iterations);
         let safe_ns = ns_per_iter(timing.optimized_v1, iterations);
         let unsafe_ns = ns_per_iter(timing.optimized_v2, iterations);
-        let safe_vs_unsafe = if unsafe_ns > 0.0 {
-            safe_ns / unsafe_ns
+        let cached_ns = ns_per_iter(timing.optimized_v3, iterations);
+        let safe_vs_cached = if cached_ns > 0.0 {
+            safe_ns / cached_ns
         } else {
             f64::INFINITY
         };
-        let safe_vs_legacy = if legacy_ns > 0.0 {
-            safe_ns / legacy_ns
+        let cached_vs_legacy = if legacy_ns > 0.0 {
+            cached_ns / legacy_ns
         } else {
             f64::INFINITY
         };
         println!(
-            "{:<20} {:>12.1} {:>12.1} {:>12.1} {:>11.2}x {:>11.2}x",
-            workload.name, legacy_ns, safe_ns, unsafe_ns, safe_vs_unsafe, safe_vs_legacy
+            "{:<20} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>11.2}x {:>11.2}x",
+            workload.name,
+            legacy_ns,
+            safe_ns,
+            unsafe_ns,
+            cached_ns,
+            safe_vs_cached,
+            cached_vs_legacy
         );
 
-        let delta_pct = if unsafe_ns > 0.0 {
-            ((safe_ns - unsafe_ns) / unsafe_ns) * 100.0
+        let delta_pct = if safe_ns > 0.0 {
+            ((cached_ns - safe_ns) / safe_ns) * 100.0
         } else {
             0.0
         };
         if delta_pct > max_regression_pct {
             regressions.push(format!(
-                "{} regressed by {:.2}% (unsafe {:.1} ns -> safe {:.1} ns)",
-                workload.name, delta_pct, unsafe_ns, safe_ns
+                "{} regressed by {:.2}% (safe {:.1} ns -> cached {:.1} ns)",
+                workload.name, delta_pct, safe_ns, cached_ns
             ));
         }
     }

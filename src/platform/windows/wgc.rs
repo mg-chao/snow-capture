@@ -43,6 +43,10 @@ const WGC_STALE_FRAME_TIMEOUT_MAX: Duration = Duration::from_millis(2);
 const WGC_STALE_FRAME_TIMEOUT_INITIAL: Duration = WGC_STALE_FRAME_TIMEOUT_MAX;
 const WGC_STALE_FRAME_TIMEOUT_DECREASE_STEP: Duration = Duration::from_micros(200);
 const WGC_STALE_FRAME_TIMEOUT_INCREASE_STEP: Duration = Duration::from_micros(100);
+const WGC_STALE_FRAME_TIMEOUT_AGGRESSIVE_MAX: Duration = Duration::from_micros(900);
+const WGC_STALE_FRAME_TIMEOUT_AGGRESSIVE_INITIAL: Duration = WGC_STALE_FRAME_TIMEOUT_AGGRESSIVE_MAX;
+const WGC_STALE_FRAME_TIMEOUT_AGGRESSIVE_DECREASE_STEP: Duration = Duration::from_micros(120);
+const WGC_STALE_FRAME_TIMEOUT_AGGRESSIVE_INCREASE_STEP: Duration = Duration::from_micros(60);
 const WGC_FRAME_POOL_BUFFERS: i32 = 2;
 const WGC_STAGING_SLOTS: usize = 2;
 const WGC_DIRTY_COPY_MAX_RECTS: usize = 192;
@@ -55,6 +59,15 @@ const WGC_QUERY_SPIN_MIN_POLLS: u32 = 2;
 const WGC_QUERY_SPIN_MAX_POLLS: u32 = 64;
 const WGC_QUERY_SPIN_INITIAL_POLLS: u32 = 4;
 const WGC_QUERY_SPIN_INCREASE_STEP: u32 = 4;
+
+#[derive(Clone, Copy)]
+struct WgcStaleTimeoutConfig {
+    min: Duration,
+    max: Duration,
+    initial: Duration,
+    decrease_step: Duration,
+    increase_step: Duration,
+}
 
 #[inline]
 fn env_var_truthy(var_name: &'static str) -> bool {
@@ -101,6 +114,38 @@ fn borrowed_source_resource_cast_enabled() -> bool {
 fn borrowed_slot_resource_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_BORROWED_SLOT_RESOURCE"))
+}
+
+#[inline]
+fn aggressive_stale_timeout_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_AGGRESSIVE_STALE_TIMEOUT"))
+}
+
+#[inline(always)]
+fn stale_timeout_config(aggressive: bool) -> WgcStaleTimeoutConfig {
+    if aggressive {
+        WgcStaleTimeoutConfig {
+            min: WGC_STALE_FRAME_TIMEOUT_MIN,
+            max: WGC_STALE_FRAME_TIMEOUT_AGGRESSIVE_MAX,
+            initial: WGC_STALE_FRAME_TIMEOUT_AGGRESSIVE_INITIAL,
+            decrease_step: WGC_STALE_FRAME_TIMEOUT_AGGRESSIVE_DECREASE_STEP,
+            increase_step: WGC_STALE_FRAME_TIMEOUT_AGGRESSIVE_INCREASE_STEP,
+        }
+    } else {
+        WgcStaleTimeoutConfig {
+            min: WGC_STALE_FRAME_TIMEOUT_MIN,
+            max: WGC_STALE_FRAME_TIMEOUT_MAX,
+            initial: WGC_STALE_FRAME_TIMEOUT_INITIAL,
+            decrease_step: WGC_STALE_FRAME_TIMEOUT_DECREASE_STEP,
+            increase_step: WGC_STALE_FRAME_TIMEOUT_INCREASE_STEP,
+        }
+    }
+}
+
+#[inline(always)]
+fn active_stale_timeout_config() -> WgcStaleTimeoutConfig {
+    stale_timeout_config(aggressive_stale_timeout_enabled())
 }
 
 #[inline(always)]
@@ -589,6 +634,7 @@ struct WindowsGraphicsCaptureCapturer {
     /// Last present timestamp emitted to callers.
     last_emitted_present_time: i64,
     stale_poll_spins: u32,
+    stale_timeout_config: WgcStaleTimeoutConfig,
     stale_frame_timeout: Duration,
     adaptive_spin_polls: u32,
     region_adaptive_spin_polls: u32,
@@ -621,6 +667,7 @@ impl WindowsGraphicsCaptureCapturer {
         item: GraphicsCaptureItem,
         hdr_metadata: Option<HdrMonitorMetadata>,
     ) -> CaptureResult<Self> {
+        let stale_timeout_config = active_stale_timeout_config();
         let winrt_device = create_winrt_device(&device)?;
         let pool_size = item
             .Size()
@@ -754,7 +801,8 @@ impl WindowsGraphicsCaptureCapturer {
             last_present_time: 0,
             last_emitted_present_time: 0,
             stale_poll_spins: WGC_STALE_POLL_SPIN_INITIAL,
-            stale_frame_timeout: WGC_STALE_FRAME_TIMEOUT_INITIAL,
+            stale_timeout_config,
+            stale_frame_timeout: stale_timeout_config.initial,
             adaptive_spin_polls: WGC_QUERY_SPIN_INITIAL_POLLS,
             region_adaptive_spin_polls: WGC_QUERY_SPIN_INITIAL_POLLS,
             capture_mode: CaptureMode::Screenshot,
@@ -845,8 +893,8 @@ impl WindowsGraphicsCaptureCapturer {
     fn tighten_stale_timeout(&mut self) {
         self.stale_frame_timeout = duration_saturating_sub_clamped(
             self.stale_frame_timeout,
-            WGC_STALE_FRAME_TIMEOUT_DECREASE_STEP,
-            WGC_STALE_FRAME_TIMEOUT_MIN,
+            self.stale_timeout_config.decrease_step,
+            self.stale_timeout_config.min,
         );
     }
 
@@ -854,14 +902,14 @@ impl WindowsGraphicsCaptureCapturer {
     fn relax_stale_timeout(&mut self) {
         self.stale_frame_timeout = duration_saturating_add_clamped(
             self.stale_frame_timeout,
-            WGC_STALE_FRAME_TIMEOUT_INCREASE_STEP,
-            WGC_STALE_FRAME_TIMEOUT_MAX,
+            self.stale_timeout_config.increase_step,
+            self.stale_timeout_config.max,
         );
     }
 
     #[inline(always)]
     fn reset_stale_timeout_window(&mut self) {
-        self.stale_frame_timeout = WGC_STALE_FRAME_TIMEOUT_INITIAL;
+        self.stale_frame_timeout = self.stale_timeout_config.initial;
     }
 
     fn acquire_next_frame_or_stale(
@@ -1005,7 +1053,7 @@ impl WindowsGraphicsCaptureCapturer {
         self.has_frame_history = false;
         self.last_emitted_present_time = 0;
         self.stale_poll_spins = WGC_STALE_POLL_SPIN_INITIAL;
-        self.stale_frame_timeout = WGC_STALE_FRAME_TIMEOUT_INITIAL;
+        self.stale_frame_timeout = self.stale_timeout_config.initial;
         self.adaptive_spin_polls = WGC_QUERY_SPIN_INITIAL_POLLS;
         self.source_dirty_rects_scratch.clear();
     }
@@ -2787,6 +2835,27 @@ mod tests {
         assert!(dirty_region_mode_supported(
             GraphicsCaptureDirtyRegionMode::ReportAndRender
         ));
+    }
+
+    #[test]
+    fn aggressive_stale_timeout_profile_is_tighter_than_legacy_profile() {
+        let legacy = stale_timeout_config(false);
+        let aggressive = stale_timeout_config(true);
+        assert!(aggressive.initial < legacy.initial);
+        assert!(aggressive.max < legacy.max);
+        assert!(aggressive.increase_step <= legacy.increase_step);
+        assert!(aggressive.decrease_step <= legacy.decrease_step);
+        assert_eq!(aggressive.min, legacy.min);
+    }
+
+    #[test]
+    fn stale_timeout_profiles_respect_bounds() {
+        for config in [stale_timeout_config(false), stale_timeout_config(true)] {
+            assert!(config.min <= config.initial);
+            assert!(config.initial <= config.max);
+            assert!(!config.decrease_step.is_zero());
+            assert!(!config.increase_step.is_zero());
+        }
     }
 
     #[test]

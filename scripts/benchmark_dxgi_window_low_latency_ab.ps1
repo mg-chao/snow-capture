@@ -1,16 +1,17 @@
 param(
-    [string]$BaselinePath = "target/perf/dxgi-window-ab-baseline.csv",
-    [string]$TargetLabel = "dxgi-window-animated",
+    [string]$BaselinePath = "target/perf/dxgi-window-low-latency-ab-baseline.csv",
+    [string]$TargetLabel = "dxgi-window-low-latency",
     [int]$WarmupFrames = 80,
     [int]$MeasureFrames = 600,
     [int]$Rounds = 5,
     [double]$SampleIntervalMs = 8.0,
     [double]$MaxRegressionPct = 0.0,
     [double]$MaxDuplicatePct = 70.0,
-    [int]$WorkloadWidth = 960,
-    [int]$WorkloadHeight = 540,
+    [long]$LowLatencyMaxPixels = 1048576,
+    [int]$WorkloadWidth = 1600,
+    [int]$WorkloadHeight = 900,
     [int]$WorkloadX = 180,
-    [int]$WorkloadY = 160,
+    [int]$WorkloadY = 120,
     [int]$WorkloadIntervalMs = 8,
     [switch]$SaveBaselineOnly
 )
@@ -21,7 +22,7 @@ if (-not (Test-Path $workloadScript)) {
     exit 1
 }
 
-$workloadInfoPath = "target/perf/dxgi-window-workload.json"
+$workloadInfoPath = "target/perf/dxgi-window-low-latency-workload.json"
 if (Test-Path $workloadInfoPath) {
     Remove-Item $workloadInfoPath -Force
 }
@@ -46,33 +47,28 @@ if ($baselineDir -and -not (Test-Path $baselineDir)) {
 
 $workloadProcess = Start-Process -FilePath powershell.exe -ArgumentList $workloadArgs -PassThru
 
-function Invoke-DxgiBenchmark {
+function Invoke-DxgiWindowBenchmark {
     param(
         [string[]]$BenchmarkArgs,
-        [bool]$DisableOptimizations
+        [bool]$ForceLegacyLowLatency,
+        [long]$AdaptiveMaxPixels
     )
 
-    $oldDisableDirtyGpuCopy = $env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_GPU_COPY
-    $oldDisableDirectDirtyExtract = $env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_DIRECT_EXTRACT
-    $oldDisableWindowMonitorCache = $env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_MONITOR_CACHE
     $oldDisableWindowLowLatency = $env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_LOW_LATENCY_REGION
     $oldForceWindowLowLatency = $env:SNOW_CAPTURE_DXGI_FORCE_WINDOW_LOW_LATENCY_REGION
     $oldWindowLowLatencyMaxPixels = $env:SNOW_CAPTURE_DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS
 
     try {
-        if ($DisableOptimizations) {
-            $env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_GPU_COPY = "1"
-            $env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_DIRECT_EXTRACT = "1"
-            $env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_MONITOR_CACHE = "1"
-            $env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_LOW_LATENCY_REGION = "1"
-            Remove-Item Env:SNOW_CAPTURE_DXGI_FORCE_WINDOW_LOW_LATENCY_REGION -ErrorAction SilentlyContinue
-            Remove-Item Env:SNOW_CAPTURE_DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS -ErrorAction SilentlyContinue
+        Remove-Item Env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_LOW_LATENCY_REGION -ErrorAction SilentlyContinue
+        if ($ForceLegacyLowLatency) {
+            $env:SNOW_CAPTURE_DXGI_FORCE_WINDOW_LOW_LATENCY_REGION = "1"
         } else {
-            Remove-Item Env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_GPU_COPY -ErrorAction SilentlyContinue
-            Remove-Item Env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_DIRECT_EXTRACT -ErrorAction SilentlyContinue
-            Remove-Item Env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_MONITOR_CACHE -ErrorAction SilentlyContinue
-            Remove-Item Env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_LOW_LATENCY_REGION -ErrorAction SilentlyContinue
             Remove-Item Env:SNOW_CAPTURE_DXGI_FORCE_WINDOW_LOW_LATENCY_REGION -ErrorAction SilentlyContinue
+        }
+
+        if ($AdaptiveMaxPixels -gt 0) {
+            $env:SNOW_CAPTURE_DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS = [string]$AdaptiveMaxPixels
+        } else {
             Remove-Item Env:SNOW_CAPTURE_DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS -ErrorAction SilentlyContinue
         }
 
@@ -88,21 +84,6 @@ function Invoke-DxgiBenchmark {
         return [int]$cargoProcess.ExitCode
     }
     finally {
-        if ($null -ne $oldDisableDirtyGpuCopy) {
-            $env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_GPU_COPY = $oldDisableDirtyGpuCopy
-        } else {
-            Remove-Item Env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_GPU_COPY -ErrorAction SilentlyContinue
-        }
-        if ($null -ne $oldDisableDirectDirtyExtract) {
-            $env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_DIRECT_EXTRACT = $oldDisableDirectDirtyExtract
-        } else {
-            Remove-Item Env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_DIRECT_EXTRACT -ErrorAction SilentlyContinue
-        }
-        if ($null -ne $oldDisableWindowMonitorCache) {
-            $env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_MONITOR_CACHE = $oldDisableWindowMonitorCache
-        } else {
-            Remove-Item Env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_MONITOR_CACHE -ErrorAction SilentlyContinue
-        }
         if ($null -ne $oldDisableWindowLowLatency) {
             $env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_LOW_LATENCY_REGION = $oldDisableWindowLowLatency
         } else {
@@ -152,15 +133,16 @@ try {
     )
 
     Write-Host "Benchmark window handle: $windowHandle"
+    Write-Host "Adaptive low-latency max pixels: $LowLatencyMaxPixels"
 
-    Write-Host "Collecting baseline with region dirty GPU copy disabled..."
-    $baselineExitCode = Invoke-DxgiBenchmark -BenchmarkArgs ($commonArgs + @("--save-baseline", $BaselinePath)) -DisableOptimizations $true
+    Write-Host "Collecting baseline with forced legacy low-latency path..."
+    $baselineExitCode = Invoke-DxgiWindowBenchmark -BenchmarkArgs ($commonArgs + @("--save-baseline", $BaselinePath)) -ForceLegacyLowLatency $true -AdaptiveMaxPixels $LowLatencyMaxPixels
     if ($baselineExitCode -ne 0) {
         exit $baselineExitCode
     }
 
     if ($SaveBaselineOnly) {
-        Write-Host "Saved disabled-optimization baseline to $BaselinePath"
+        Write-Host "Saved forced-low-latency baseline to $BaselinePath"
         exit 0
     }
 
@@ -169,13 +151,13 @@ try {
         exit 1
     }
 
-    Write-Host "Running optimized benchmark and regression guard..."
-    $optimizedExitCode = Invoke-DxgiBenchmark -BenchmarkArgs (
+    Write-Host "Running adaptive low-latency benchmark and regression guard..."
+    $optimizedExitCode = Invoke-DxgiWindowBenchmark -BenchmarkArgs (
         $commonArgs + @(
             "--baseline", $BaselinePath,
             "--max-regression-pct", $MaxRegressionPct
         )
-    ) -DisableOptimizations $false
+    ) -ForceLegacyLowLatency $false -AdaptiveMaxPixels $LowLatencyMaxPixels
 
     exit $optimizedExitCode
 }

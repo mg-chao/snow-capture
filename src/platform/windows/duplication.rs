@@ -51,6 +51,7 @@ const DXGI_DIRTY_GPU_COPY_MAX_RECTS: usize = 64;
 const DXGI_DIRTY_GPU_COPY_MAX_AREA_PERCENT: u64 = 45;
 const DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS: usize = 8;
 const DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT: u64 = 18;
+const DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS_DEFAULT: u64 = 1_048_576;
 const DXGI_REGION_STAGING_SLOTS: usize = 3;
 const DXGI_REGION_DIRTY_TRACK_MAX_RECTS: usize = DXGI_DIRTY_COPY_MAX_RECTS + 1;
 
@@ -62,6 +63,14 @@ fn env_var_truthy(var_name: &'static str) -> bool {
             normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
         })
         .unwrap_or(false)
+}
+
+#[inline]
+fn env_var_positive_u64(var_name: &'static str) -> Option<u64> {
+    std::env::var(var_name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
 }
 
 #[inline]
@@ -93,6 +102,21 @@ fn window_monitor_cache_enabled() -> bool {
 fn window_low_latency_region_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_WINDOW_LOW_LATENCY_REGION"))
+}
+
+#[inline]
+fn window_low_latency_force_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_var_truthy("SNOW_CAPTURE_DXGI_FORCE_WINDOW_LOW_LATENCY_REGION"))
+}
+
+#[inline]
+fn window_low_latency_max_pixels() -> u64 {
+    static MAX_PIXELS: OnceLock<u64> = OnceLock::new();
+    *MAX_PIXELS.get_or_init(|| {
+        env_var_positive_u64("SNOW_CAPTURE_DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS")
+            .unwrap_or(DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS_DEFAULT)
+    })
 }
 
 #[inline]
@@ -1046,6 +1070,50 @@ fn should_use_low_latency_dirty_gpu_copy(rects: &[DirtyRect], width: u32, height
 }
 
 #[inline(always)]
+fn choose_window_low_latency_region_mode(
+    recording_mode: bool,
+    prefer_low_latency: bool,
+    low_latency_enabled: bool,
+    force_low_latency: bool,
+    max_low_latency_pixels: u64,
+    blit: CaptureBlitRegion,
+    low_latency_dirty_gpu_preferred: bool,
+) -> bool {
+    if !recording_mode || !prefer_low_latency || !low_latency_enabled {
+        return false;
+    }
+
+    if force_low_latency {
+        return true;
+    }
+
+    let region_pixels = u64::from(blit.width).saturating_mul(u64::from(blit.height));
+    if region_pixels == 0 {
+        return false;
+    }
+
+    region_pixels <= max_low_latency_pixels || low_latency_dirty_gpu_preferred
+}
+
+#[inline(always)]
+fn should_use_window_low_latency_region_path(
+    recording_mode: bool,
+    prefer_low_latency: bool,
+    blit: CaptureBlitRegion,
+    low_latency_dirty_gpu_preferred: bool,
+) -> bool {
+    choose_window_low_latency_region_mode(
+        recording_mode,
+        prefer_low_latency,
+        window_low_latency_region_enabled(),
+        window_low_latency_force_enabled(),
+        window_low_latency_max_pixels(),
+        blit,
+        low_latency_dirty_gpu_preferred,
+    )
+}
+
+#[inline(always)]
 fn should_skip_screenrecord_submit_copy(
     fastpath_enabled: bool,
     has_pending_submission: bool,
@@ -1818,8 +1886,24 @@ impl OutputCapturer {
             }
 
             let recording_mode = self.capture_mode == CaptureMode::ScreenRecording;
-            let low_latency_recording =
-                recording_mode && prefer_low_latency && window_low_latency_region_enabled();
+            let low_latency_dirty_gpu_preferred = region_dirty_available
+                && should_use_low_latency_dirty_gpu_copy(
+                    &region_dirty_rects,
+                    region_desc.Width,
+                    region_desc.Height,
+                );
+            let regular_dirty_gpu_preferred = region_dirty_available
+                && should_use_dirty_gpu_copy(
+                    &region_dirty_rects,
+                    region_desc.Width,
+                    region_desc.Height,
+                );
+            let low_latency_recording = should_use_window_low_latency_region_path(
+                recording_mode,
+                prefer_low_latency,
+                blit,
+                low_latency_dirty_gpu_preferred,
+            );
             let write_slot = if low_latency_recording {
                 self.region_pending_slot.unwrap_or(0)
             } else if recording_mode {
@@ -1867,17 +1951,9 @@ impl OutputCapturer {
                     slot.dirty_rects.clear();
                     slot.dirty_rects.extend_from_slice(&region_dirty_rects);
                     let dirty_gpu_copy_preferred = if low_latency_recording {
-                        should_use_low_latency_dirty_gpu_copy(
-                            &slot.dirty_rects,
-                            region_desc.Width,
-                            region_desc.Height,
-                        )
+                        low_latency_dirty_gpu_preferred
                     } else {
-                        should_use_dirty_gpu_copy(
-                            &slot.dirty_rects,
-                            region_desc.Width,
-                            region_desc.Height,
-                        )
+                        regular_dirty_gpu_preferred
                     };
                     slot.dirty_copy_preferred = can_use_dirty_gpu_copy
                         && region_dirty_available
@@ -2664,6 +2740,113 @@ mod tests {
             DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS + 1
         ];
         assert!(!should_use_low_latency_dirty_gpu_copy(&rects, 1920, 1080));
+    }
+
+    fn test_blit(width: u32, height: u32) -> CaptureBlitRegion {
+        CaptureBlitRegion {
+            src_x: 0,
+            src_y: 0,
+            width,
+            height,
+            dst_x: 0,
+            dst_y: 0,
+        }
+    }
+
+    #[test]
+    fn window_low_latency_mode_prefers_small_regions() {
+        assert!(choose_window_low_latency_region_mode(
+            true,
+            true,
+            true,
+            false,
+            1_048_576,
+            test_blit(1280, 720),
+            false
+        ));
+    }
+
+    #[test]
+    fn window_low_latency_mode_requires_recording_preference_and_enablement() {
+        assert!(!choose_window_low_latency_region_mode(
+            false,
+            true,
+            true,
+            true,
+            DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS_DEFAULT,
+            test_blit(1280, 720),
+            true
+        ));
+        assert!(!choose_window_low_latency_region_mode(
+            true,
+            false,
+            true,
+            true,
+            DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS_DEFAULT,
+            test_blit(1280, 720),
+            true
+        ));
+        assert!(!choose_window_low_latency_region_mode(
+            true,
+            true,
+            false,
+            true,
+            DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS_DEFAULT,
+            test_blit(1280, 720),
+            true
+        ));
+    }
+
+    #[test]
+    fn window_low_latency_mode_uses_pipeline_for_large_regions_without_sparse_damage() {
+        assert!(!choose_window_low_latency_region_mode(
+            true,
+            true,
+            true,
+            false,
+            1_048_576,
+            test_blit(1920, 1080),
+            false
+        ));
+    }
+
+    #[test]
+    fn window_low_latency_mode_rejects_zero_sized_regions_without_force() {
+        assert!(!choose_window_low_latency_region_mode(
+            true,
+            true,
+            true,
+            false,
+            DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS_DEFAULT,
+            test_blit(0, 720),
+            false
+        ));
+    }
+
+    #[test]
+    fn window_low_latency_mode_keeps_low_latency_for_sparse_large_updates() {
+        assert!(choose_window_low_latency_region_mode(
+            true,
+            true,
+            true,
+            false,
+            1_048_576,
+            test_blit(1920, 1080),
+            true
+        ));
+    }
+
+    #[test]
+    fn window_low_latency_mode_force_flag_overrides_thresholds() {
+        assert!(choose_window_low_latency_region_mode(
+            true,
+            true,
+            true,
+            true,
+            1,
+            test_blit(3840, 2160),
+            false
+        ));
     }
 
     #[test]

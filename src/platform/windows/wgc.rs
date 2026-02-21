@@ -38,7 +38,11 @@ use super::monitor::{HdrMonitorMetadata, MonitorResolver};
 use super::surface::{self, StagingSampleDesc};
 
 const WGC_FRAME_TIMEOUT: Duration = Duration::from_millis(250);
-const WGC_STALE_FRAME_TIMEOUT: Duration = Duration::from_millis(2);
+const WGC_STALE_FRAME_TIMEOUT_MIN: Duration = Duration::from_micros(400);
+const WGC_STALE_FRAME_TIMEOUT_MAX: Duration = Duration::from_millis(2);
+const WGC_STALE_FRAME_TIMEOUT_INITIAL: Duration = WGC_STALE_FRAME_TIMEOUT_MAX;
+const WGC_STALE_FRAME_TIMEOUT_DECREASE_STEP: Duration = Duration::from_micros(200);
+const WGC_STALE_FRAME_TIMEOUT_INCREASE_STEP: Duration = Duration::from_micros(100);
 const WGC_FRAME_POOL_BUFFERS: i32 = 2;
 const WGC_STAGING_SLOTS: usize = 2;
 const WGC_DIRTY_COPY_MAX_RECTS: usize = 192;
@@ -51,6 +55,16 @@ const WGC_QUERY_SPIN_MIN_POLLS: u32 = 2;
 const WGC_QUERY_SPIN_MAX_POLLS: u32 = 64;
 const WGC_QUERY_SPIN_INITIAL_POLLS: u32 = 4;
 const WGC_QUERY_SPIN_INCREASE_STEP: u32 = 4;
+
+#[inline(always)]
+fn duration_saturating_add_clamped(base: Duration, delta: Duration, max: Duration) -> Duration {
+    base.checked_add(delta).unwrap_or(max).min(max)
+}
+
+#[inline(always)]
+fn duration_saturating_sub_clamped(base: Duration, delta: Duration, min: Duration) -> Duration {
+    base.saturating_sub(delta).max(min)
+}
 
 fn hdr_to_sdr_params(hdr: HdrMonitorMetadata) -> Option<HdrToSdrParams> {
     if !hdr.advanced_color_enabled {
@@ -491,6 +505,7 @@ struct WindowsGraphicsCaptureCapturer {
     /// Last present timestamp emitted to callers.
     last_emitted_present_time: i64,
     stale_poll_spins: u32,
+    stale_frame_timeout: Duration,
     adaptive_spin_polls: u32,
     region_adaptive_spin_polls: u32,
     capture_mode: CaptureMode,
@@ -503,6 +518,8 @@ struct WindowsGraphicsCaptureCapturer {
     region_blit: Option<CaptureBlitRegion>,
     cursor_config: CursorCaptureConfig,
     has_frame_history: bool,
+    source_dirty_rects_scratch: Vec<DirtyRect>,
+    region_dirty_rects_scratch: Vec<DirtyRect>,
 }
 
 // SAFETY: WGC COM objects are not Send, but we only access them from
@@ -653,6 +670,7 @@ impl WindowsGraphicsCaptureCapturer {
             last_present_time: 0,
             last_emitted_present_time: 0,
             stale_poll_spins: WGC_STALE_POLL_SPIN_INITIAL,
+            stale_frame_timeout: WGC_STALE_FRAME_TIMEOUT_INITIAL,
             adaptive_spin_polls: WGC_QUERY_SPIN_INITIAL_POLLS,
             region_adaptive_spin_polls: WGC_QUERY_SPIN_INITIAL_POLLS,
             capture_mode: CaptureMode::Screenshot,
@@ -662,6 +680,8 @@ impl WindowsGraphicsCaptureCapturer {
             region_blit: None,
             cursor_config,
             has_frame_history: false,
+            source_dirty_rects_scratch: Vec::new(),
+            region_dirty_rects_scratch: Vec::new(),
         })
     }
 
@@ -737,12 +757,36 @@ impl WindowsGraphicsCaptureCapturer {
         Ok(None)
     }
 
+    #[inline(always)]
+    fn tighten_stale_timeout(&mut self) {
+        self.stale_frame_timeout = duration_saturating_sub_clamped(
+            self.stale_frame_timeout,
+            WGC_STALE_FRAME_TIMEOUT_DECREASE_STEP,
+            WGC_STALE_FRAME_TIMEOUT_MIN,
+        );
+    }
+
+    #[inline(always)]
+    fn relax_stale_timeout(&mut self) {
+        self.stale_frame_timeout = duration_saturating_add_clamped(
+            self.stale_frame_timeout,
+            WGC_STALE_FRAME_TIMEOUT_INCREASE_STEP,
+            WGC_STALE_FRAME_TIMEOUT_MAX,
+        );
+    }
+
+    #[inline(always)]
+    fn reset_stale_timeout_window(&mut self) {
+        self.stale_frame_timeout = WGC_STALE_FRAME_TIMEOUT_INITIAL;
+    }
+
     fn acquire_next_frame_or_stale(
         &mut self,
         allow_stale_return: bool,
     ) -> CaptureResult<Option<(Direct3D11CaptureFrame, i64)>> {
         if allow_stale_return {
-            if let Some(fresh) = self.poll_for_next_frame_stale(WGC_STALE_FRAME_TIMEOUT)? {
+            if let Some(fresh) = self.poll_for_next_frame_stale(self.stale_frame_timeout)? {
+                self.relax_stale_timeout();
                 return Ok(Some(fresh));
             }
 
@@ -750,9 +794,11 @@ impl WindowsGraphicsCaptureCapturer {
             // already have a previously converted slot. Wait briefly for a
             // just-about-to-arrive frame, then fall back to stale reuse.
             if self.pending_slot.is_some() {
+                self.tighten_stale_timeout();
                 return Ok(None);
             }
         }
+        self.reset_stale_timeout_window();
         self.wait_for_next_frame(WGC_FRAME_TIMEOUT).map(Some)
     }
 
@@ -761,9 +807,16 @@ impl WindowsGraphicsCaptureCapturer {
         allow_stale_return: bool,
     ) -> CaptureResult<Option<(Direct3D11CaptureFrame, i64)>> {
         if allow_stale_return {
-            return self.poll_for_next_frame_stale(WGC_STALE_FRAME_TIMEOUT);
+            let polled = self.poll_for_next_frame_stale(self.stale_frame_timeout)?;
+            if polled.is_some() {
+                self.relax_stale_timeout();
+            } else {
+                self.tighten_stale_timeout();
+            }
+            return Ok(polled);
         }
 
+        self.reset_stale_timeout_window();
         self.wait_for_next_frame(WGC_FRAME_TIMEOUT).map(Some)
     }
 
@@ -845,7 +898,9 @@ impl WindowsGraphicsCaptureCapturer {
         self.has_frame_history = false;
         self.last_emitted_present_time = 0;
         self.stale_poll_spins = WGC_STALE_POLL_SPIN_INITIAL;
+        self.stale_frame_timeout = WGC_STALE_FRAME_TIMEOUT_INITIAL;
         self.adaptive_spin_polls = WGC_QUERY_SPIN_INITIAL_POLLS;
+        self.source_dirty_rects_scratch.clear();
     }
 
     fn reset_region_pipeline(&mut self) {
@@ -856,6 +911,7 @@ impl WindowsGraphicsCaptureCapturer {
         self.region_next_write_slot = 0;
         self.region_adaptive_spin_polls = WGC_QUERY_SPIN_INITIAL_POLLS;
         self.region_blit = None;
+        self.region_dirty_rects_scratch.clear();
     }
 
     fn ensure_region_pipeline_for_blit(&mut self, blit: CaptureBlitRegion) {
@@ -1468,8 +1524,10 @@ impl WindowsGraphicsCaptureCapturer {
         let (capture_frame, time_ticks) = if let Some(capture) = maybe_capture {
             capture
         } else if let Some(slot_idx) = self.region_pending_slot {
-            let sample =
+            let mut sample =
                 self.read_region_slot_into_output(slot_idx, out, destination_has_history, blit)?;
+            sample.capture_time = Some(capture_time);
+            sample.is_duplicate = true;
             self.has_frame_history = true;
             return Ok(sample);
         } else {
@@ -1486,6 +1544,7 @@ impl WindowsGraphicsCaptureCapturer {
             self.last_present_time = time_ticks;
         }
 
+        let mut region_dirty_rects = std::mem::take(&mut self.region_dirty_rects_scratch);
         let capture_result = (|| -> CaptureResult<CaptureSampleMetadata> {
             self.recreate_pool_if_needed(&capture_frame)?;
 
@@ -1556,6 +1615,34 @@ impl WindowsGraphicsCaptureCapturer {
             }
 
             let region_desc = Self::region_desc_for_blit(&effective_desc, blit);
+            let region_dirty_available = extract_region_dirty_rects(
+                &capture_frame,
+                effective_desc.Width,
+                effective_desc.Height,
+                blit,
+                &mut region_dirty_rects,
+            );
+            if !region_dirty_available {
+                region_dirty_rects.clear();
+            }
+            let region_unchanged = region_dirty_available && region_dirty_rects.is_empty();
+
+            if self.capture_mode != CaptureMode::ScreenRecording
+                && self.has_frame_history
+                && destination_has_history
+                && (source_is_duplicate || region_unchanged)
+            {
+                return Ok(CaptureSampleMetadata {
+                    capture_time: Some(capture_time),
+                    present_time_qpc: if time_ticks != 0 {
+                        Some(time_ticks)
+                    } else {
+                        None
+                    },
+                    is_duplicate: true,
+                });
+            }
+
             let write_slot = if self.capture_mode == CaptureMode::ScreenRecording {
                 self.region_next_write_slot % WGC_STAGING_SLOTS
             } else {
@@ -1568,35 +1655,39 @@ impl WindowsGraphicsCaptureCapturer {
             };
 
             let skip_submit_copy = self.capture_mode == CaptureMode::ScreenRecording
-                && source_is_duplicate
-                && self.region_pending_slot.is_some();
-            if !skip_submit_copy {
+                && self.region_pending_slot.is_some()
+                && (source_is_duplicate || region_unchanged);
+
+            let read_slot = if skip_submit_copy {
+                let slot_idx = self.region_pending_slot.unwrap_or(read_slot);
+                let slot = &mut self.region_slots[slot_idx];
+                slot.capture_time = Some(capture_time);
+                slot.present_time_ticks = time_ticks;
+                slot.is_duplicate = true;
+                slot.dirty_mode_available = region_dirty_available;
+                slot.dirty_copy_preferred = false;
+                slot.dirty_rects.clear();
+                slot.populated = true;
+                slot_idx
+            } else {
                 self.ensure_region_slot(write_slot, &region_desc)?;
                 {
                     let slot = &mut self.region_slots[write_slot];
-                    let dirty_mode_available = extract_region_dirty_rects(
-                        &capture_frame,
-                        effective_desc.Width,
-                        effective_desc.Height,
-                        blit,
-                        &mut slot.dirty_rects,
-                    );
-                    slot.dirty_mode_available = dirty_mode_available;
-                    if !dirty_mode_available {
-                        slot.dirty_rects.clear();
-                    }
-                    slot.dirty_copy_preferred = dirty_mode_available
-                        && should_use_dirty_copy(
-                            &slot.dirty_rects,
-                            region_desc.Width,
-                            region_desc.Height,
-                        );
-                    let region_unchanged = dirty_mode_available && slot.dirty_rects.is_empty();
                     slot.capture_time = Some(capture_time);
                     slot.present_time_ticks = time_ticks;
                     slot.is_duplicate = source_is_duplicate || region_unchanged;
                     slot.hdr_to_sdr = effective_hdr;
                     slot.source_desc = Some(region_desc);
+                    slot.dirty_mode_available = region_dirty_available;
+                    slot.dirty_rects.clear();
+                    slot.dirty_rects.extend_from_slice(&region_dirty_rects);
+                    slot.dirty_copy_preferred = region_dirty_available
+                        && should_use_dirty_copy(
+                            &slot.dirty_rects,
+                            region_desc.Width,
+                            region_desc.Height,
+                        );
+                    slot.populated = true;
                 }
 
                 let source_resource: ID3D11Resource = effective_source
@@ -1605,7 +1696,8 @@ impl WindowsGraphicsCaptureCapturer {
                     .map_err(CaptureError::Platform)?;
                 self.copy_region_source_to_slot(write_slot, &source_resource, blit)?;
                 self.maybe_flush_region_after_submit(write_slot, read_slot);
-            }
+                read_slot
+            };
 
             let sample =
                 self.read_region_slot_into_output(read_slot, out, destination_has_history, blit)?;
@@ -1622,6 +1714,9 @@ impl WindowsGraphicsCaptureCapturer {
 
             Ok(sample)
         })();
+
+        region_dirty_rects.clear();
+        self.region_dirty_rects_scratch = region_dirty_rects;
 
         let _ = capture_frame.Close();
         match capture_result {
@@ -1660,6 +1755,8 @@ impl WindowsGraphicsCaptureCapturer {
                 .read_slot_into_output(slot_idx, &mut out, destination_has_history)
                 .is_ok()
             {
+                out.metadata.capture_time = Some(capture_time);
+                out.metadata.is_duplicate = true;
                 self.has_frame_history = true;
                 return Ok(out);
             }
@@ -1679,6 +1776,7 @@ impl WindowsGraphicsCaptureCapturer {
             self.last_present_time = time_ticks;
         }
 
+        let mut source_dirty_rects = std::mem::take(&mut self.source_dirty_rects_scratch);
         let capture_result = (|| -> CaptureResult<()> {
             self.recreate_pool_if_needed(&capture_frame)?;
 
@@ -1740,28 +1838,21 @@ impl WindowsGraphicsCaptureCapturer {
                     (frame_texture.clone(), src_desc, self.hdr_to_sdr)
                 };
 
-            let write_slot = if self.capture_mode == CaptureMode::ScreenRecording {
-                self.next_write_slot % WGC_STAGING_SLOTS
-            } else {
-                0
-            };
-            let read_slot = if self.capture_mode == CaptureMode::ScreenRecording {
-                self.pending_slot.unwrap_or(write_slot)
-            } else {
-                write_slot
-            };
-
-            if self.capture_mode == CaptureMode::ScreenRecording
-                && source_is_duplicate
-                && self.pending_slot.is_some()
-            {
-                self.read_slot_into_output(read_slot, &mut out, destination_has_history)?;
-                return Ok(());
+            let source_dirty_mode = extract_dirty_rects(
+                &capture_frame,
+                effective_desc.Width,
+                effective_desc.Height,
+                &mut source_dirty_rects,
+            );
+            let source_dirty_available = source_dirty_mode.is_some();
+            if !source_dirty_available {
+                source_dirty_rects.clear();
             }
+            let source_unchanged = source_dirty_available && source_dirty_rects.is_empty();
 
             let emitted_duplicate = time_ticks != 0 && time_ticks == self.last_emitted_present_time;
             if self.capture_mode != CaptureMode::ScreenRecording
-                && source_is_duplicate
+                && (source_is_duplicate || source_unchanged)
                 && self.has_frame_history
                 && destination_has_history
                 && out.width() == effective_desc.Width
@@ -1781,50 +1872,75 @@ impl WindowsGraphicsCaptureCapturer {
                 return Ok(());
             }
 
-            self.ensure_staging_slot(write_slot, &effective_desc)?;
-            let can_use_dirty_gpu_copy = {
-                let slot = &self.staging_slots[write_slot];
-                slot.populated
-                    && slot.present_time_ticks != 0
-                    && slot.present_time_ticks == previous_present_time
+            let write_slot = if self.capture_mode == CaptureMode::ScreenRecording {
+                self.next_write_slot % WGC_STAGING_SLOTS
+            } else {
+                0
             };
-            {
-                let slot = &mut self.staging_slots[write_slot];
-                let dirty_mode = extract_dirty_rects(
-                    &capture_frame,
-                    effective_desc.Width,
-                    effective_desc.Height,
-                    &mut slot.dirty_rects,
-                );
-                slot.dirty_mode_available = dirty_mode.is_some();
-                if dirty_mode.is_none() {
-                    slot.dirty_rects.clear();
-                }
-                slot.dirty_copy_preferred = slot.dirty_mode_available
-                    && should_use_dirty_copy(
-                        &slot.dirty_rects,
-                        effective_desc.Width,
-                        effective_desc.Height,
-                    );
+            let read_slot = if self.capture_mode == CaptureMode::ScreenRecording {
+                self.pending_slot.unwrap_or(write_slot)
+            } else {
+                write_slot
+            };
+
+            let skip_submit_copy = self.capture_mode == CaptureMode::ScreenRecording
+                && self.pending_slot.is_some()
+                && (source_is_duplicate || source_unchanged);
+
+            let read_slot = if skip_submit_copy {
+                let slot_idx = self.pending_slot.unwrap_or(read_slot);
+                let slot = &mut self.staging_slots[slot_idx];
                 slot.capture_time = Some(capture_time);
                 slot.present_time_ticks = time_ticks;
-                slot.is_duplicate = source_is_duplicate;
-                slot.hdr_to_sdr = effective_hdr;
-                slot.source_desc = Some(effective_desc);
-            }
+                slot.is_duplicate = true;
+                slot.dirty_mode_available = source_dirty_available;
+                slot.dirty_copy_preferred = false;
+                slot.dirty_rects.clear();
+                slot.populated = true;
+                slot_idx
+            } else {
+                self.ensure_staging_slot(write_slot, &effective_desc)?;
+                let can_use_dirty_gpu_copy = {
+                    let slot = &self.staging_slots[write_slot];
+                    slot.populated
+                        && slot.present_time_ticks != 0
+                        && slot.present_time_ticks == previous_present_time
+                };
+                {
+                    let slot = &mut self.staging_slots[write_slot];
+                    slot.dirty_mode_available = source_dirty_available;
+                    slot.dirty_rects.clear();
+                    slot.dirty_rects.extend_from_slice(&source_dirty_rects);
+                    slot.dirty_copy_preferred = source_dirty_available
+                        && should_use_dirty_copy(
+                            &slot.dirty_rects,
+                            effective_desc.Width,
+                            effective_desc.Height,
+                        );
+                    slot.capture_time = Some(capture_time);
+                    slot.present_time_ticks = time_ticks;
+                    slot.is_duplicate = source_is_duplicate || source_unchanged;
+                    slot.hdr_to_sdr = effective_hdr;
+                    slot.source_desc = Some(effective_desc);
+                    slot.populated = true;
+                }
 
-            let source_resource: ID3D11Resource = effective_source
-                .cast()
-                .context("failed to cast WGC frame texture to ID3D11Resource")
-                .map_err(CaptureError::Platform)?;
-            self.copy_source_to_slot(write_slot, &source_resource, can_use_dirty_gpu_copy)?;
+                let source_resource: ID3D11Resource = effective_source
+                    .cast()
+                    .context("failed to cast WGC frame texture to ID3D11Resource")
+                    .map_err(CaptureError::Platform)?;
+                self.copy_source_to_slot(write_slot, &source_resource, can_use_dirty_gpu_copy)?;
+                self.maybe_flush_after_submit(write_slot, read_slot);
+                read_slot
+            };
 
-            self.maybe_flush_after_submit(write_slot, read_slot);
             self.read_slot_into_output(read_slot, &mut out, destination_has_history)?;
 
             if self.capture_mode == CaptureMode::ScreenRecording {
-                self.pending_slot = Some(write_slot);
-                self.next_write_slot = (write_slot + 1) % WGC_STAGING_SLOTS;
+                if !skip_submit_copy {
+                    self.pending_slot = Some(write_slot);
+                    self.next_write_slot = (write_slot + 1) % WGC_STAGING_SLOTS;
+                }
             } else {
                 self.pending_slot = None;
                 self.next_write_slot = 0;
@@ -1832,6 +1948,9 @@ impl WindowsGraphicsCaptureCapturer {
 
             Ok(())
         })();
+
+        source_dirty_rects.clear();
+        self.source_dirty_rects_scratch = source_dirty_rects;
 
         let _ = capture_frame.Close();
         if let Err(err) = capture_result {
@@ -2206,5 +2325,25 @@ mod tests {
         assert!(dirty_region_mode_supported(
             GraphicsCaptureDirtyRegionMode::ReportAndRender
         ));
+    }
+
+    #[test]
+    fn stale_timeout_add_clamp_respects_upper_bound() {
+        let value = duration_saturating_add_clamped(
+            Duration::from_micros(1900),
+            Duration::from_micros(300),
+            WGC_STALE_FRAME_TIMEOUT_MAX,
+        );
+        assert_eq!(value, WGC_STALE_FRAME_TIMEOUT_MAX);
+    }
+
+    #[test]
+    fn stale_timeout_sub_clamp_respects_lower_bound() {
+        let value = duration_saturating_sub_clamped(
+            Duration::from_micros(500),
+            Duration::from_micros(200),
+            WGC_STALE_FRAME_TIMEOUT_MIN,
+        );
+        assert_eq!(value, WGC_STALE_FRAME_TIMEOUT_MIN);
     }
 }

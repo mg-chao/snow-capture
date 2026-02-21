@@ -53,12 +53,21 @@ function Invoke-DxgiBenchmark {
     )
 
     $oldDisableDirtyGpuCopy = $env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_GPU_COPY
+    $oldDisableDirectDirtyExtract = $env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_DIRECT_EXTRACT
+    $oldDisableWindowMonitorCache = $env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_MONITOR_CACHE
+    $oldDisableWindowLowLatency = $env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_LOW_LATENCY_REGION
 
     try {
         if ($DisableOptimizations) {
             $env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_GPU_COPY = "1"
+            $env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_DIRECT_EXTRACT = "1"
+            $env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_MONITOR_CACHE = "1"
+            $env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_LOW_LATENCY_REGION = "1"
         } else {
             Remove-Item Env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_GPU_COPY -ErrorAction SilentlyContinue
+            Remove-Item Env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_DIRECT_EXTRACT -ErrorAction SilentlyContinue
+            Remove-Item Env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_MONITOR_CACHE -ErrorAction SilentlyContinue
+            Remove-Item Env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_LOW_LATENCY_REGION -ErrorAction SilentlyContinue
         }
 
         $cargoArgs = @(
@@ -77,6 +86,21 @@ function Invoke-DxgiBenchmark {
             $env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_GPU_COPY = $oldDisableDirtyGpuCopy
         } else {
             Remove-Item Env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_GPU_COPY -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $oldDisableDirectDirtyExtract) {
+            $env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_DIRECT_EXTRACT = $oldDisableDirectDirtyExtract
+        } else {
+            Remove-Item Env:SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_DIRECT_EXTRACT -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $oldDisableWindowMonitorCache) {
+            $env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_MONITOR_CACHE = $oldDisableWindowMonitorCache
+        } else {
+            Remove-Item Env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_MONITOR_CACHE -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $oldDisableWindowLowLatency) {
+            $env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_LOW_LATENCY_REGION = $oldDisableWindowLowLatency
+        } else {
+            Remove-Item Env:SNOW_CAPTURE_DXGI_DISABLE_WINDOW_LOW_LATENCY_REGION -ErrorAction SilentlyContinue
         }
     }
 }

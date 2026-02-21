@@ -49,7 +49,10 @@ const DXGI_DIRTY_COPY_MAX_RECTS: usize = 192;
 const DXGI_DIRTY_COPY_MAX_AREA_PERCENT: u64 = 70;
 const DXGI_DIRTY_GPU_COPY_MAX_RECTS: usize = 64;
 const DXGI_DIRTY_GPU_COPY_MAX_AREA_PERCENT: u64 = 45;
+const DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS: usize = 8;
+const DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT: u64 = 18;
 const DXGI_REGION_STAGING_SLOTS: usize = 3;
+const DXGI_REGION_DIRTY_TRACK_MAX_RECTS: usize = DXGI_DIRTY_COPY_MAX_RECTS + 1;
 
 #[inline]
 fn env_var_truthy(var_name: &'static str) -> bool {
@@ -71,6 +74,25 @@ fn region_dirty_gpu_copy_enabled() -> bool {
 fn duplicate_dirty_fastpath_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_DUPLICATE_DIRTY_FASTPATH"))
+}
+
+#[inline]
+fn region_direct_dirty_extract_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_DIRECT_EXTRACT"))
+}
+
+#[inline]
+fn window_monitor_cache_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_WINDOW_MONITOR_CACHE"))
+}
+
+#[inline]
+fn window_low_latency_region_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_WINDOW_LOW_LATENCY_REGION"))
 }
 
 #[derive(Default)]
@@ -258,6 +280,89 @@ fn extract_region_dirty_rects(
 
     for rect in source_dirty_rects {
         let Some(clamped) = clamp_dirty_rect(*rect, source_width, source_height) else {
+            continue;
+        };
+        let Some(intersection) = intersect_dirty_rects(clamped, region_bounds) else {
+            continue;
+        };
+        if out.len() == DXGI_REGION_DIRTY_TRACK_MAX_RECTS {
+            break;
+        }
+        out.push(DirtyRect {
+            x: intersection.x.saturating_sub(region_bounds.x),
+            y: intersection.y.saturating_sub(region_bounds.y),
+            width: intersection.width,
+            height: intersection.height,
+        });
+    }
+
+    true
+}
+
+fn extract_region_dirty_rects_direct(
+    duplication: &IDXGIOutputDuplication,
+    info: &DXGI_OUTDUPL_FRAME_INFO,
+    rect_buffer: &mut Vec<RECT>,
+    source_width: u32,
+    source_height: u32,
+    blit: CaptureBlitRegion,
+    out: &mut Vec<DirtyRect>,
+) -> bool {
+    out.clear();
+
+    let Some(region_bounds) = clamp_dirty_rect(
+        DirtyRect {
+            x: blit.src_x,
+            y: blit.src_y,
+            width: blit.width,
+            height: blit.height,
+        },
+        source_width,
+        source_height,
+    ) else {
+        return false;
+    };
+
+    let dirty_bytes = info.TotalMetadataBufferSize as usize;
+    if dirty_bytes == 0 {
+        return true;
+    }
+
+    let max_rects = dirty_bytes / std::mem::size_of::<RECT>();
+    if max_rects == 0 {
+        return false;
+    }
+    if rect_buffer.len() < max_rects {
+        rect_buffer.resize(max_rects, RECT::default());
+    }
+
+    let mut buf_size = info.TotalMetadataBufferSize;
+    let hr = unsafe {
+        duplication.GetFrameDirtyRects(buf_size, rect_buffer.as_mut_ptr(), &mut buf_size)
+    };
+    if hr.is_err() {
+        return false;
+    }
+
+    let actual_count = ((buf_size as usize) / std::mem::size_of::<RECT>()).min(rect_buffer.len());
+    for raw_rect in &rect_buffer[..actual_count] {
+        if out.len() == DXGI_REGION_DIRTY_TRACK_MAX_RECTS {
+            break;
+        }
+
+        let width = (raw_rect.right - raw_rect.left).max(0) as u32;
+        let height = (raw_rect.bottom - raw_rect.top).max(0) as u32;
+        if width == 0 || height == 0 {
+            continue;
+        }
+
+        let dirty = DirtyRect {
+            x: raw_rect.left.max(0) as u32,
+            y: raw_rect.top.max(0) as u32,
+            width,
+            height,
+        };
+        let Some(clamped) = clamp_dirty_rect(dirty, source_width, source_height) else {
             continue;
         };
         let Some(intersection) = intersect_dirty_rects(clamped, region_bounds) else {
@@ -866,6 +971,30 @@ fn should_use_dirty_gpu_copy(rects: &[DirtyRect], width: u32, height: u32) -> bo
     true
 }
 
+fn should_use_low_latency_dirty_gpu_copy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
+    if rects.is_empty() || rects.len() > DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS {
+        return false;
+    }
+
+    let total_pixels = (width as u64).saturating_mul(height as u64);
+    if total_pixels == 0 {
+        return false;
+    }
+
+    let mut dirty_pixels = 0u64;
+    for rect in rects {
+        dirty_pixels =
+            dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+        if dirty_pixels.saturating_mul(100)
+            > total_pixels.saturating_mul(DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT)
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
 #[inline(always)]
 fn should_skip_screenrecord_submit_copy(
     fastpath_enabled: bool,
@@ -1460,6 +1589,7 @@ impl OutputCapturer {
         blit: CaptureBlitRegion,
         destination: &mut Frame,
         destination_has_history: bool,
+        prefer_low_latency: bool,
     ) -> CaptureResult<CaptureSampleMetadata> {
         if blit.width == 0 || blit.height == 0 {
             return Err(CaptureError::InvalidConfig(
@@ -1540,26 +1670,38 @@ impl OutputCapturer {
                 region_dirty_rects.clear();
                 (true, true)
             } else {
-                let source_dirty_available = extract_dirty_rects(
-                    &self.duplication,
-                    &frame_info,
-                    &mut self.dxgi_rect_buffer,
-                    &mut self.source_dirty_rects_scratch,
-                );
-                let region_dirty_available = if source_dirty_available {
-                    extract_region_dirty_rects(
-                        &self.source_dirty_rects_scratch,
+                let region_dirty_available = if region_direct_dirty_extract_enabled() {
+                    extract_region_dirty_rects_direct(
+                        &self.duplication,
+                        &frame_info,
+                        &mut self.dxgi_rect_buffer,
                         effective_desc.Width,
                         effective_desc.Height,
                         blit,
                         &mut region_dirty_rects,
                     )
                 } else {
-                    region_dirty_rects.clear();
-                    false
+                    let source_dirty_available = extract_dirty_rects(
+                        &self.duplication,
+                        &frame_info,
+                        &mut self.dxgi_rect_buffer,
+                        &mut self.source_dirty_rects_scratch,
+                    );
+                    if source_dirty_available {
+                        extract_region_dirty_rects(
+                            &self.source_dirty_rects_scratch,
+                            effective_desc.Width,
+                            effective_desc.Height,
+                            blit,
+                            &mut region_dirty_rects,
+                        )
+                    } else {
+                        region_dirty_rects.clear();
+                        false
+                    }
                 };
 
-                if region_dirty_available {
+                if region_dirty_available && region_dirty_rects.len() <= DXGI_DIRTY_COPY_MAX_RECTS {
                     normalize_dirty_rects_in_place(
                         &mut region_dirty_rects,
                         blit.width,
@@ -1587,18 +1729,25 @@ impl OutputCapturer {
                 });
             }
 
-            let write_slot = if self.capture_mode == CaptureMode::ScreenRecording {
+            let recording_mode = self.capture_mode == CaptureMode::ScreenRecording;
+            let low_latency_recording =
+                recording_mode && prefer_low_latency && window_low_latency_region_enabled();
+            let write_slot = if low_latency_recording {
+                self.region_pending_slot.unwrap_or(0)
+            } else if recording_mode {
                 self.region_next_write_slot % DXGI_REGION_STAGING_SLOTS
             } else {
                 0
             };
-            let read_slot = if self.capture_mode == CaptureMode::ScreenRecording {
+            let read_slot = if low_latency_recording {
+                write_slot
+            } else if recording_mode {
                 self.region_pending_slot.unwrap_or(write_slot)
             } else {
                 write_slot
             };
 
-            let skip_submit_copy = self.capture_mode == CaptureMode::ScreenRecording
+            let skip_submit_copy = recording_mode
                 && self.region_pending_slot.is_some()
                 && (source_is_duplicate || region_unchanged);
 
@@ -1617,11 +1766,8 @@ impl OutputCapturer {
                 slot_idx
             } else {
                 self.ensure_region_slot(write_slot, &region_desc)?;
-                // Dirty GPU copy needs the slot to already hold the previous frame.
-                // The recording pipeline rotates slots, so only the single-slot
-                // screenshot path can safely preserve unchanged pixels this way.
-                let can_use_dirty_gpu_copy =
-                    destination_has_history && self.capture_mode != CaptureMode::ScreenRecording;
+                let can_use_dirty_gpu_copy = destination_has_history
+                    && (self.capture_mode != CaptureMode::ScreenRecording || low_latency_recording);
                 {
                     let slot = &mut self.region_slots[write_slot];
                     slot.capture_time = Some(capture_time);
@@ -1632,13 +1778,22 @@ impl OutputCapturer {
                     slot.dirty_mode_available = region_dirty_available;
                     slot.dirty_rects.clear();
                     slot.dirty_rects.extend_from_slice(&region_dirty_rects);
-                    slot.dirty_copy_preferred = can_use_dirty_gpu_copy
-                        && region_dirty_available
-                        && should_use_dirty_gpu_copy(
+                    let dirty_gpu_copy_preferred = if low_latency_recording {
+                        should_use_low_latency_dirty_gpu_copy(
                             &slot.dirty_rects,
                             region_desc.Width,
                             region_desc.Height,
-                        );
+                        )
+                    } else {
+                        should_use_dirty_gpu_copy(
+                            &slot.dirty_rects,
+                            region_desc.Width,
+                            region_desc.Height,
+                        )
+                    };
+                    slot.dirty_copy_preferred = can_use_dirty_gpu_copy
+                        && region_dirty_available
+                        && dirty_gpu_copy_preferred;
                     slot.populated = true;
                 }
 
@@ -1663,10 +1818,14 @@ impl OutputCapturer {
                 blit,
             )?;
 
-            if self.capture_mode == CaptureMode::ScreenRecording {
+            if recording_mode {
                 if !skip_submit_copy {
                     self.region_pending_slot = Some(write_slot);
-                    self.region_next_write_slot = (write_slot + 1) % DXGI_REGION_STAGING_SLOTS;
+                    if low_latency_recording {
+                        self.region_next_write_slot = write_slot;
+                    } else {
+                        self.region_next_write_slot = (write_slot + 1) % DXGI_REGION_STAGING_SLOTS;
+                    }
                 }
             } else {
                 self.region_pending_slot = None;
@@ -1951,9 +2110,9 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
         destination: &mut Frame,
         destination_has_history: bool,
     ) -> CaptureResult<Option<CaptureSampleMetadata>> {
-        let result = self
-            .output
-            .capture_region_into(blit, destination, destination_has_history);
+        let result =
+            self.output
+                .capture_region_into(blit, destination, destination_has_history, false);
         match result {
             Ok(sample) => Ok(Some(sample)),
             Err(CaptureError::MonitorLost) | Err(CaptureError::AccessLost) => {
@@ -1966,7 +2125,7 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
                 self.output.cursor_config = self.cursor_config;
                 self.output.set_capture_mode(self.capture_mode);
                 self.output
-                    .capture_region_into(blit, destination, destination_has_history)
+                    .capture_region_into(blit, destination, destination_has_history, false)
                     .map(Some)
             }
             Err(e) => Err(e),
@@ -2035,6 +2194,14 @@ fn monitor_rect(hmon: HMONITOR) -> CaptureResult<RECT> {
     Ok(info.rcMonitor)
 }
 
+#[inline(always)]
+fn rect_within_rect(inner: &RECT, outer: &RECT) -> bool {
+    inner.left >= outer.left
+        && inner.top >= outer.top
+        && inner.right <= outer.right
+        && inner.bottom <= outer.bottom
+}
+
 /// Wrapper around `HWND` to satisfy `Send`.  Window handles are
 /// plain integer-sized values that are safe to use from any thread
 /// (Win32 window messages are dispatched by the OS regardless of
@@ -2057,6 +2224,8 @@ pub(crate) struct WindowsDxgiWindowCapturer {
     /// Cached monitor handle so we can detect when the window moves
     /// to a different monitor.
     current_hmon: SendHmon,
+    /// Cached monitor desktop bounds. Avoids `GetMonitorInfoW` on every frame.
+    current_monitor_rect: RECT,
     cursor_config: CursorCaptureConfig,
     capture_mode: CaptureMode,
 }
@@ -2090,6 +2259,7 @@ impl WindowsDxgiWindowCapturer {
                 "failed to create DXGI duplication for window's monitor: {e}"
             ))
         })?;
+        let current_monitor_rect = monitor_rect(hmon)?;
 
         Ok(Self {
             hwnd: SendHwnd(hwnd),
@@ -2097,6 +2267,7 @@ impl WindowsDxgiWindowCapturer {
             _com: com,
             output,
             current_hmon: SendHmon(hmon),
+            current_monitor_rect,
             cursor_config: CursorCaptureConfig::default(),
             capture_mode: CaptureMode::Screenshot,
         })
@@ -2111,6 +2282,7 @@ impl WindowsDxgiWindowCapturer {
         self.output.cursor_config = self.cursor_config;
         self.output.set_capture_mode(self.capture_mode);
         self.current_hmon = SendHmon(hmon);
+        self.current_monitor_rect = monitor_rect(hmon)?;
         Ok(())
     }
 
@@ -2141,13 +2313,49 @@ impl WindowsDxgiWindowCapturer {
             dst_y: 0,
         })
     }
-}
 
-impl crate::backend::MonitorCapturer for WindowsDxgiWindowCapturer {
-    fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
+    fn resolve_window_blit(
+        &mut self,
+        hwnd: HWND,
+        win_rect: &RECT,
+    ) -> CaptureResult<CaptureBlitRegion> {
+        let cache_enabled = window_monitor_cache_enabled();
+
+        if !cache_enabled || !rect_within_rect(win_rect, &self.current_monitor_rect) {
+            let hmon = monitor_from_window(hwnd).ok_or_else(|| {
+                CaptureError::BackendUnavailable("window is not on any monitor".into())
+            })?;
+            if SendHmon(hmon) != self.current_hmon {
+                self.reinit_for_monitor(hmon)?;
+            }
+        }
+
+        if !cache_enabled {
+            self.current_monitor_rect = monitor_rect(self.current_hmon.0)?;
+        }
+
+        let blit = match Self::window_blit_on_monitor(&self.current_monitor_rect, win_rect) {
+            Ok(blit) => blit,
+            Err(error) if cache_enabled => {
+                self.current_monitor_rect = monitor_rect(self.current_hmon.0)?;
+                match Self::window_blit_on_monitor(&self.current_monitor_rect, win_rect) {
+                    Ok(blit) => blit,
+                    Err(_) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+
+        Ok(blit)
+    }
+
+    fn capture_internal(
+        &mut self,
+        reuse: Option<Frame>,
+        destination_history_hint: Option<bool>,
+    ) -> CaptureResult<Frame> {
         let hwnd = self.hwnd.0;
 
-        // Validate the window is still alive and visible.
         if !unsafe { IsWindow(hwnd) }.as_bool() {
             return Err(CaptureError::InvalidTarget(
                 "window no longer exists".into(),
@@ -2157,7 +2365,6 @@ impl crate::backend::MonitorCapturer for WindowsDxgiWindowCapturer {
             return Err(CaptureError::InvalidTarget("window is minimized".into()));
         }
 
-        // Get current window bounds.
         let mut win_rect = RECT::default();
         unsafe { GetWindowRect(hwnd, &mut win_rect) }
             .ok()
@@ -2172,35 +2379,44 @@ impl crate::backend::MonitorCapturer for WindowsDxgiWindowCapturer {
             ));
         }
 
-        // Check if the window moved to a different monitor.
-        let hmon = monitor_from_window(hwnd).ok_or_else(|| {
-            CaptureError::BackendUnavailable("window is not on any monitor".into())
-        })?;
-
-        if SendHmon(hmon) != self.current_hmon {
-            self.reinit_for_monitor(hmon)?;
-        }
-
-        let mon_rect = monitor_rect(self.current_hmon.0)?;
-        let blit = Self::window_blit_on_monitor(&mon_rect, &win_rect)?;
+        let blit = self.resolve_window_blit(hwnd, &win_rect)?;
 
         let mut frame = reuse.unwrap_or_else(Frame::empty);
-        let destination_has_history = frame.width() == blit.width
-            && frame.height() == blit.height
-            && !frame.as_rgba_bytes().is_empty();
+        let has_pixels = !frame.as_rgba_bytes().is_empty();
+        let history_enabled = destination_history_hint.unwrap_or(has_pixels) && has_pixels;
+        let destination_has_history =
+            history_enabled && frame.width() == blit.width && frame.height() == blit.height;
         frame.ensure_rgba_capacity(blit.width, blit.height)?;
         frame.reset_metadata();
 
         let sample =
             match self
                 .output
-                .capture_region_into(blit, &mut frame, destination_has_history)
+                .capture_region_into(blit, &mut frame, destination_has_history, true)
             {
                 Ok(sample) => sample,
                 Err(CaptureError::MonitorLost) | Err(CaptureError::AccessLost) => {
-                    self.reinit_for_monitor(hmon)?;
-                    self.output
-                        .capture_region_into(blit, &mut frame, destination_has_history)?
+                    let retry_hmon = monitor_from_window(hwnd).ok_or_else(|| {
+                        CaptureError::BackendUnavailable("window is not on any monitor".into())
+                    })?;
+                    self.reinit_for_monitor(retry_hmon)?;
+                    win_rect = RECT::default();
+                    unsafe { GetWindowRect(hwnd, &mut win_rect) }
+                        .ok()
+                        .context("GetWindowRect failed during DXGI window capture recovery")
+                        .map_err(CaptureError::Platform)?;
+                    let retry_blit = self.resolve_window_blit(hwnd, &win_rect)?;
+                    let retry_has_history = history_enabled
+                        && frame.width() == retry_blit.width
+                        && frame.height() == retry_blit.height
+                        && !frame.as_rgba_bytes().is_empty();
+                    frame.ensure_rgba_capacity(retry_blit.width, retry_blit.height)?;
+                    self.output.capture_region_into(
+                        retry_blit,
+                        &mut frame,
+                        retry_has_history,
+                        true,
+                    )?
                 }
                 Err(e) => return Err(e),
             };
@@ -2209,6 +2425,20 @@ impl crate::backend::MonitorCapturer for WindowsDxgiWindowCapturer {
         frame.metadata.present_time_qpc = sample.present_time_qpc;
         frame.metadata.is_duplicate = sample.is_duplicate;
         Ok(frame)
+    }
+}
+
+impl crate::backend::MonitorCapturer for WindowsDxgiWindowCapturer {
+    fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
+        self.capture_internal(reuse, None)
+    }
+
+    fn capture_with_history_hint(
+        &mut self,
+        reuse: Option<Frame>,
+        destination_has_history: bool,
+    ) -> CaptureResult<Frame> {
+        self.capture_internal(reuse, Some(destination_has_history))
     }
 
     fn set_capture_mode(&mut self, mode: CaptureMode) {
@@ -2336,6 +2566,20 @@ mod tests {
             DXGI_DIRTY_GPU_COPY_MAX_RECTS + 1
         ];
         assert!(!should_use_dirty_gpu_copy(&rects, 1920, 1080));
+    }
+
+    #[test]
+    fn low_latency_dirty_gpu_copy_heuristic_is_stricter() {
+        let rects = vec![
+            DirtyRect {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            };
+            DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS + 1
+        ];
+        assert!(!should_use_low_latency_dirty_gpu_copy(&rects, 1920, 1080));
     }
 
     #[test]
@@ -2587,5 +2831,65 @@ mod tests {
             &source, 1920, 1080, blit, &mut out
         ));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn region_dirty_rects_cap_tracked_output() {
+        let source = vec![
+            DirtyRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            };
+            DXGI_REGION_DIRTY_TRACK_MAX_RECTS + 32
+        ];
+        let blit = CaptureBlitRegion {
+            src_x: 0,
+            src_y: 0,
+            width: 1920,
+            height: 1080,
+            dst_x: 0,
+            dst_y: 0,
+        };
+        let mut out = Vec::new();
+        assert!(extract_region_dirty_rects(
+            &source, 1920, 1080, blit, &mut out
+        ));
+        assert_eq!(out.len(), DXGI_REGION_DIRTY_TRACK_MAX_RECTS);
+    }
+
+    #[test]
+    fn rect_within_rect_detects_containment() {
+        let inner = RECT {
+            left: 100,
+            top: 100,
+            right: 200,
+            bottom: 180,
+        };
+        let outer = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        assert!(rect_within_rect(&inner, &outer));
+    }
+
+    #[test]
+    fn rect_within_rect_detects_out_of_bounds() {
+        let inner = RECT {
+            left: -10,
+            top: 0,
+            right: 300,
+            bottom: 200,
+        };
+        let outer = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        assert!(!rect_within_rect(&inner, &outer));
     }
 }

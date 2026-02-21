@@ -1,2 +1,0 @@
-target,backend,avg_ms,p50_ms,p95_ms,p99_ms,min_ms,max_ms,stddev_ms,fps,duplicate_pct,fresh_fps
-primary-monitor,wgc,13.791978,15.387500,16.096700,16.256200,0.253300,16.939100,3.852177,72.505918,87.361,9.163942

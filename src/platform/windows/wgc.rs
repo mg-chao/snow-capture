@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,11 +38,15 @@ use super::monitor::{HdrMonitorMetadata, MonitorResolver};
 use super::surface::{self, StagingSampleDesc};
 
 const WGC_FRAME_TIMEOUT: Duration = Duration::from_millis(250);
-const WGC_STALE_FRAME_TIMEOUT: Duration = Duration::from_millis(1);
+const WGC_STALE_FRAME_TIMEOUT: Duration = Duration::from_millis(2);
 const WGC_FRAME_POOL_BUFFERS: i32 = 2;
 const WGC_STAGING_SLOTS: usize = 2;
 const WGC_DIRTY_COPY_MAX_RECTS: usize = 192;
 const WGC_DIRTY_COPY_MAX_AREA_PERCENT: u64 = 70;
+const WGC_STALE_POLL_SPIN_MIN: u32 = 16;
+const WGC_STALE_POLL_SPIN_MAX: u32 = 256;
+const WGC_STALE_POLL_SPIN_INITIAL: u32 = 64;
+const WGC_STALE_POLL_SPIN_INCREASE_STEP: u32 = 16;
 const WGC_QUERY_SPIN_MIN_POLLS: u32 = 2;
 const WGC_QUERY_SPIN_MAX_POLLS: u32 = 64;
 const WGC_QUERY_SPIN_INITIAL_POLLS: u32 = 4;
@@ -304,6 +309,8 @@ struct FrameState {
 struct FrameSignal {
     state: Mutex<FrameState>,
     cv: Condvar,
+    sequence_hint: AtomicU64,
+    closed_hint: AtomicBool,
 }
 
 fn poisoned_lock_error() -> CaptureError {
@@ -393,6 +400,7 @@ struct WindowsGraphicsCaptureCapturer {
     last_present_time: i64,
     /// Last present timestamp emitted to callers.
     last_emitted_present_time: i64,
+    stale_poll_spins: u32,
     adaptive_spin_polls: u32,
     region_adaptive_spin_polls: u32,
     capture_mode: CaptureMode,
@@ -485,6 +493,9 @@ impl WindowsGraphicsCaptureCapturer {
                                 state.latest_time_ticks = time_ticks;
                                 state.latest = Some(next_frame);
                                 state.sequence = state.sequence.wrapping_add(1);
+                                signal_for_frames
+                                    .sequence_hint
+                                    .store(state.sequence, Ordering::Release);
                                 signal_for_frames.cv.notify_all();
                             }
                         }
@@ -501,6 +512,7 @@ impl WindowsGraphicsCaptureCapturer {
                 &TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(move |_, _| {
                     if let Ok(mut state) = signal_for_closed.state.lock() {
                         state.closed = true;
+                        signal_for_closed.closed_hint.store(true, Ordering::Release);
                         signal_for_closed.cv.notify_all();
                     }
                     Ok(())
@@ -550,6 +562,7 @@ impl WindowsGraphicsCaptureCapturer {
             cached_src_desc: None,
             last_present_time: 0,
             last_emitted_present_time: 0,
+            stale_poll_spins: WGC_STALE_POLL_SPIN_INITIAL,
             adaptive_spin_polls: WGC_QUERY_SPIN_INITIAL_POLLS,
             region_adaptive_spin_polls: WGC_QUERY_SPIN_INITIAL_POLLS,
             capture_mode: CaptureMode::Screenshot,
@@ -563,12 +576,21 @@ impl WindowsGraphicsCaptureCapturer {
     }
 
     fn try_take_latest_frame(&mut self) -> CaptureResult<Option<(Direct3D11CaptureFrame, i64)>> {
+        if self.signal.closed_hint.load(Ordering::Acquire) {
+            return Err(CaptureError::MonitorLost);
+        }
+        let observed_sequence = self.signal.sequence_hint.load(Ordering::Acquire);
+        if observed_sequence == self.last_sequence {
+            return Ok(None);
+        }
+
         let mut state = self
             .signal
             .state
             .lock()
             .map_err(|_| poisoned_lock_error())?;
         if state.closed {
+            self.signal.closed_hint.store(true, Ordering::Release);
             return Err(CaptureError::MonitorLost);
         }
         if state.sequence != self.last_sequence {
@@ -581,23 +603,64 @@ impl WindowsGraphicsCaptureCapturer {
         Ok(None)
     }
 
+    fn poll_for_next_frame_stale(
+        &mut self,
+        timeout: Duration,
+    ) -> CaptureResult<Option<(Direct3D11CaptureFrame, i64)>> {
+        if let Some(frame) = self.try_take_latest_frame()? {
+            return Ok(Some(frame));
+        }
+        if timeout.is_zero() {
+            return Ok(None);
+        }
+
+        let deadline = Instant::now() + timeout;
+        for _ in 0..self.stale_poll_spins {
+            if let Some(frame) = self.try_take_latest_frame()? {
+                self.stale_poll_spins = self
+                    .stale_poll_spins
+                    .saturating_sub(1)
+                    .max(WGC_STALE_POLL_SPIN_MIN);
+                return Ok(Some(frame));
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+
+        while Instant::now() < deadline {
+            std::thread::yield_now();
+            if let Some(frame) = self.try_take_latest_frame()? {
+                self.stale_poll_spins = self
+                    .stale_poll_spins
+                    .saturating_add(1)
+                    .min(WGC_STALE_POLL_SPIN_MAX);
+                return Ok(Some(frame));
+            }
+        }
+
+        self.stale_poll_spins = self
+            .stale_poll_spins
+            .saturating_add(WGC_STALE_POLL_SPIN_INCREASE_STEP)
+            .min(WGC_STALE_POLL_SPIN_MAX);
+        Ok(None)
+    }
+
     fn acquire_next_frame_or_stale(
         &mut self,
         allow_stale_return: bool,
     ) -> CaptureResult<Option<(Direct3D11CaptureFrame, i64)>> {
         if allow_stale_return {
-            if let Some(fresh) = self.try_take_latest_frame()? {
+            if let Some(fresh) = self.poll_for_next_frame_stale(WGC_STALE_FRAME_TIMEOUT)? {
                 return Ok(Some(fresh));
             }
 
             // In recording mode, don't sit on a full frame interval when we
             // already have a previously converted slot. Wait briefly for a
             // just-about-to-arrive frame, then fall back to stale reuse.
-            match self.wait_for_next_frame(WGC_STALE_FRAME_TIMEOUT) {
-                Ok(fresh) => return Ok(Some(fresh)),
-                Err(CaptureError::Timeout) if self.pending_slot.is_some() => return Ok(None),
-                Err(CaptureError::Timeout) => {}
-                Err(error) => return Err(error),
+            if self.pending_slot.is_some() {
+                return Ok(None);
             }
         }
         self.wait_for_next_frame(WGC_FRAME_TIMEOUT).map(Some)
@@ -608,15 +671,7 @@ impl WindowsGraphicsCaptureCapturer {
         allow_stale_return: bool,
     ) -> CaptureResult<Option<(Direct3D11CaptureFrame, i64)>> {
         if allow_stale_return {
-            if let Some(fresh) = self.try_take_latest_frame()? {
-                return Ok(Some(fresh));
-            }
-
-            match self.wait_for_next_frame(WGC_STALE_FRAME_TIMEOUT) {
-                Ok(fresh) => return Ok(Some(fresh)),
-                Err(CaptureError::Timeout) => return Ok(None),
-                Err(error) => return Err(error),
-            }
+            return self.poll_for_next_frame_stale(WGC_STALE_FRAME_TIMEOUT);
         }
 
         self.wait_for_next_frame(WGC_FRAME_TIMEOUT).map(Some)
@@ -635,6 +690,7 @@ impl WindowsGraphicsCaptureCapturer {
 
         loop {
             if state.closed {
+                self.signal.closed_hint.store(true, Ordering::Release);
                 return Err(CaptureError::MonitorLost);
             }
 
@@ -698,6 +754,7 @@ impl WindowsGraphicsCaptureCapturer {
         self.reset_region_pipeline();
         self.has_frame_history = false;
         self.last_emitted_present_time = 0;
+        self.stale_poll_spins = WGC_STALE_POLL_SPIN_INITIAL;
         self.adaptive_spin_polls = WGC_QUERY_SPIN_INITIAL_POLLS;
     }
 

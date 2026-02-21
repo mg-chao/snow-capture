@@ -1,2 +1,0 @@
-target,backend,avg_ms,p50_ms,p95_ms,p99_ms,min_ms,max_ms,stddev_ms,fps,duplicate_pct,fresh_fps
-window:0000000000df10f4,gdi,42.107126,41.773500,46.647400,48.845500,35.788300,54.708100,2.088757,23.748949,0.000,23.748949

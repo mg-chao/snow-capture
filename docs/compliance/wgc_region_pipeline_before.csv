@@ -1,2 +1,0 @@
-target,backend,avg_ms,p50_ms,p95_ms,p99_ms,min_ms,max_ms,stddev_ms,fps,duplicate_pct,fresh_fps
-region:1280:720:1280:720,wgc,14.393701,15.478600,16.112700,16.182000,1.377400,17.266500,3.245489,69.474835,90.972,6.272034

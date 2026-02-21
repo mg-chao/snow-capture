@@ -83,6 +83,7 @@ struct Config {
     rounds: usize,
     backends: Vec<CaptureBackendKind>,
     target: BenchTarget,
+    target_label_override: Option<String>,
     baseline_path: Option<PathBuf>,
     save_baseline_path: Option<PathBuf>,
     max_regression_pct: f64,
@@ -303,7 +304,10 @@ fn centered_primary_region(width: u32, height: u32) -> Result<CaptureRegion> {
         .context("failed to build centered primary region")
 }
 
-fn target_label(target: &BenchTarget) -> String {
+fn target_label(target: &BenchTarget, override_label: Option<&str>) -> String {
+    if let Some(label) = override_label {
+        return label.to_string();
+    }
     match target {
         BenchTarget::PrimaryMonitor => "primary-monitor".to_string(),
         BenchTarget::Region(region) => {
@@ -326,6 +330,7 @@ fn parse_args() -> Result<Config> {
         CaptureBackendKind::Gdi,
     ];
     let mut target = BenchTarget::PrimaryMonitor;
+    let mut target_label_override = None;
     let mut baseline_path = None;
     let mut save_baseline_path = None;
     let mut max_regression_pct = DEFAULT_MAX_REGRESSION_PCT;
@@ -379,6 +384,17 @@ fn parse_args() -> Result<Config> {
                 };
                 let (width, height) = parse_size_2d(raw)?;
                 target = BenchTarget::Region(centered_primary_region(width, height)?);
+                i += 2;
+            }
+            "--target-label" => {
+                let Some(raw) = args.get(i + 1) else {
+                    bail!("--target-label requires a value");
+                };
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    bail!("--target-label cannot be empty");
+                }
+                target_label_override = Some(trimmed.to_string());
                 i += 2;
             }
             "--baseline" => {
@@ -437,6 +453,7 @@ fn parse_args() -> Result<Config> {
   --window-handle <value>    Benchmark window capture for an HWND (decimal or 0xHEX)
   --region <x,y,w,h>         Benchmark region capture in virtual desktop coordinates
   --region-center <WxH>      Benchmark a centered region on the primary monitor
+  --target-label <name>      Override target label used in output/baselines
   --baseline <path>          Compare current run to baseline CSV
   --save-baseline <path>     Save current run as baseline CSV
   --max-regression-pct <f>   Allowed metric increase vs baseline (default: {DEFAULT_MAX_REGRESSION_PCT})
@@ -471,6 +488,7 @@ fn parse_args() -> Result<Config> {
         rounds,
         backends,
         target,
+        target_label_override,
         baseline_path,
         save_baseline_path,
         max_regression_pct,
@@ -503,6 +521,7 @@ fn run_backend(
     measure_frames: usize,
     rounds: usize,
     bench_target: &BenchTarget,
+    target_label_override: Option<&str>,
 ) -> Result<BenchResult> {
     let mut session = CaptureSession::builder()
         .with_backend_kind(kind)
@@ -515,7 +534,7 @@ fn run_backend(
             )
         })?;
     let target = capture_target_for(bench_target);
-    let target_label = target_label(bench_target);
+    let target_label = target_label(bench_target, target_label_override);
     let mut frame = Frame::empty();
 
     let total_samples = measure_frames
@@ -797,7 +816,7 @@ fn main() -> Result<()> {
     let config = parse_args()?;
     println!(
         "Running benchmark: target={} warmup={} frames={} rounds={} backends={} regression_metrics={} max_duplicate_pct={}",
-        target_label(&config.target),
+        target_label(&config.target, config.target_label_override.as_deref()),
         config.warmup_frames,
         config.measure_frames,
         config.rounds,
@@ -828,6 +847,7 @@ fn main() -> Result<()> {
             config.measure_frames,
             config.rounds,
             &config.target,
+            config.target_label_override.as_deref(),
         )?;
         results.push(result);
     }

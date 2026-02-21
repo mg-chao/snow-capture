@@ -66,3 +66,6 @@ name = "region_capture"
 
 [[example]]
 name = "convert_benchmark"
+
+[[example]]
+name = "dxgi_region_dirty_rect_benchmark"

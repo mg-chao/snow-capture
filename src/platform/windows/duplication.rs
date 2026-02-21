@@ -152,11 +152,21 @@ fn region_low_latency_max_pixels() -> u64 {
 #[inline]
 fn region_full_slot_map_fastpath_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    // Experimental opt-in path: map/copy the full staging slot directly
-    // when the destination frame exactly matches region dimensions.
-    // Keep disabled by default until workload benchmarks confirm wins.
-    *ENABLED
-        .get_or_init(|| env_var_truthy("SNOW_CAPTURE_DXGI_ENABLE_REGION_FULL_SLOT_MAP_FASTPATH"))
+    *ENABLED.get_or_init(|| {
+        if env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_REGION_FULL_SLOT_MAP_FASTPATH") {
+            return false;
+        }
+        // Backward-compatible opt-in alias from older builds.
+        // If explicitly set, honor the old truthy/falsey value.
+        if let Ok(raw) = std::env::var("SNOW_CAPTURE_DXGI_ENABLE_REGION_FULL_SLOT_MAP_FASTPATH") {
+            let normalized = raw.trim().to_ascii_lowercase();
+            return normalized == "1"
+                || normalized == "true"
+                || normalized == "yes"
+                || normalized == "on";
+        }
+        true
+    })
 }
 
 #[inline]
@@ -1745,16 +1755,18 @@ impl OutputCapturer {
         region_desc: &D3D11_TEXTURE2D_DESC,
     ) -> CaptureResult<()> {
         let slot = &mut self.region_slots[slot_idx];
-        let staging = surface::ensure_staging_texture(
-            &self.device,
-            &mut slot.staging,
-            region_desc,
-            StagingSampleDesc::SingleSample,
-            "failed to create region staging texture",
-        )?;
-
         let key = (region_desc.Width, region_desc.Height, region_desc.Format);
-        if slot.staging_key != Some(key) || slot.staging_resource.is_none() {
+        let slot_ready = slot.staging_key == Some(key)
+            && slot.staging.is_some()
+            && slot.staging_resource.is_some();
+        if !slot_ready {
+            let staging = surface::ensure_staging_texture(
+                &self.device,
+                &mut slot.staging,
+                region_desc,
+                StagingSampleDesc::SingleSample,
+                "failed to create region staging texture",
+            )?;
             slot.staging_resource = Some(
                 staging
                     .cast::<ID3D11Resource>()

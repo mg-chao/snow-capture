@@ -207,6 +207,23 @@ fn gdi_row_compare_unroll_enabled() -> bool {
     })
 }
 
+#[inline]
+fn gdi_row_compare_bidirectional_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_DISABLE_GDI_ROW_COMPARE_BIDIRECTIONAL")
+            .map(|raw| {
+                let normalized = raw.trim().to_ascii_lowercase();
+                !(normalized == "1"
+                    || normalized == "true"
+                    || normalized == "yes"
+                    || normalized == "on")
+            })
+            .unwrap_or(true)
+    })
+}
+
 const GDI_INCREMENTAL_MIN_PIXELS: usize = 160_000;
 const GDI_INCREMENTAL_MAX_DIRTY_ROW_NUMERATOR: usize = 3;
 const GDI_INCREMENTAL_MAX_DIRTY_ROW_DENOMINATOR: usize = 4;
@@ -243,16 +260,25 @@ fn select_row_compare_kernel() -> RowCompareKernel {
     #[cfg(target_arch = "x86_64")]
     {
         let use_unrolled = gdi_row_compare_unroll_enabled();
+        let use_bidirectional = gdi_row_compare_bidirectional_enabled();
         if std::arch::is_x86_feature_detected!("avx2") {
             return if use_unrolled {
-                row_equal_avx2_unrolled
+                if use_bidirectional {
+                    row_equal_avx2_unrolled
+                } else {
+                    row_equal_avx2_unrolled_legacy
+                }
             } else {
                 row_equal_avx2_legacy
             };
         }
         if std::arch::is_x86_feature_detected!("sse2") {
             return if use_unrolled {
-                row_equal_sse2_unrolled
+                if use_bidirectional {
+                    row_equal_sse2_unrolled
+                } else {
+                    row_equal_sse2_unrolled_legacy
+                }
             } else {
                 row_equal_sse2_legacy
             };
@@ -314,7 +340,7 @@ unsafe fn row_equal_sse2_legacy(lhs: *const u8, rhs: *const u8, len: usize) -> b
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn row_equal_sse2_unrolled(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
+unsafe fn row_equal_sse2_unrolled_legacy(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
     use std::arch::x86_64::{
         __m128i, _mm_and_si128, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8,
     };
@@ -360,6 +386,34 @@ unsafe fn row_equal_sse2_unrolled(lhs: *const u8, rhs: *const u8, len: usize) ->
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn row_equal_sse2_unrolled(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
+    use std::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+
+    if len >= 16 {
+        let tail_offset = len - 16;
+        let tail_left = unsafe { _mm_loadu_si128(lhs.add(tail_offset).cast::<__m128i>()) };
+        let tail_right = unsafe { _mm_loadu_si128(rhs.add(tail_offset).cast::<__m128i>()) };
+        if _mm_movemask_epi8(_mm_cmpeq_epi8(tail_left, tail_right)) != 0xFFFF_i32 {
+            return false;
+        }
+
+        if len >= 64 {
+            let mid_offset = (len >> 1) & !15usize;
+            if mid_offset != tail_offset {
+                let mid_left = unsafe { _mm_loadu_si128(lhs.add(mid_offset).cast::<__m128i>()) };
+                let mid_right = unsafe { _mm_loadu_si128(rhs.add(mid_offset).cast::<__m128i>()) };
+                if _mm_movemask_epi8(_mm_cmpeq_epi8(mid_left, mid_right)) != 0xFFFF_i32 {
+                    return false;
+                }
+            }
+        }
+    }
+
+    unsafe { row_equal_sse2_unrolled_legacy(lhs, rhs, len) }
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn row_equal_avx2_legacy(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
     use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
@@ -380,7 +434,7 @@ unsafe fn row_equal_avx2_legacy(lhs: *const u8, rhs: *const u8, len: usize) -> b
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn row_equal_avx2_unrolled(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
+unsafe fn row_equal_avx2_unrolled_legacy(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
     use std::arch::x86_64::{
         __m256i, _mm256_loadu_si256, _mm256_or_si256, _mm256_testz_si256, _mm256_xor_si256,
     };
@@ -423,6 +477,37 @@ unsafe fn row_equal_avx2_unrolled(lhs: *const u8, rhs: *const u8, len: usize) ->
     }
 
     unsafe { row_equal_scalar(lhs.add(offset), rhs.add(offset), len - offset) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn row_equal_avx2_unrolled(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
+    use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_testz_si256, _mm256_xor_si256};
+
+    if len >= 32 {
+        let tail_offset = len - 32;
+        let tail_left = unsafe { _mm256_loadu_si256(lhs.add(tail_offset).cast::<__m256i>()) };
+        let tail_right = unsafe { _mm256_loadu_si256(rhs.add(tail_offset).cast::<__m256i>()) };
+        let tail_diff = _mm256_xor_si256(tail_left, tail_right);
+        if _mm256_testz_si256(tail_diff, tail_diff) == 0 {
+            return false;
+        }
+
+        if len >= 128 {
+            let mid_offset = (len >> 1) & !31usize;
+            if mid_offset != tail_offset {
+                let mid_left = unsafe { _mm256_loadu_si256(lhs.add(mid_offset).cast::<__m256i>()) };
+                let mid_right =
+                    unsafe { _mm256_loadu_si256(rhs.add(mid_offset).cast::<__m256i>()) };
+                let mid_diff = _mm256_xor_si256(mid_left, mid_right);
+                if _mm256_testz_si256(mid_diff, mid_diff) == 0 {
+                    return false;
+                }
+            }
+        }
+    }
+
+    unsafe { row_equal_avx2_unrolled_legacy(lhs, rhs, len) }
 }
 
 #[inline(always)]
@@ -1844,7 +1929,7 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn unrolled_simd_row_compare_matches_legacy_kernels() {
+    fn simd_row_compare_variants_match_legacy_kernels() {
         let mut lhs = vec![0u8; 8192];
         for (idx, value) in lhs.iter_mut().enumerate() {
             *value = (idx as u8).wrapping_mul(37).wrapping_add(11);
@@ -1854,6 +1939,10 @@ mod tests {
         let test_lengths = [31usize, 64, 127, 255, 512, 1023, 4097, lhs.len()];
         for &len in &test_lengths {
             assert_eq!(
+                unsafe { row_equal_sse2_unrolled_legacy(lhs.as_ptr(), rhs.as_ptr(), len) },
+                unsafe { row_equal_sse2_legacy(lhs.as_ptr(), rhs.as_ptr(), len) }
+            );
+            assert_eq!(
                 unsafe { row_equal_sse2_unrolled(lhs.as_ptr(), rhs.as_ptr(), len) },
                 unsafe { row_equal_sse2_legacy(lhs.as_ptr(), rhs.as_ptr(), len) }
             );
@@ -1861,6 +1950,10 @@ mod tests {
 
         rhs[2027] ^= 0x5A;
         for &len in &test_lengths {
+            assert_eq!(
+                unsafe { row_equal_sse2_unrolled_legacy(lhs.as_ptr(), rhs.as_ptr(), len) },
+                unsafe { row_equal_sse2_legacy(lhs.as_ptr(), rhs.as_ptr(), len) }
+            );
             assert_eq!(
                 unsafe { row_equal_sse2_unrolled(lhs.as_ptr(), rhs.as_ptr(), len) },
                 unsafe { row_equal_sse2_legacy(lhs.as_ptr(), rhs.as_ptr(), len) }
@@ -1871,6 +1964,10 @@ mod tests {
             rhs.copy_from_slice(&lhs);
             for &len in &test_lengths {
                 assert_eq!(
+                    unsafe { row_equal_avx2_unrolled_legacy(lhs.as_ptr(), rhs.as_ptr(), len) },
+                    unsafe { row_equal_avx2_legacy(lhs.as_ptr(), rhs.as_ptr(), len) }
+                );
+                assert_eq!(
                     unsafe { row_equal_avx2_unrolled(lhs.as_ptr(), rhs.as_ptr(), len) },
                     unsafe { row_equal_avx2_legacy(lhs.as_ptr(), rhs.as_ptr(), len) }
                 );
@@ -1878,6 +1975,10 @@ mod tests {
 
             rhs[6015] ^= 0x31;
             for &len in &test_lengths {
+                assert_eq!(
+                    unsafe { row_equal_avx2_unrolled_legacy(lhs.as_ptr(), rhs.as_ptr(), len) },
+                    unsafe { row_equal_avx2_legacy(lhs.as_ptr(), rhs.as_ptr(), len) }
+                );
                 assert_eq!(
                     unsafe { row_equal_avx2_unrolled(lhs.as_ptr(), rhs.as_ptr(), len) },
                     unsafe { row_equal_avx2_legacy(lhs.as_ptr(), rhs.as_ptr(), len) }

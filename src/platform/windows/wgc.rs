@@ -84,6 +84,18 @@ fn immediate_stale_return_enabled() -> bool {
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_IMMEDIATE_STALE_RETURN"))
 }
 
+#[inline]
+fn borrowed_source_resource_cast_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_BORROWED_SOURCE_RESOURCE"))
+}
+
+#[inline]
+fn borrowed_slot_resource_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_BORROWED_SLOT_RESOURCE"))
+}
+
 #[inline(always)]
 fn duration_saturating_add_clamped(base: Duration, delta: Duration, max: Duration) -> Duration {
     base.checked_add(delta).unwrap_or(max).min(max)
@@ -458,6 +470,28 @@ fn map_platform_error(error: windows::core::Error, context: &str) -> CaptureErro
     CaptureError::Platform(anyhow::Error::from(error).context(context.to_string()))
 }
 
+#[inline(always)]
+fn with_texture_resource<T>(
+    texture: &ID3D11Texture2D,
+    cast_context: &'static str,
+    f: impl FnOnce(&ID3D11Resource) -> CaptureResult<T>,
+) -> CaptureResult<T> {
+    if borrowed_source_resource_cast_enabled() {
+        let raw = texture.as_raw();
+        // SAFETY: ID3D11Texture2D inherits from ID3D11Resource, so the raw
+        // COM pointer is valid when viewed through the base interface.
+        if let Some(resource) = unsafe { ID3D11Resource::from_raw_borrowed(&raw) } {
+            return f(resource);
+        }
+    }
+
+    let owned_resource: ID3D11Resource = texture
+        .cast()
+        .context(cast_context)
+        .map_err(CaptureError::Platform)?;
+    f(&owned_resource)
+}
+
 fn create_winrt_device(device: &ID3D11Device) -> CaptureResult<IDirect3DDevice> {
     let dxgi_device: IDXGIDevice = device
         .cast()
@@ -631,7 +665,7 @@ impl WindowsGraphicsCaptureCapturer {
                                 signal_for_frames
                                     .sequence_hint
                                     .store(state.sequence, Ordering::Release);
-                                signal_for_frames.cv.notify_all();
+                                signal_for_frames.cv.notify_one();
                             }
                         }
                         Ok(())
@@ -648,7 +682,7 @@ impl WindowsGraphicsCaptureCapturer {
                     if let Ok(mut state) = signal_for_closed.state.lock() {
                         state.closed = true;
                         signal_for_closed.closed_hint.store(true, Ordering::Release);
-                        signal_for_closed.cv.notify_all();
+                        signal_for_closed.cv.notify_one();
                     }
                     Ok(())
                 }),
@@ -1088,27 +1122,123 @@ impl WindowsGraphicsCaptureCapturer {
         blit: CaptureBlitRegion,
         can_use_dirty_gpu_copy: bool,
     ) -> CaptureResult<()> {
-        let staging_resource = self.region_slots[slot_idx]
-            .staging_resource
-            .as_ref()
-            .ok_or_else(|| {
+        if !borrowed_slot_resource_enabled() {
+            let staging_resource = self.region_slots[slot_idx]
+                .staging_resource
+                .as_ref()
+                .ok_or_else(|| {
+                    CaptureError::Platform(anyhow::anyhow!(
+                        "failed to resolve WGC region staging resource for slot {}",
+                        slot_idx
+                    ))
+                })?
+                .clone();
+            let query = self.region_slots[slot_idx].query.clone();
+
+            let mut used_dirty_copy = false;
+            if can_use_dirty_gpu_copy && region_dirty_gpu_copy_enabled() {
+                let use_dirty_copy = {
+                    let slot = &self.region_slots[slot_idx];
+                    slot.dirty_copy_preferred
+                };
+
+                if use_dirty_copy {
+                    let slot = &self.region_slots[slot_idx];
+                    for rect in &slot.dirty_rects {
+                        let source_left = blit
+                            .src_x
+                            .checked_add(rect.x)
+                            .ok_or(CaptureError::BufferOverflow)?;
+                        let source_top = blit
+                            .src_y
+                            .checked_add(rect.y)
+                            .ok_or(CaptureError::BufferOverflow)?;
+                        let source_right = source_left
+                            .checked_add(rect.width)
+                            .ok_or(CaptureError::BufferOverflow)?;
+                        let source_bottom = source_top
+                            .checked_add(rect.height)
+                            .ok_or(CaptureError::BufferOverflow)?;
+                        let source_box = D3D11_BOX {
+                            left: source_left,
+                            top: source_top,
+                            front: 0,
+                            right: source_right,
+                            bottom: source_bottom,
+                            back: 1,
+                        };
+                        unsafe {
+                            self.context.CopySubresourceRegion(
+                                &staging_resource,
+                                0,
+                                rect.x,
+                                rect.y,
+                                0,
+                                source_resource,
+                                0,
+                                Some(&source_box),
+                            );
+                        }
+                    }
+                    used_dirty_copy = true;
+                }
+            }
+
+            if !used_dirty_copy {
+                let src_right = blit
+                    .src_x
+                    .checked_add(blit.width)
+                    .ok_or(CaptureError::BufferOverflow)?;
+                let src_bottom = blit
+                    .src_y
+                    .checked_add(blit.height)
+                    .ok_or(CaptureError::BufferOverflow)?;
+                let source_box = D3D11_BOX {
+                    left: blit.src_x,
+                    top: blit.src_y,
+                    front: 0,
+                    right: src_right,
+                    bottom: src_bottom,
+                    back: 1,
+                };
+
+                unsafe {
+                    self.context.CopySubresourceRegion(
+                        &staging_resource,
+                        0,
+                        0,
+                        0,
+                        0,
+                        source_resource,
+                        0,
+                        Some(&source_box),
+                    );
+                }
+            }
+
+            if let Some(query) = query.as_ref() {
+                unsafe {
+                    self.context.End(query);
+                }
+            }
+            self.region_slots[slot_idx].populated = true;
+            return Ok(());
+        }
+
+        let mut used_dirty_copy = false;
+        {
+            let slot = &self.region_slots[slot_idx];
+            let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
                 CaptureError::Platform(anyhow::anyhow!(
                     "failed to resolve WGC region staging resource for slot {}",
                     slot_idx
                 ))
-            })?
-            .clone();
-        let query = self.region_slots[slot_idx].query.clone();
+            })?;
 
-        let mut used_dirty_copy = false;
-        if can_use_dirty_gpu_copy && region_dirty_gpu_copy_enabled() {
-            let use_dirty_copy = {
-                let slot = &self.region_slots[slot_idx];
-                slot.dirty_copy_preferred
-            };
-
-            if use_dirty_copy {
-                let slot = &self.region_slots[slot_idx];
+            if can_use_dirty_gpu_copy
+                && region_dirty_gpu_copy_enabled()
+                && slot.dirty_copy_preferred
+            {
                 for rect in &slot.dirty_rects {
                     let source_left = blit
                         .src_x
@@ -1134,7 +1264,7 @@ impl WindowsGraphicsCaptureCapturer {
                     };
                     unsafe {
                         self.context.CopySubresourceRegion(
-                            &staging_resource,
+                            staging_resource,
                             0,
                             rect.x,
                             rect.y,
@@ -1147,43 +1277,43 @@ impl WindowsGraphicsCaptureCapturer {
                 }
                 used_dirty_copy = true;
             }
-        }
 
-        if !used_dirty_copy {
-            let src_right = blit
-                .src_x
-                .checked_add(blit.width)
-                .ok_or(CaptureError::BufferOverflow)?;
-            let src_bottom = blit
-                .src_y
-                .checked_add(blit.height)
-                .ok_or(CaptureError::BufferOverflow)?;
-            let source_box = D3D11_BOX {
-                left: blit.src_x,
-                top: blit.src_y,
-                front: 0,
-                right: src_right,
-                bottom: src_bottom,
-                back: 1,
-            };
+            if !used_dirty_copy {
+                let src_right = blit
+                    .src_x
+                    .checked_add(blit.width)
+                    .ok_or(CaptureError::BufferOverflow)?;
+                let src_bottom = blit
+                    .src_y
+                    .checked_add(blit.height)
+                    .ok_or(CaptureError::BufferOverflow)?;
+                let source_box = D3D11_BOX {
+                    left: blit.src_x,
+                    top: blit.src_y,
+                    front: 0,
+                    right: src_right,
+                    bottom: src_bottom,
+                    back: 1,
+                };
 
-            unsafe {
-                self.context.CopySubresourceRegion(
-                    &staging_resource,
-                    0,
-                    0,
-                    0,
-                    0,
-                    source_resource,
-                    0,
-                    Some(&source_box),
-                );
+                unsafe {
+                    self.context.CopySubresourceRegion(
+                        staging_resource,
+                        0,
+                        0,
+                        0,
+                        0,
+                        source_resource,
+                        0,
+                        Some(&source_box),
+                    );
+                }
             }
-        }
 
-        if let Some(query) = query.as_ref() {
-            unsafe {
-                self.context.End(query);
+            if let Some(query) = slot.query.as_ref() {
+                unsafe {
+                    self.context.End(query);
+                }
             }
         }
         self.region_slots[slot_idx].populated = true;
@@ -1196,27 +1326,89 @@ impl WindowsGraphicsCaptureCapturer {
         source_resource: &ID3D11Resource,
         can_use_dirty_gpu_copy: bool,
     ) -> CaptureResult<()> {
-        let staging_resource = self.staging_slots[slot_idx]
-            .staging_resource
-            .as_ref()
-            .ok_or_else(|| {
+        if !borrowed_slot_resource_enabled() {
+            let staging_resource = self.staging_slots[slot_idx]
+                .staging_resource
+                .as_ref()
+                .ok_or_else(|| {
+                    CaptureError::Platform(anyhow::anyhow!(
+                        "failed to resolve WGC staging resource for slot {}",
+                        slot_idx
+                    ))
+                })?
+                .clone();
+            let query = self.staging_slots[slot_idx].query.clone();
+
+            let mut used_dirty_copy = false;
+            if can_use_dirty_gpu_copy {
+                let use_dirty_copy = {
+                    let slot = &self.staging_slots[slot_idx];
+                    slot.dirty_copy_preferred
+                };
+
+                if use_dirty_copy {
+                    let slot = &self.staging_slots[slot_idx];
+                    for rect in &slot.dirty_rects {
+                        let right = rect
+                            .x
+                            .checked_add(rect.width)
+                            .ok_or(CaptureError::BufferOverflow)?;
+                        let bottom = rect
+                            .y
+                            .checked_add(rect.height)
+                            .ok_or(CaptureError::BufferOverflow)?;
+                        let source_box = D3D11_BOX {
+                            left: rect.x,
+                            top: rect.y,
+                            front: 0,
+                            right,
+                            bottom,
+                            back: 1,
+                        };
+                        unsafe {
+                            self.context.CopySubresourceRegion(
+                                &staging_resource,
+                                0,
+                                rect.x,
+                                rect.y,
+                                0,
+                                source_resource,
+                                0,
+                                Some(&source_box),
+                            );
+                        }
+                    }
+                    used_dirty_copy = true;
+                }
+            }
+
+            if !used_dirty_copy {
+                unsafe {
+                    self.context
+                        .CopyResource(&staging_resource, source_resource);
+                }
+            }
+
+            if let Some(query) = query.as_ref() {
+                unsafe {
+                    self.context.End(query);
+                }
+            }
+            self.staging_slots[slot_idx].populated = true;
+            return Ok(());
+        }
+
+        let mut used_dirty_copy = false;
+        {
+            let slot = &self.staging_slots[slot_idx];
+            let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
                 CaptureError::Platform(anyhow::anyhow!(
                     "failed to resolve WGC staging resource for slot {}",
                     slot_idx
                 ))
-            })?
-            .clone();
-        let query = self.staging_slots[slot_idx].query.clone();
+            })?;
 
-        let mut used_dirty_copy = false;
-        if can_use_dirty_gpu_copy {
-            let use_dirty_copy = {
-                let slot = &self.staging_slots[slot_idx];
-                slot.dirty_copy_preferred
-            };
-
-            if use_dirty_copy {
-                let slot = &self.staging_slots[slot_idx];
+            if can_use_dirty_gpu_copy && slot.dirty_copy_preferred {
                 for rect in &slot.dirty_rects {
                     let right = rect
                         .x
@@ -1236,7 +1428,7 @@ impl WindowsGraphicsCaptureCapturer {
                     };
                     unsafe {
                         self.context.CopySubresourceRegion(
-                            &staging_resource,
+                            staging_resource,
                             0,
                             rect.x,
                             rect.y,
@@ -1249,18 +1441,17 @@ impl WindowsGraphicsCaptureCapturer {
                 }
                 used_dirty_copy = true;
             }
-        }
 
-        if !used_dirty_copy {
-            unsafe {
-                self.context
-                    .CopyResource(&staging_resource, source_resource);
+            if !used_dirty_copy {
+                unsafe {
+                    self.context.CopyResource(staging_resource, source_resource);
+                }
             }
-        }
 
-        if let Some(query) = query.as_ref() {
-            unsafe {
-                self.context.End(query);
+            if let Some(query) = slot.query.as_ref() {
+                unsafe {
+                    self.context.End(query);
+                }
             }
         }
         self.staging_slots[slot_idx].populated = true;
@@ -1818,15 +2009,17 @@ impl WindowsGraphicsCaptureCapturer {
                     slot.populated = true;
                 }
 
-                let source_resource: ID3D11Resource = effective_source
-                    .cast()
-                    .context("failed to cast WGC region source texture to ID3D11Resource")
-                    .map_err(CaptureError::Platform)?;
-                self.copy_region_source_to_slot(
-                    write_slot,
-                    &source_resource,
-                    blit,
-                    can_use_dirty_gpu_copy,
+                with_texture_resource(
+                    &effective_source,
+                    "failed to cast WGC region source texture to ID3D11Resource",
+                    |source_resource| {
+                        self.copy_region_source_to_slot(
+                            write_slot,
+                            source_resource,
+                            blit,
+                            can_use_dirty_gpu_copy,
+                        )
+                    },
                 )?;
                 self.maybe_flush_region_after_submit(write_slot, read_slot);
                 read_slot
@@ -2067,11 +2260,17 @@ impl WindowsGraphicsCaptureCapturer {
                     slot.populated = true;
                 }
 
-                let source_resource: ID3D11Resource = effective_source
-                    .cast()
-                    .context("failed to cast WGC frame texture to ID3D11Resource")
-                    .map_err(CaptureError::Platform)?;
-                self.copy_source_to_slot(write_slot, &source_resource, can_use_dirty_gpu_copy)?;
+                with_texture_resource(
+                    &effective_source,
+                    "failed to cast WGC frame texture to ID3D11Resource",
+                    |source_resource| {
+                        self.copy_source_to_slot(
+                            write_slot,
+                            source_resource,
+                            can_use_dirty_gpu_copy,
+                        )
+                    },
+                )?;
                 self.maybe_flush_after_submit(write_slot, read_slot);
                 read_slot
             };

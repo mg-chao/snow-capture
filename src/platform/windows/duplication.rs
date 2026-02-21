@@ -209,7 +209,8 @@ struct RegionStagingSlot {
     present_time_qpc: i64,
     is_duplicate: bool,
     dirty_mode_available: bool,
-    dirty_copy_preferred: bool,
+    dirty_cpu_copy_preferred: bool,
+    dirty_gpu_copy_preferred: bool,
     dirty_rects: Vec<DirtyRect>,
     populated: bool,
 }
@@ -222,7 +223,8 @@ impl RegionStagingSlot {
         self.present_time_qpc = 0;
         self.is_duplicate = false;
         self.dirty_mode_available = false;
-        self.dirty_copy_preferred = false;
+        self.dirty_cpu_copy_preferred = false;
+        self.dirty_gpu_copy_preferred = false;
         self.dirty_rects.clear();
         self.populated = false;
     }
@@ -380,13 +382,19 @@ fn normalize_dirty_rects_legacy_after_clamp(rects: &mut Vec<DirtyRect>) {
 }
 
 #[inline(always)]
-unsafe fn remove_dirty_rect_at_unchecked(rects: &mut Vec<DirtyRect>, idx: usize) {
-    let len = rects.len();
+unsafe fn remove_dirty_rect_candidate_at_unchecked(
+    candidates: &mut Vec<DirtyRectMergeCandidate>,
+    idx: usize,
+) {
+    let len = candidates.len();
     debug_assert!(idx < len);
-    let ptr = rects.as_mut_ptr();
+    let ptr = candidates.as_mut_ptr();
     unsafe {
-        std::ptr::copy(ptr.add(idx + 1), ptr.add(idx), len - idx - 1);
-        rects.set_len(len - 1);
+        let tail_len = len - idx - 1;
+        if tail_len > 0 {
+            std::ptr::copy(ptr.add(idx + 1), ptr.add(idx), tail_len);
+        }
+        candidates.set_len(len - 1);
     }
 }
 
@@ -432,27 +440,27 @@ fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height
     }
 
     pending.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
-    rects.reserve(pending.len());
+    let mut merged: Vec<DirtyRectMergeCandidate> = Vec::with_capacity(pending.len());
     for rect in pending {
-        let mut candidate = rect;
+        let mut candidate = DirtyRectMergeCandidate::new(rect);
         loop {
             let mut merged_any = false;
-            let candidate_bottom = candidate.y.saturating_add(candidate.height);
+            let mut candidate_bottom = candidate.bottom;
             let mut idx = 0usize;
-            while idx < rects.len() {
-                let existing = rects[idx];
-                let existing_bottom = existing.y.saturating_add(existing.height);
-                if existing_bottom < candidate.y {
+            while idx < merged.len() {
+                let existing = merged[idx];
+                if existing.bottom < candidate.rect.y {
                     idx += 1;
                     continue;
                 }
-                if existing.y > candidate_bottom {
+                if existing.rect.y > candidate_bottom {
                     break;
                 }
 
-                if dirty_rects_can_merge(candidate, existing) {
-                    candidate = merge_dirty_rects(candidate, existing);
-                    unsafe { remove_dirty_rect_at_unchecked(rects, idx) };
+                if candidate.can_merge(existing) {
+                    candidate.merge_in_place(existing);
+                    candidate_bottom = candidate.bottom;
+                    unsafe { remove_dirty_rect_candidate_at_unchecked(&mut merged, idx) };
                     merged_any = true;
                 } else {
                     idx += 1;
@@ -464,16 +472,20 @@ fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height
             }
         }
 
-        let insert_at = rects
+        let insert_at = merged
             .binary_search_by(|probe| {
                 probe
+                    .rect
                     .y
-                    .cmp(&candidate.y)
-                    .then_with(|| probe.x.cmp(&candidate.x))
+                    .cmp(&candidate.rect.y)
+                    .then_with(|| probe.rect.x.cmp(&candidate.rect.x))
             })
             .unwrap_or_else(|pos| pos);
-        rects.insert(insert_at, candidate);
+        merged.insert(insert_at, candidate);
     }
+
+    rects.reserve(merged.len());
+    rects.extend(merged.into_iter().map(|candidate| candidate.rect));
 }
 
 #[cfg(test)]
@@ -1244,76 +1256,117 @@ fn extract_dirty_rects(
     true
 }
 
+#[derive(Clone, Copy, Default)]
+struct DirtyCopyStrategy {
+    cpu: bool,
+    gpu: bool,
+    gpu_low_latency: bool,
+}
+
+fn evaluate_dirty_copy_strategy(rects: &[DirtyRect], width: u32, height: u32) -> DirtyCopyStrategy {
+    if rects.is_empty() {
+        return DirtyCopyStrategy::default();
+    }
+
+    let total_pixels = (width as u64).saturating_mul(height as u64);
+    if total_pixels == 0 {
+        return DirtyCopyStrategy::default();
+    }
+
+    let cpu_candidate = rects.len() <= DXGI_DIRTY_COPY_MAX_RECTS;
+    if !cpu_candidate {
+        return DirtyCopyStrategy::default();
+    }
+    let gpu_candidate = rects.len() <= DXGI_DIRTY_GPU_COPY_MAX_RECTS;
+    let low_latency_candidate = rects.len() <= DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS;
+
+    let cpu_limit = total_pixels.saturating_mul(DXGI_DIRTY_COPY_MAX_AREA_PERCENT);
+    let mut dirty_pixels = 0u64;
+
+    // Fast path: rect-count threshold already disqualifies GPU paths.
+    if !gpu_candidate {
+        for rect in rects {
+            dirty_pixels =
+                dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+            if dirty_pixels.saturating_mul(100) > cpu_limit {
+                return DirtyCopyStrategy::default();
+            }
+        }
+        return DirtyCopyStrategy {
+            cpu: true,
+            gpu: false,
+            gpu_low_latency: false,
+        };
+    }
+
+    let gpu_limit = total_pixels.saturating_mul(DXGI_DIRTY_GPU_COPY_MAX_AREA_PERCENT);
+    if !low_latency_candidate {
+        let mut cpu = true;
+        let mut gpu = true;
+        for rect in rects {
+            dirty_pixels =
+                dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+            let dirty_percent_scaled = dirty_pixels.saturating_mul(100);
+            if gpu && dirty_percent_scaled > gpu_limit {
+                gpu = false;
+            }
+            if cpu && dirty_percent_scaled > cpu_limit {
+                cpu = false;
+            }
+            if !cpu && !gpu {
+                break;
+            }
+        }
+        return DirtyCopyStrategy {
+            cpu,
+            gpu,
+            gpu_low_latency: false,
+        };
+    }
+
+    let gpu_low_latency_limit =
+        total_pixels.saturating_mul(DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT);
+    let mut cpu = true;
+    let mut gpu = true;
+    let mut gpu_low_latency = true;
+    for rect in rects {
+        dirty_pixels =
+            dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+        let dirty_percent_scaled = dirty_pixels.saturating_mul(100);
+        if gpu_low_latency && dirty_percent_scaled > gpu_low_latency_limit {
+            gpu_low_latency = false;
+        }
+        if gpu && dirty_percent_scaled > gpu_limit {
+            gpu = false;
+        }
+        if cpu && dirty_percent_scaled > cpu_limit {
+            cpu = false;
+        }
+        if !cpu && !gpu && !gpu_low_latency {
+            break;
+        }
+    }
+
+    DirtyCopyStrategy {
+        cpu,
+        gpu,
+        gpu_low_latency,
+    }
+}
+
+#[cfg(test)]
 fn should_use_dirty_copy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
-    if rects.is_empty() || rects.len() > DXGI_DIRTY_COPY_MAX_RECTS {
-        return false;
-    }
-
-    let total_pixels = (width as u64).saturating_mul(height as u64);
-    if total_pixels == 0 {
-        return false;
-    }
-
-    let mut dirty_pixels = 0u64;
-    for rect in rects {
-        dirty_pixels =
-            dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
-        if dirty_pixels.saturating_mul(100)
-            > total_pixels.saturating_mul(DXGI_DIRTY_COPY_MAX_AREA_PERCENT)
-        {
-            return false;
-        }
-    }
-
-    true
+    evaluate_dirty_copy_strategy(rects, width, height).cpu
 }
 
+#[cfg(test)]
 fn should_use_dirty_gpu_copy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
-    if rects.is_empty() || rects.len() > DXGI_DIRTY_GPU_COPY_MAX_RECTS {
-        return false;
-    }
-
-    let total_pixels = (width as u64).saturating_mul(height as u64);
-    if total_pixels == 0 {
-        return false;
-    }
-
-    let mut dirty_pixels = 0u64;
-    for rect in rects {
-        dirty_pixels =
-            dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
-        if dirty_pixels.saturating_mul(100)
-            > total_pixels.saturating_mul(DXGI_DIRTY_GPU_COPY_MAX_AREA_PERCENT)
-        {
-            return false;
-        }
-    }
-
-    true
+    evaluate_dirty_copy_strategy(rects, width, height).gpu
 }
 
+#[cfg(test)]
 fn should_use_low_latency_dirty_gpu_copy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
-    if rects.is_empty() || rects.len() > DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS {
-        return false;
-    }
-
-    let total_pixels = (width as u64).saturating_mul(height as u64);
-    if total_pixels == 0 {
-        return false;
-    }
-
-    let mut dirty_pixels = 0u64;
-    for rect in rects {
-        dirty_pixels =
-            dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
-        if dirty_pixels.saturating_mul(100)
-            > total_pixels.saturating_mul(DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT)
-        {
-            return false;
-        }
-    }
-
-    true
+    evaluate_dirty_copy_strategy(rects, width, height).gpu_low_latency
 }
 
 #[inline(always)]
@@ -1559,6 +1612,8 @@ struct OutputCapturer {
     pending_is_duplicate: bool,
     /// Dirty rectangles associated with the pending pipelined frame.
     pending_dirty_rects: Vec<DirtyRect>,
+    /// Pre-computed dirty-copy strategy for `pending_dirty_rects`.
+    pending_dirty_cpu_copy_preferred: bool,
     /// Cached descriptor of the desktop texture from the duplication
     /// interface.  DXGI duplication textures don't change format/size
     /// mid-session, so we only need to query once (and re-query after
@@ -1619,6 +1674,7 @@ impl OutputCapturer {
             pending_hdr: None,
             pending_is_duplicate: false,
             pending_dirty_rects: Vec::new(),
+            pending_dirty_cpu_copy_preferred: false,
             cached_src_desc: None,
             spare_frame: None,
             region_slots: std::array::from_fn(|_| RegionStagingSlot::default()),
@@ -1646,6 +1702,7 @@ impl OutputCapturer {
         self.pending_hdr = None;
         self.pending_is_duplicate = false;
         self.pending_dirty_rects.clear();
+        self.pending_dirty_cpu_copy_preferred = false;
         self.cached_src_desc = None;
         self.invalidate_region_pipeline();
         self.dxgi_rect_buffer.clear();
@@ -1666,6 +1723,7 @@ impl OutputCapturer {
         self.pending_hdr = None;
         self.pending_is_duplicate = false;
         self.pending_dirty_rects.clear();
+        self.pending_dirty_cpu_copy_preferred = false;
         self.staging_ring.reset_pipeline();
         self.reset_region_pipeline();
     }
@@ -1868,7 +1926,7 @@ impl OutputCapturer {
                 let mut used_dirty_copy = false;
                 if can_use_dirty_gpu_copy
                     && region_dirty_gpu_copy_enabled()
-                    && slot.dirty_copy_preferred
+                    && slot.dirty_gpu_copy_preferred
                 {
                     for rect in &slot.dirty_rects {
                         let source_left = blit
@@ -2009,8 +2067,7 @@ impl OutputCapturer {
         let use_dirty_copy = destination_has_history
             && slot.dirty_mode_available
             && !slot.dirty_rects.is_empty()
-            && (slot.dirty_copy_preferred
-                || should_use_dirty_copy(&slot.dirty_rects, source_desc.Width, source_desc.Height));
+            && slot.dirty_cpu_copy_preferred;
         let write_full_slot_direct = region_full_slot_map_fastpath_enabled()
             && blit.dst_x == 0
             && blit.dst_y == 0
@@ -2104,6 +2161,7 @@ impl OutputCapturer {
         self.pending_hdr = None;
         self.pending_is_duplicate = false;
         self.pending_dirty_rects.clear();
+        self.pending_dirty_cpu_copy_preferred = false;
         self.staging_ring.reset_pipeline();
 
         let mut destination_has_history = destination_has_history;
@@ -2230,18 +2288,17 @@ impl OutputCapturer {
             }
 
             let recording_mode = self.capture_mode == CaptureMode::ScreenRecording;
-            let low_latency_dirty_gpu_preferred = region_dirty_available
-                && should_use_low_latency_dirty_gpu_copy(
+            let dirty_copy_strategy = if region_dirty_available {
+                evaluate_dirty_copy_strategy(
                     &region_dirty_rects,
                     region_desc.Width,
                     region_desc.Height,
-                );
-            let regular_dirty_gpu_preferred = region_dirty_available
-                && should_use_dirty_gpu_copy(
-                    &region_dirty_rects,
-                    region_desc.Width,
-                    region_desc.Height,
-                );
+                )
+            } else {
+                DirtyCopyStrategy::default()
+            };
+            let low_latency_dirty_gpu_preferred = dirty_copy_strategy.gpu_low_latency;
+            let regular_dirty_gpu_preferred = dirty_copy_strategy.gpu;
             let low_latency_recording = should_use_window_low_latency_region_path(
                 recording_mode,
                 prefer_low_latency,
@@ -2276,7 +2333,8 @@ impl OutputCapturer {
                 slot.hdr_to_sdr = effective_hdr;
                 slot.source_desc = Some(region_desc);
                 slot.dirty_mode_available = region_dirty_available;
-                slot.dirty_copy_preferred = false;
+                slot.dirty_cpu_copy_preferred = false;
+                slot.dirty_gpu_copy_preferred = false;
                 slot.dirty_rects.clear();
                 slot.populated = true;
                 slot_idx
@@ -2293,12 +2351,14 @@ impl OutputCapturer {
                     slot.source_desc = Some(region_desc);
                     slot.dirty_mode_available = region_dirty_available;
                     std::mem::swap(&mut slot.dirty_rects, &mut region_dirty_rects);
+                    slot.dirty_cpu_copy_preferred =
+                        region_dirty_available && dirty_copy_strategy.cpu;
                     let dirty_gpu_copy_preferred = if low_latency_recording {
                         low_latency_dirty_gpu_preferred
                     } else {
                         regular_dirty_gpu_preferred
                     };
-                    slot.dirty_copy_preferred = can_use_dirty_gpu_copy
+                    slot.dirty_gpu_copy_preferred = can_use_dirty_gpu_copy
                         && region_dirty_available
                         && dirty_gpu_copy_preferred;
                     slot.populated = true;
@@ -2456,6 +2516,7 @@ impl OutputCapturer {
             let mut read_hdr = effective_hdr;
             let mut read_is_duplicate = frame_pixels_unchanged;
             let mut read_dirty_rects: &[DirtyRect] = &[];
+            let mut read_dirty_cpu_copy_preferred = false;
 
             if skip_submit_copy {
                 if let Some(prev_desc) = self.pending_desc.as_ref() {
@@ -2466,6 +2527,7 @@ impl OutputCapturer {
                     // non-duplicate frame). Respect its duplicate state.
                     read_is_duplicate = self.pending_is_duplicate;
                     read_dirty_rects = &self.pending_dirty_rects;
+                    read_dirty_cpu_copy_preferred = self.pending_dirty_cpu_copy_preferred;
                 }
             } else {
                 let submitted_read_slot = self
@@ -2480,6 +2542,7 @@ impl OutputCapturer {
                     read_hdr = self.pending_hdr;
                     read_is_duplicate = self.pending_is_duplicate;
                     read_dirty_rects = &self.pending_dirty_rects;
+                    read_dirty_cpu_copy_preferred = self.pending_dirty_cpu_copy_preferred;
                 } else {
                     // Bootstrap/desync path: read the freshly submitted slot.
                     read_slot = self.staging_ring.latest_write_slot();
@@ -2496,7 +2559,7 @@ impl OutputCapturer {
             let use_dirty_copy = output_matches_source
                 && !skip_readback
                 && !read_dirty_rects.is_empty()
-                && should_use_dirty_copy(read_dirty_rects, read_desc.Width, read_desc.Height);
+                && read_dirty_cpu_copy_preferred;
             self.staging_ring.read_slot_with_strategy(
                 &self.context,
                 read_slot,
@@ -2513,11 +2576,13 @@ impl OutputCapturer {
                 // keep metadata aligned with that slot's unchanged contents.
                 self.pending_is_duplicate = true;
                 self.pending_dirty_rects.clear();
+                self.pending_dirty_cpu_copy_preferred = false;
             } else {
                 self.pending_desc = Some(effective_desc);
                 self.pending_hdr = effective_hdr;
                 self.pending_is_duplicate = frame_pixels_unchanged;
                 self.pending_dirty_rects.clear();
+                self.pending_dirty_cpu_copy_preferred = false;
                 if !frame_pixels_unchanged {
                     self.pending_dirty_rects
                         .extend_from_slice(&frame.metadata.dirty_rects);
@@ -2526,6 +2591,12 @@ impl OutputCapturer {
                         effective_desc.Width,
                         effective_desc.Height,
                     );
+                    self.pending_dirty_cpu_copy_preferred = evaluate_dirty_copy_strategy(
+                        &self.pending_dirty_rects,
+                        effective_desc.Width,
+                        effective_desc.Height,
+                    )
+                    .cpu;
                 }
             }
         } else {
@@ -2536,6 +2607,7 @@ impl OutputCapturer {
             self.pending_hdr = None;
             self.pending_is_duplicate = false;
             self.pending_dirty_rects.clear();
+            self.pending_dirty_cpu_copy_preferred = false;
             self.staging_ring.reset_pipeline();
             self.staging_ring.copy_and_read(
                 &self.context,
@@ -3679,5 +3751,292 @@ mod tests {
             bottom: 1080,
         };
         assert!(!rect_within_rect(&inner, &outer));
+    }
+
+    fn row_major_rects(
+        start_x: u32,
+        start_y: u32,
+        cols: u32,
+        rows: u32,
+        rect_w: u32,
+        rect_h: u32,
+        gap_x: u32,
+        gap_y: u32,
+        limit: usize,
+    ) -> Vec<DirtyRect> {
+        let mut out = Vec::with_capacity(limit);
+        for row in 0..rows {
+            for col in 0..cols {
+                if out.len() == limit {
+                    return out;
+                }
+                let x = start_x + col * (rect_w + gap_x);
+                let y = start_y + row * (rect_h + gap_y);
+                out.push(DirtyRect {
+                    x,
+                    y,
+                    width: rect_w,
+                    height: rect_h,
+                });
+            }
+        }
+        out
+    }
+
+    fn make_dirty_strategy_workloads() -> Vec<Vec<DirtyRect>> {
+        vec![
+            row_major_rects(24, 18, 8, 4, 32, 28, 24, 18, 32),
+            row_major_rects(8, 8, 16, 6, 10, 8, 8, 6, 96),
+            row_major_rects(32, 24, 2, 10, 640, 18, 96, 10, 20),
+            row_major_rects(6, 6, 30, 6, 8, 6, 4, 3, 180),
+        ]
+    }
+
+    fn make_normalize_bench_inputs() -> Vec<Vec<DirtyRect>> {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut out = Vec::with_capacity(24);
+        for _ in 0..24 {
+            let mut rects = Vec::with_capacity(200);
+            let rect_count = 96 + ((state >> 5) as usize % 96);
+            for _ in 0..rect_count {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let x = ((state >> 12) as u32) % 2600;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let y = ((state >> 20) as u32) % 1500;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let width = 1 + ((state >> 24) as u32) % 900;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let height = 1 + ((state >> 28) as u32) % 500;
+                rects.push(DirtyRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                });
+            }
+            out.push(rects);
+        }
+        out
+    }
+
+    fn should_use_dirty_copy_legacy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
+        if rects.is_empty() || rects.len() > DXGI_DIRTY_COPY_MAX_RECTS {
+            return false;
+        }
+
+        let total_pixels = (width as u64).saturating_mul(height as u64);
+        if total_pixels == 0 {
+            return false;
+        }
+
+        let mut dirty_pixels = 0u64;
+        for rect in rects {
+            dirty_pixels =
+                dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+            if dirty_pixels.saturating_mul(100)
+                > total_pixels.saturating_mul(DXGI_DIRTY_COPY_MAX_AREA_PERCENT)
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn should_use_dirty_gpu_copy_legacy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
+        if rects.is_empty() || rects.len() > DXGI_DIRTY_GPU_COPY_MAX_RECTS {
+            return false;
+        }
+
+        let total_pixels = (width as u64).saturating_mul(height as u64);
+        if total_pixels == 0 {
+            return false;
+        }
+
+        let mut dirty_pixels = 0u64;
+        for rect in rects {
+            dirty_pixels =
+                dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+            if dirty_pixels.saturating_mul(100)
+                > total_pixels.saturating_mul(DXGI_DIRTY_GPU_COPY_MAX_AREA_PERCENT)
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn should_use_low_latency_dirty_gpu_copy_legacy(
+        rects: &[DirtyRect],
+        width: u32,
+        height: u32,
+    ) -> bool {
+        if rects.is_empty() || rects.len() > DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS {
+            return false;
+        }
+
+        let total_pixels = (width as u64).saturating_mul(height as u64);
+        if total_pixels == 0 {
+            return false;
+        }
+
+        let mut dirty_pixels = 0u64;
+        for rect in rects {
+            dirty_pixels =
+                dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+            if dirty_pixels.saturating_mul(100)
+                > total_pixels.saturating_mul(DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT)
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    #[test]
+    #[ignore = "performance benchmark guard; run explicitly with --ignored --nocapture"]
+    fn bench_dirty_copy_strategy_single_pass_vs_legacy() {
+        use std::hint::black_box;
+
+        let workloads = make_dirty_strategy_workloads();
+        for rects in &workloads {
+            let legacy_cpu = should_use_dirty_copy_legacy(rects, 1920, 1080);
+            let legacy_gpu = should_use_dirty_gpu_copy_legacy(rects, 1920, 1080);
+            let legacy_gpu_low = should_use_low_latency_dirty_gpu_copy_legacy(rects, 1920, 1080);
+            let optimized = evaluate_dirty_copy_strategy(rects, 1920, 1080);
+            assert_eq!(optimized.cpu, legacy_cpu);
+            assert_eq!(optimized.gpu, legacy_gpu);
+            assert_eq!(optimized.gpu_low_latency, legacy_gpu_low);
+        }
+
+        let warmup_iters = 10_000usize;
+        let measure_iters = 120_000usize;
+
+        let mut sink = 0usize;
+        for iter in 0..warmup_iters {
+            let rects = black_box(&workloads[iter % workloads.len()]);
+            let width = black_box(1920u32);
+            let height = black_box(1080u32);
+            sink ^= should_use_dirty_copy_legacy(rects, width, height) as usize;
+            sink ^= (should_use_dirty_gpu_copy_legacy(rects, width, height) as usize) << 1;
+            sink ^=
+                (should_use_low_latency_dirty_gpu_copy_legacy(rects, width, height) as usize) << 2;
+            let strategy = evaluate_dirty_copy_strategy(rects, width, height);
+            sink ^= (strategy.cpu as usize) << 3;
+            sink ^= (strategy.gpu as usize) << 4;
+            sink ^= (strategy.gpu_low_latency as usize) << 5;
+        }
+
+        let legacy_start = std::time::Instant::now();
+        for iter in 0..measure_iters {
+            let rects = black_box(&workloads[iter % workloads.len()]);
+            let width = black_box(1920u32);
+            let height = black_box(1080u32);
+            sink ^= should_use_dirty_copy_legacy(rects, width, height) as usize;
+            sink ^= (should_use_dirty_gpu_copy_legacy(rects, width, height) as usize) << 1;
+            sink ^=
+                (should_use_low_latency_dirty_gpu_copy_legacy(rects, width, height) as usize) << 2;
+        }
+        let legacy_elapsed = legacy_start.elapsed();
+
+        let optimized_start = std::time::Instant::now();
+        for iter in 0..measure_iters {
+            let rects = black_box(&workloads[iter % workloads.len()]);
+            let width = black_box(1920u32);
+            let height = black_box(1080u32);
+            let strategy = evaluate_dirty_copy_strategy(rects, width, height);
+            sink ^= strategy.cpu as usize;
+            sink ^= (strategy.gpu as usize) << 1;
+            sink ^= (strategy.gpu_low_latency as usize) << 2;
+        }
+        let optimized_elapsed = optimized_start.elapsed();
+        black_box(sink);
+
+        let legacy_ms = legacy_elapsed.as_secs_f64() * 1000.0;
+        let optimized_ms = optimized_elapsed.as_secs_f64() * 1000.0;
+        let speedup = if optimized_ms > 0.0 {
+            legacy_ms / optimized_ms
+        } else {
+            0.0
+        };
+
+        println!(
+            "dxgi dirty strategy benchmark: legacy={legacy_ms:.3} ms optimized={optimized_ms:.3} ms speedup={speedup:.2}x"
+        );
+
+        assert!(
+            optimized_ms <= legacy_ms * 1.03,
+            "single-pass dirty strategy regressed: legacy={legacy_ms:.3}ms optimized={optimized_ms:.3}ms ({speedup:.2}x)"
+        );
+    }
+
+    #[test]
+    #[ignore = "performance benchmark guard; run explicitly with --ignored --nocapture"]
+    fn bench_normalize_dirty_rects_merge_candidate_vs_reference() {
+        use std::hint::black_box;
+
+        let inputs = make_normalize_bench_inputs();
+        for input in &inputs {
+            let mut optimized = input.clone();
+            let mut reference = input.clone();
+            normalize_dirty_rects_in_place(&mut optimized, 1920, 1080);
+            normalize_dirty_rects_reference_in_place(&mut reference, 1920, 1080);
+            assert_eq!(optimized, reference);
+        }
+
+        let warmup_iters = 1_000usize;
+        let measure_iters = 8_000usize;
+        let mut working = Vec::new();
+        let mut sink = 0usize;
+
+        for iter in 0..warmup_iters {
+            working.clear();
+            working.extend_from_slice(&inputs[iter % inputs.len()]);
+            normalize_dirty_rects_reference_in_place(&mut working, 1920, 1080);
+            sink ^= working.len();
+
+            working.clear();
+            working.extend_from_slice(&inputs[iter % inputs.len()]);
+            normalize_dirty_rects_in_place(&mut working, 1920, 1080);
+            sink ^= working.len() << 1;
+        }
+
+        let reference_start = std::time::Instant::now();
+        for iter in 0..measure_iters {
+            working.clear();
+            working.extend_from_slice(&inputs[iter % inputs.len()]);
+            normalize_dirty_rects_reference_in_place(&mut working, 1920, 1080);
+            sink ^= working.len();
+        }
+        let reference_elapsed = reference_start.elapsed();
+
+        let optimized_start = std::time::Instant::now();
+        for iter in 0..measure_iters {
+            working.clear();
+            working.extend_from_slice(&inputs[iter % inputs.len()]);
+            normalize_dirty_rects_in_place(&mut working, 1920, 1080);
+            sink ^= working.len() << 1;
+        }
+        let optimized_elapsed = optimized_start.elapsed();
+        black_box(sink);
+
+        let reference_ms = reference_elapsed.as_secs_f64() * 1000.0;
+        let optimized_ms = optimized_elapsed.as_secs_f64() * 1000.0;
+        let speedup = if optimized_ms > 0.0 {
+            reference_ms / optimized_ms
+        } else {
+            0.0
+        };
+
+        println!(
+            "dxgi normalize benchmark: reference={reference_ms:.3} ms optimized={optimized_ms:.3} ms speedup={speedup:.2}x"
+        );
+
+        assert!(
+            optimized_ms <= reference_ms * 1.03,
+            "merge-candidate normalize path regressed: reference={reference_ms:.3}ms optimized={optimized_ms:.3}ms ({speedup:.2}x)"
+        );
     }
 }

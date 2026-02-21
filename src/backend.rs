@@ -111,6 +111,19 @@ pub struct CaptureSampleMetadata {
 pub trait MonitorCapturer: Send {
     fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame>;
 
+    /// Capture a frame with an explicit hint about whether `reuse`
+    /// contains the previous output from this same capture target.
+    ///
+    /// Backends can use this to safely enable incremental conversion
+    /// paths that only update changed rows/tiles.
+    fn capture_with_history_hint(
+        &mut self,
+        reuse: Option<Frame>,
+        _destination_has_history: bool,
+    ) -> CaptureResult<Frame> {
+        self.capture(reuse)
+    }
+
     /// Optional accelerated path for writing only a source sub-rectangle
     /// into an already-allocated destination frame.
     ///

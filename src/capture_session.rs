@@ -203,6 +203,8 @@ impl CaptureSessionBuilder {
             backend,
             capturers: FxHashMap::default(),
             window_capturers: FxHashMap::default(),
+            monitor_output_history: FxHashMap::default(),
+            window_output_history: FxHashMap::default(),
             config: self.config,
             sequence: 0,
             layout: None,
@@ -223,6 +225,11 @@ pub struct CaptureSession {
     backend: Arc<dyn CaptureBackend>,
     capturers: FxHashMap<MonitorKey, Box<dyn MonitorCapturer>>,
     window_capturers: FxHashMap<WindowKey, Box<dyn MonitorCapturer>>,
+    /// Last output sequence per monitor. Reuse is considered to have
+    /// valid history only when its metadata sequence matches this value.
+    monitor_output_history: FxHashMap<MonitorKey, u64>,
+    /// Per-window map mirroring `monitor_output_history`.
+    window_output_history: FxHashMap<WindowKey, u64>,
     config: CaptureSessionConfig,
     sequence: u64,
     /// Lazily-initialized monitor layout for region capture.
@@ -299,6 +306,15 @@ impl CaptureSession {
     /// Update capture mode for both future and already-initialized
     /// monitor capturers.
     pub fn set_capture_mode(&mut self, mode: CaptureMode) {
+        if self.config.mode != mode {
+            // Reuse history is mode-sensitive (for example, some
+            // backend caches only advance in recording mode), so reset
+            // all reuse provenance on mode transitions.
+            self.monitor_output_history.clear();
+            self.window_output_history.clear();
+            self.region_output_history_valid = false;
+            self.region_fallback_frames.clear();
+        }
         self.config.mode = mode;
         for capturer in self.capturers.values_mut() {
             capturer.set_capture_mode(mode);
@@ -383,16 +399,24 @@ impl CaptureSession {
         let monitor = self.resolve_target(target)?;
         let key = monitor.key();
         let max_retries = self.config.capture_retry_count;
+        let reuse_sequence = reuse.as_ref().map(|frame| frame.metadata.sequence);
+        let destination_has_history = matches!(
+            (reuse_sequence, self.monitor_output_history.get(&key)),
+            (Some(reuse_seq), Some(last_seq)) if reuse_seq == *last_seq
+        );
 
         self.sequence = self.sequence.wrapping_add(1);
         let seq = self.sequence;
 
         let cap_start = std::time::Instant::now();
-        let first_result = self.get_or_create_capturer(&monitor)?.capture(reuse);
+        let first_result = self
+            .get_or_create_capturer(&monitor)?
+            .capture_with_history_hint(reuse, destination_has_history);
         let cap_dur = cap_start.elapsed();
         match first_result {
             Ok(mut frame) => {
                 frame.metadata.sequence = seq;
+                self.monitor_output_history.insert(key, seq);
                 if frame.metadata.capture_duration.is_none() {
                     frame.metadata.capture_duration = Some(cap_dur);
                 }
@@ -400,6 +424,7 @@ impl CaptureSession {
             }
             Err(error) if error.requires_worker_reset() && max_retries > 0 => {
                 self.capturers.remove(&key);
+                self.monitor_output_history.remove(&key);
             }
             Err(error) => return Err(error),
         }
@@ -407,11 +432,14 @@ impl CaptureSession {
         // Retry loop after capturer reset.
         for attempt in 0..max_retries {
             let retry_start = std::time::Instant::now();
-            let result = self.get_or_create_capturer(&monitor)?.capture(None);
+            let result = self
+                .get_or_create_capturer(&monitor)?
+                .capture_with_history_hint(None, false);
             let retry_dur = retry_start.elapsed();
             match result {
                 Ok(mut frame) => {
                     frame.metadata.sequence = seq;
+                    self.monitor_output_history.insert(key, seq);
                     if frame.metadata.capture_duration.is_none() {
                         frame.metadata.capture_duration = Some(retry_dur);
                     }
@@ -419,6 +447,7 @@ impl CaptureSession {
                 }
                 Err(error) if error.requires_worker_reset() && attempt + 1 < max_retries => {
                     self.capturers.remove(&key);
+                    self.monitor_output_history.remove(&key);
                 }
                 Err(error) => return Err(error),
             }
@@ -436,16 +465,24 @@ impl CaptureSession {
 
         let key = window.key();
         let max_retries = self.config.capture_retry_count;
+        let reuse_sequence = reuse.as_ref().map(|frame| frame.metadata.sequence);
+        let destination_has_history = matches!(
+            (reuse_sequence, self.window_output_history.get(&key)),
+            (Some(reuse_seq), Some(last_seq)) if reuse_seq == *last_seq
+        );
 
         self.sequence = self.sequence.wrapping_add(1);
         let seq = self.sequence;
 
         let cap_start = std::time::Instant::now();
-        let first_result = self.get_window_capturer(window).capture(reuse);
+        let first_result = self
+            .get_window_capturer(window)
+            .capture_with_history_hint(reuse, destination_has_history);
         let cap_dur = cap_start.elapsed();
         match first_result {
             Ok(mut frame) => {
                 frame.metadata.sequence = seq;
+                self.window_output_history.insert(key, seq);
                 if frame.metadata.capture_duration.is_none() {
                     frame.metadata.capture_duration = Some(cap_dur);
                 }
@@ -453,6 +490,7 @@ impl CaptureSession {
             }
             Err(error) if error.requires_worker_reset() && max_retries > 0 => {
                 self.window_capturers.remove(&key);
+                self.window_output_history.remove(&key);
             }
             Err(error) => return Err(error),
         }
@@ -462,11 +500,14 @@ impl CaptureSession {
                 self.ensure_window_capturer(window)?;
             }
             let retry_start = std::time::Instant::now();
-            let result = self.get_window_capturer(window).capture(None);
+            let result = self
+                .get_window_capturer(window)
+                .capture_with_history_hint(None, false);
             let retry_dur = retry_start.elapsed();
             match result {
                 Ok(mut frame) => {
                     frame.metadata.sequence = seq;
+                    self.window_output_history.insert(key, seq);
                     if frame.metadata.capture_duration.is_none() {
                         frame.metadata.capture_duration = Some(retry_dur);
                     }
@@ -474,6 +515,7 @@ impl CaptureSession {
                 }
                 Err(error) if error.requires_worker_reset() && attempt + 1 < max_retries => {
                     self.window_capturers.remove(&key);
+                    self.window_output_history.remove(&key);
                 }
                 Err(error) => return Err(error),
             }
@@ -580,9 +622,10 @@ impl CaptureSession {
                 sample
             } else {
                 let reuse_frame = self.region_fallback_frames.remove(&entry.monitor_key);
+                let reuse_has_history = reuse_frame.is_some();
                 let monitor_frame = {
                     let capturer = self.get_or_create_capturer(&entry.monitor)?;
-                    capturer.capture(reuse_frame)?
+                    capturer.capture_with_history_hint(reuse_frame, reuse_has_history)?
                 };
 
                 copy_region_rgba(&monitor_frame, entry.blit, &mut out_frame)?;
@@ -614,5 +657,104 @@ impl CaptureSession {
         out_frame.metadata.is_duplicate = all_duplicate;
         self.region_output_history_valid = true;
         Ok(out_frame)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct MockBackend {
+        monitor: MonitorId,
+        history_hints: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl MockBackend {
+        fn new(history_hints: Arc<Mutex<Vec<bool>>>) -> Self {
+            Self {
+                monitor: MonitorId::from_parts(1, 2, 0, "mock-monitor", true),
+                history_hints,
+            }
+        }
+    }
+
+    struct MockMonitorCapturer {
+        history_hints: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl MonitorCapturer for MockMonitorCapturer {
+        fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
+            self.capture_with_history_hint(reuse, false)
+        }
+
+        fn capture_with_history_hint(
+            &mut self,
+            reuse: Option<Frame>,
+            destination_has_history: bool,
+        ) -> CaptureResult<Frame> {
+            self.history_hints
+                .lock()
+                .unwrap()
+                .push(destination_has_history);
+            let mut frame = reuse.unwrap_or_else(Frame::empty);
+            frame.ensure_rgba_capacity(4, 4)?;
+            frame.reset_metadata();
+            Ok(frame)
+        }
+    }
+
+    impl CaptureBackend for MockBackend {
+        fn enumerate_monitors(&self) -> CaptureResult<Vec<MonitorId>> {
+            Ok(vec![self.monitor.clone()])
+        }
+
+        fn primary_monitor(&self) -> CaptureResult<MonitorId> {
+            Ok(self.monitor.clone())
+        }
+
+        fn create_monitor_capturer(
+            &self,
+            _monitor: &MonitorId,
+        ) -> CaptureResult<Box<dyn MonitorCapturer>> {
+            Ok(Box::new(MockMonitorCapturer {
+                history_hints: Arc::clone(&self.history_hints),
+            }))
+        }
+    }
+
+    #[test]
+    fn monitor_reuse_history_hint_requires_matching_sequence() -> CaptureResult<()> {
+        let history_hints = Arc::new(Mutex::new(Vec::new()));
+        let backend: Arc<dyn CaptureBackend> =
+            Arc::new(MockBackend::new(Arc::clone(&history_hints)));
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        let target = CaptureTarget::PrimaryMonitor;
+
+        let mut first = session.capture_frame(&target)?;
+        first.metadata.sequence = first.metadata.sequence.wrapping_add(1);
+        let second = session.capture_frame_reuse(&target, first)?;
+        let _third = session.capture_frame_reuse(&target, second)?;
+
+        let recorded = history_hints.lock().unwrap().clone();
+        assert_eq!(recorded, vec![false, false, true]);
+        Ok(())
+    }
+
+    #[test]
+    fn changing_capture_mode_clears_reuse_history() -> CaptureResult<()> {
+        let history_hints = Arc::new(Mutex::new(Vec::new()));
+        let backend: Arc<dyn CaptureBackend> =
+            Arc::new(MockBackend::new(Arc::clone(&history_hints)));
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        let target = CaptureTarget::PrimaryMonitor;
+
+        let first = session.capture_frame(&target)?;
+        session.set_capture_mode(CaptureMode::ScreenRecording);
+        let _second = session.capture_frame_reuse(&target, first)?;
+
+        let recorded = history_hints.lock().unwrap().clone();
+        assert_eq!(recorded, vec![false, false]);
+        Ok(())
     }
 }

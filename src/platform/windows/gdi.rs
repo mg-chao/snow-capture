@@ -139,6 +139,113 @@ fn gdi_window_state_refresh_interval_frames() -> u32 {
     })
 }
 
+#[inline]
+fn gdi_incremental_convert_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_CONVERT")
+            .map(|raw| {
+                let normalized = raw.trim().to_ascii_lowercase();
+                !(normalized == "1"
+                    || normalized == "true"
+                    || normalized == "yes"
+                    || normalized == "on")
+            })
+            .unwrap_or(true)
+    })
+}
+
+const GDI_INCREMENTAL_MIN_PIXELS: usize = 160_000;
+const GDI_INCREMENTAL_MAX_DIRTY_ROW_NUMERATOR: usize = 3;
+const GDI_INCREMENTAL_MAX_DIRTY_ROW_DENOMINATOR: usize = 4;
+
+#[derive(Clone, Copy, Debug)]
+struct DirtyRowRun {
+    start_row: usize,
+    row_count: usize,
+}
+
+type RowCompareKernel = unsafe fn(*const u8, *const u8, usize) -> bool;
+
+#[inline(always)]
+fn row_compare_kernel() -> RowCompareKernel {
+    use std::sync::OnceLock;
+    static KERNEL: OnceLock<RowCompareKernel> = OnceLock::new();
+    *KERNEL.get_or_init(select_row_compare_kernel)
+}
+
+fn select_row_compare_kernel() -> RowCompareKernel {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return row_equal_avx2;
+        }
+        if std::arch::is_x86_feature_detected!("sse2") {
+            return row_equal_sse2;
+        }
+    }
+    row_equal_scalar
+}
+
+unsafe fn row_equal_scalar(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
+    let mut offset = 0usize;
+    while offset + size_of::<u64>() <= len {
+        let left = unsafe { std::ptr::read_unaligned(lhs.add(offset).cast::<u64>()) };
+        let right = unsafe { std::ptr::read_unaligned(rhs.add(offset).cast::<u64>()) };
+        if left != right {
+            return false;
+        }
+        offset += size_of::<u64>();
+    }
+
+    while offset < len {
+        if unsafe { *lhs.add(offset) } != unsafe { *rhs.add(offset) } {
+            return false;
+        }
+        offset += 1;
+    }
+    true
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn row_equal_sse2(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
+    use std::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+
+    let mut offset = 0usize;
+    while offset + 16 <= len {
+        let left = unsafe { _mm_loadu_si128(lhs.add(offset).cast::<__m128i>()) };
+        let right = unsafe { _mm_loadu_si128(rhs.add(offset).cast::<__m128i>()) };
+        let equals = _mm_cmpeq_epi8(left, right);
+        if _mm_movemask_epi8(equals) != 0xFFFF_i32 {
+            return false;
+        }
+        offset += 16;
+    }
+
+    unsafe { row_equal_scalar(lhs.add(offset), rhs.add(offset), len - offset) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn row_equal_avx2(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
+    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+
+    let mut offset = 0usize;
+    while offset + 32 <= len {
+        let left = unsafe { _mm256_loadu_si256(lhs.add(offset).cast::<__m256i>()) };
+        let right = unsafe { _mm256_loadu_si256(rhs.add(offset).cast::<__m256i>()) };
+        let equals = _mm256_cmpeq_epi8(left, right);
+        if _mm256_movemask_epi8(equals) != -1 {
+            return false;
+        }
+        offset += 32;
+    }
+
+    unsafe { row_equal_scalar(lhs.add(offset), rhs.add(offset), len - offset) }
+}
+
 #[inline(always)]
 fn window_capture_order(mode: CaptureMode) -> &'static [WindowCapturePath; 4] {
     match mode {
@@ -187,6 +294,8 @@ struct GdiResources {
     width: i32,
     height: i32,
     stride: usize,
+    bgra_history: Vec<u8>,
+    dirty_row_runs: Vec<DirtyRowRun>,
 }
 
 impl GdiResources {
@@ -219,6 +328,8 @@ impl GdiResources {
             width: 0,
             height: 0,
             stride: 0,
+            bgra_history: Vec::new(),
+            dirty_row_runs: Vec::new(),
         })
     }
 
@@ -354,6 +465,136 @@ impl GdiResources {
         Ok(())
     }
 
+    fn ensure_bgra_history(&mut self, byte_len: usize) -> bool {
+        if byte_len == 0 {
+            self.bgra_history.clear();
+            return false;
+        }
+
+        let had_history = self.bgra_history.len() == byte_len;
+        if !had_history {
+            self.bgra_history.resize(byte_len, 0);
+        }
+        had_history
+    }
+
+    unsafe fn copy_surface_to_history_unchecked(&mut self, byte_len: usize) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.bits.cast_const(),
+                self.bgra_history.as_mut_ptr(),
+                byte_len,
+            );
+        }
+    }
+
+    fn try_convert_incremental_rows(
+        &mut self,
+        frame: &mut Frame,
+        width: usize,
+        height: usize,
+    ) -> CaptureResult<Option<bool>> {
+        let row_bytes = width.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+        let total_bytes = row_bytes
+            .checked_mul(height)
+            .ok_or(CaptureError::BufferOverflow)?;
+        if !self.ensure_bgra_history(total_bytes) {
+            return Ok(None);
+        }
+
+        let max_dirty_rows = height.saturating_mul(GDI_INCREMENTAL_MAX_DIRTY_ROW_NUMERATOR)
+            / GDI_INCREMENTAL_MAX_DIRTY_ROW_DENOMINATOR;
+        let compare_row = row_compare_kernel();
+        self.dirty_row_runs.clear();
+
+        let mut dirty_rows = 0usize;
+        let mut run_start = None::<usize>;
+        let src_base = self.bits.cast_const();
+        let history_base = self.bgra_history.as_mut_ptr();
+
+        for row in 0..height {
+            let src_offset = row
+                .checked_mul(self.stride)
+                .ok_or(CaptureError::BufferOverflow)?;
+            let src_row = unsafe { src_base.add(src_offset) };
+            let history_offset = row
+                .checked_mul(row_bytes)
+                .ok_or(CaptureError::BufferOverflow)?;
+            let history_row = unsafe { history_base.add(history_offset) };
+
+            let changed = unsafe { !compare_row(src_row, history_row.cast_const(), row_bytes) };
+            if !changed {
+                if let Some(start) = run_start.take() {
+                    self.dirty_row_runs.push(DirtyRowRun {
+                        start_row: start,
+                        row_count: row - start,
+                    });
+                }
+                continue;
+            }
+
+            dirty_rows = dirty_rows.saturating_add(1);
+            unsafe {
+                std::ptr::copy_nonoverlapping(src_row, history_row, row_bytes);
+            }
+            if run_start.is_none() {
+                run_start = Some(row);
+            }
+
+            if dirty_rows > max_dirty_rows {
+                return Ok(None);
+            }
+        }
+
+        if let Some(start) = run_start {
+            self.dirty_row_runs.push(DirtyRowRun {
+                start_row: start,
+                row_count: height - start,
+            });
+        }
+
+        if dirty_rows == 0 {
+            return Ok(Some(true));
+        }
+
+        let dst_pitch = width.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+        let converter = convert::SurfaceRowConverter::new(
+            convert::SurfacePixelFormat::Bgra8,
+            convert::SurfaceConversionOptions::default(),
+        );
+        let src_addr = src_base as usize;
+        let dst_addr = frame.as_mut_rgba_ptr() as usize;
+
+        for run in &self.dirty_row_runs {
+            let src_offset = run
+                .start_row
+                .checked_mul(self.stride)
+                .ok_or(CaptureError::BufferOverflow)?;
+            let dst_offset = run
+                .start_row
+                .checked_mul(dst_pitch)
+                .ok_or(CaptureError::BufferOverflow)?;
+            let src_ptr = src_addr
+                .checked_add(src_offset)
+                .ok_or(CaptureError::BufferOverflow)? as *const u8;
+            let dst_ptr = dst_addr
+                .checked_add(dst_offset)
+                .ok_or(CaptureError::BufferOverflow)? as *mut u8;
+            unsafe {
+                converter.convert_rows_maybe_parallel_unchecked(
+                    src_ptr,
+                    self.stride,
+                    dst_ptr,
+                    dst_pitch,
+                    width,
+                    run.row_count,
+                );
+            }
+        }
+
+        Ok(Some(false))
+    }
+
     /// Capture the monitor region and return an RGBA frame.
     ///
     /// The strategy is to BitBlt into the DIB section, then perform an
@@ -362,11 +603,12 @@ impl GdiResources {
     /// SIMD kernels read and write the same cache lines, cutting memory
     /// bandwidth roughly in half compared to a separate src→dst copy.
     fn read_surface_to_rgba(
-        &self,
+        &mut self,
         width: i32,
         height: i32,
         reuse: Option<Frame>,
         mode: CaptureMode,
+        destination_has_history: bool,
     ) -> CaptureResult<Frame> {
         let width_u32 = u32::try_from(width).map_err(|_| CaptureError::BufferOverflow)?;
         let height_u32 = u32::try_from(height).map_err(|_| CaptureError::BufferOverflow)?;
@@ -379,6 +621,17 @@ impl GdiResources {
         let mut frame = reuse.unwrap_or_else(Frame::empty);
         frame.reset_metadata();
         frame.ensure_rgba_capacity(width_u32, height_u32)?;
+        let incremental_enabled = mode == CaptureMode::ScreenRecording
+            && destination_has_history
+            && gdi_incremental_convert_enabled()
+            && pixel_count >= GDI_INCREMENTAL_MIN_PIXELS;
+        if incremental_enabled
+            && let Some(is_duplicate) =
+                self.try_convert_incremental_rows(&mut frame, width, height)?
+        {
+            frame.metadata.is_duplicate = is_duplicate;
+            return Ok(frame);
+        }
 
         // Single-pass: read from DIB section, swizzle BGRA→RGBA, and
         // write directly into the Frame to avoid an extra memcpy.
@@ -397,6 +650,20 @@ impl GdiResources {
             }
         }
 
+        if mode == CaptureMode::ScreenRecording
+            && gdi_incremental_convert_enabled()
+            && pixel_count >= GDI_INCREMENTAL_MIN_PIXELS
+        {
+            let total_bytes = width
+                .checked_mul(height)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or(CaptureError::BufferOverflow)?;
+            self.ensure_bgra_history(total_bytes);
+            unsafe {
+                self.copy_surface_to_history_unchecked(total_bytes);
+            }
+        }
+
         Ok(frame)
     }
 
@@ -405,6 +672,7 @@ impl GdiResources {
         geometry: MonitorGeometry,
         reuse: Option<Frame>,
         mode: CaptureMode,
+        destination_has_history: bool,
     ) -> CaptureResult<Frame> {
         self.ensure_surface(geometry.width, geometry.height)?;
 
@@ -423,7 +691,13 @@ impl GdiResources {
         }
         .context("BitBlt failed during GDI monitor capture")
         .map_err(CaptureError::Platform)?;
-        self.read_surface_to_rgba(geometry.width, geometry.height, reuse, mode)
+        self.read_surface_to_rgba(
+            geometry.width,
+            geometry.height,
+            reuse,
+            mode,
+            destination_has_history,
+        )
     }
 
     /// Capture a monitor sub-rectangle and write it directly into an
@@ -576,6 +850,7 @@ impl GdiResources {
         reuse: Option<Frame>,
         mode: CaptureMode,
         preferred_path: Option<WindowCapturePath>,
+        destination_has_history: bool,
     ) -> CaptureResult<(Frame, WindowCapturePath)> {
         self.ensure_surface(width, height)?;
 
@@ -585,7 +860,13 @@ impl GdiResources {
         for &path in &attempts[..attempt_count] {
             match self.try_capture_window_path(hwnd, width, height, path) {
                 Ok(()) => {
-                    let frame = self.read_surface_to_rgba(width, height, reuse, mode)?;
+                    let frame = self.read_surface_to_rgba(
+                        width,
+                        height,
+                        reuse,
+                        mode,
+                        destination_has_history,
+                    )?;
                     return Ok((frame, path));
                 }
                 Err(error) => {
@@ -643,6 +924,8 @@ impl GdiResources {
         self.width = 0;
         self.height = 0;
         self.stride = 0;
+        self.bgra_history.clear();
+        self.dirty_row_runs.clear();
     }
 }
 
@@ -735,11 +1018,22 @@ impl WindowsMonitorCapturer {
 
 impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
     fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
+        self.capture_with_history_hint(reuse, false)
+    }
+
+    fn capture_with_history_hint(
+        &mut self,
+        reuse: Option<Frame>,
+        destination_has_history: bool,
+    ) -> CaptureResult<Frame> {
         self.refresh_geometry()?;
         let capture_time = Instant::now();
-        let mut frame = self
-            .resources
-            .capture_to_rgba(self.geometry, reuse, self.capture_mode)?;
+        let mut frame = self.resources.capture_to_rgba(
+            self.geometry,
+            reuse,
+            self.capture_mode,
+            destination_has_history,
+        )?;
         frame.metadata.capture_time = Some(capture_time);
         // GDI doesn't provide native presentation timestamps, so we
         // synthesize a QPC value at capture time for consistent timing
@@ -873,6 +1167,14 @@ impl WindowsWindowCapturer {
 
 impl MonitorCapturer for WindowsWindowCapturer {
     fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
+        self.capture_with_history_hint(reuse, false)
+    }
+
+    fn capture_with_history_hint(
+        &mut self,
+        reuse: Option<Frame>,
+        destination_has_history: bool,
+    ) -> CaptureResult<Frame> {
         if !unsafe { IsWindow(self.hwnd) }.as_bool() {
             return Err(CaptureError::InvalidTarget(
                 "window no longer exists".into(),
@@ -904,6 +1206,7 @@ impl MonitorCapturer for WindowsWindowCapturer {
             reuse,
             self.capture_mode,
             self.preferred_path,
+            destination_has_history,
         );
         let (mut frame, used_path) = match first_attempt {
             Ok(result) => result,
@@ -924,6 +1227,7 @@ impl MonitorCapturer for WindowsWindowCapturer {
                     None,
                     self.capture_mode,
                     self.preferred_path,
+                    false,
                 )?
             }
             Err(error) => return Err(error),
@@ -1004,5 +1308,38 @@ mod tests {
             WindowCapturePath::PrintWindow(PRINT_WINDOW_RENDER_FULL)
         );
         assert_eq!(attempts[3], WindowCapturePath::WindowDcBitBlt);
+    }
+
+    #[test]
+    fn row_compare_scalar_detects_changes() {
+        let mut lhs = vec![0u8; 257];
+        for (idx, value) in lhs.iter_mut().enumerate() {
+            *value = (idx as u8).wrapping_mul(3);
+        }
+        let mut rhs = lhs.clone();
+
+        assert!(unsafe { row_equal_scalar(lhs.as_ptr(), rhs.as_ptr(), lhs.len()) });
+
+        rhs[128] ^= 0x7F;
+        assert!(!unsafe { row_equal_scalar(lhs.as_ptr(), rhs.as_ptr(), lhs.len()) });
+    }
+
+    #[test]
+    fn selected_row_compare_kernel_matches_scalar() {
+        let mut lhs = vec![0u8; 4096];
+        for (idx, value) in lhs.iter_mut().enumerate() {
+            *value = (idx as u8).wrapping_mul(11);
+        }
+        let mut rhs = lhs.clone();
+        rhs[2048] ^= 0x55;
+
+        let kernel = row_compare_kernel();
+        let scalar_equal = unsafe { row_equal_scalar(lhs.as_ptr(), lhs.as_ptr(), lhs.len()) };
+        let kernel_equal = unsafe { kernel(lhs.as_ptr(), lhs.as_ptr(), lhs.len()) };
+        assert_eq!(kernel_equal, scalar_equal);
+
+        let scalar_diff = unsafe { row_equal_scalar(lhs.as_ptr(), rhs.as_ptr(), lhs.len()) };
+        let kernel_diff = unsafe { kernel(lhs.as_ptr(), rhs.as_ptr(), lhs.len()) };
+        assert_eq!(kernel_diff, scalar_diff);
     }
 }

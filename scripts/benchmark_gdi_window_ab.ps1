@@ -54,14 +54,17 @@ function Invoke-GdiBenchmark {
 
     $oldDisableUnalignedNt = $env:SNOW_CAPTURE_DISABLE_BGRA_NT_UNALIGNED
     $oldDisableWindowStateCache = $env:SNOW_CAPTURE_DISABLE_GDI_WINDOW_STATE_CACHE
+    $oldDisableIncremental = $env:SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_CONVERT
 
     try {
         if ($DisableOptimizations) {
             $env:SNOW_CAPTURE_DISABLE_BGRA_NT_UNALIGNED = "1"
             $env:SNOW_CAPTURE_DISABLE_GDI_WINDOW_STATE_CACHE = "1"
+            $env:SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_CONVERT = "1"
         } else {
             Remove-Item Env:SNOW_CAPTURE_DISABLE_BGRA_NT_UNALIGNED -ErrorAction SilentlyContinue
             Remove-Item Env:SNOW_CAPTURE_DISABLE_GDI_WINDOW_STATE_CACHE -ErrorAction SilentlyContinue
+            Remove-Item Env:SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_CONVERT -ErrorAction SilentlyContinue
         }
 
         $cargoArgs = @(
@@ -86,6 +89,12 @@ function Invoke-GdiBenchmark {
             $env:SNOW_CAPTURE_DISABLE_GDI_WINDOW_STATE_CACHE = $oldDisableWindowStateCache
         } else {
             Remove-Item Env:SNOW_CAPTURE_DISABLE_GDI_WINDOW_STATE_CACHE -ErrorAction SilentlyContinue
+        }
+
+        if ($null -ne $oldDisableIncremental) {
+            $env:SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_CONVERT = $oldDisableIncremental
+        } else {
+            Remove-Item Env:SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_CONVERT -ErrorAction SilentlyContinue
         }
     }
 }

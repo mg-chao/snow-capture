@@ -141,6 +141,7 @@ fn extract_dirty_rects(
         }
     }
 
+    normalize_dirty_rects_in_place(out, width, height);
     Some(mode)
 }
 
@@ -164,6 +165,92 @@ fn intersect_dirty_rects(a: DirtyRect, b: DirtyRect) -> Option<DirtyRect> {
         width: right - x,
         height: bottom - y,
     })
+}
+
+#[inline(always)]
+fn dirty_rect_bounds(rect: DirtyRect) -> (u32, u32) {
+    (
+        rect.x.saturating_add(rect.width),
+        rect.y.saturating_add(rect.height),
+    )
+}
+
+#[inline(always)]
+fn intervals_overlap(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
+#[inline(always)]
+fn intervals_touch_or_overlap(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> bool {
+    a_start <= b_end && b_start <= a_end
+}
+
+fn dirty_rects_can_merge(a: DirtyRect, b: DirtyRect) -> bool {
+    let (a_right, a_bottom) = dirty_rect_bounds(a);
+    let (b_right, b_bottom) = dirty_rect_bounds(b);
+
+    let horizontal_overlap = intervals_overlap(a.x, a_right, b.x, b_right);
+    let vertical_overlap = intervals_overlap(a.y, a_bottom, b.y, b_bottom);
+    let horizontal_touch_or_overlap = intervals_touch_or_overlap(a.x, a_right, b.x, b_right);
+    let vertical_touch_or_overlap = intervals_touch_or_overlap(a.y, a_bottom, b.y, b_bottom);
+
+    (horizontal_overlap && vertical_touch_or_overlap)
+        || (vertical_overlap && horizontal_touch_or_overlap)
+}
+
+fn merge_dirty_rects(a: DirtyRect, b: DirtyRect) -> DirtyRect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let (a_right, a_bottom) = dirty_rect_bounds(a);
+    let (b_right, b_bottom) = dirty_rect_bounds(b);
+    let right = a_right.max(b_right);
+    let bottom = a_bottom.max(b_bottom);
+    DirtyRect {
+        x,
+        y,
+        width: right.saturating_sub(x),
+        height: bottom.saturating_sub(y),
+    }
+}
+
+fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height: u32) {
+    if rects.is_empty() {
+        return;
+    }
+
+    let mut write = 0usize;
+    for read in 0..rects.len() {
+        if let Some(clamped) = clamp_dirty_rect(rects[read], width, height) {
+            rects[write] = clamped;
+            write += 1;
+        }
+    }
+    rects.truncate(write);
+    if rects.len() <= 1 {
+        return;
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+
+        let mut i = 0usize;
+        while i < rects.len() {
+            let mut j = i + 1;
+            while j < rects.len() {
+                if dirty_rects_can_merge(rects[i], rects[j]) {
+                    rects[i] = merge_dirty_rects(rects[i], rects[j]);
+                    rects.swap_remove(j);
+                    changed = true;
+                } else {
+                    j += 1;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    rects.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
 }
 
 fn extract_region_dirty_rects(
@@ -237,6 +324,7 @@ fn extract_region_dirty_rects(
         });
     }
 
+    normalize_dirty_rects_in_place(out, region_bounds.width, region_bounds.height);
     true
 }
 
@@ -275,6 +363,7 @@ struct WgcStagingSlot {
     present_time_ticks: i64,
     is_duplicate: bool,
     dirty_mode_available: bool,
+    dirty_copy_preferred: bool,
     dirty_rects: Vec<DirtyRect>,
     populated: bool,
 }
@@ -290,6 +379,7 @@ impl WgcStagingSlot {
         self.present_time_ticks = 0;
         self.is_duplicate = false;
         self.dirty_mode_available = false;
+        self.dirty_copy_preferred = false;
         self.dirty_rects.clear();
         self.populated = false;
     }
@@ -943,7 +1033,6 @@ impl WindowsGraphicsCaptureCapturer {
         &mut self,
         slot_idx: usize,
         source_resource: &ID3D11Resource,
-        source_desc: &D3D11_TEXTURE2D_DESC,
         can_use_dirty_gpu_copy: bool,
     ) -> CaptureResult<()> {
         let staging_resource = self.staging_slots[slot_idx]
@@ -962,12 +1051,7 @@ impl WindowsGraphicsCaptureCapturer {
         if can_use_dirty_gpu_copy {
             let use_dirty_copy = {
                 let slot = &self.staging_slots[slot_idx];
-                slot.dirty_mode_available
-                    && should_use_dirty_copy(
-                        &slot.dirty_rects,
-                        source_desc.Width,
-                        source_desc.Height,
-                    )
+                slot.dirty_copy_preferred
             };
 
             if use_dirty_copy {
@@ -1179,9 +1263,8 @@ impl WindowsGraphicsCaptureCapturer {
             })?;
 
             let use_dirty_copy = destination_has_history
-                && slot.dirty_mode_available
-                && !slot.dirty_rects.is_empty()
-                && should_use_dirty_copy(&slot.dirty_rects, source_desc.Width, source_desc.Height);
+                && slot.dirty_copy_preferred
+                && !slot.dirty_rects.is_empty();
 
             if use_dirty_copy {
                 match surface::map_staging_dirty_rects_to_frame_with_offset(
@@ -1303,9 +1386,8 @@ impl WindowsGraphicsCaptureCapturer {
             })?;
             let use_dirty_copy = self.has_frame_history
                 && out_matches_source
-                && slot.dirty_mode_available
-                && !slot.dirty_rects.is_empty()
-                && should_use_dirty_copy(&slot.dirty_rects, source_desc.Width, source_desc.Height);
+                && slot.dirty_copy_preferred
+                && !slot.dirty_rects.is_empty();
 
             if use_dirty_copy {
                 match surface::map_staging_dirty_rects_to_frame(
@@ -1503,6 +1585,12 @@ impl WindowsGraphicsCaptureCapturer {
                     if !dirty_mode_available {
                         slot.dirty_rects.clear();
                     }
+                    slot.dirty_copy_preferred = dirty_mode_available
+                        && should_use_dirty_copy(
+                            &slot.dirty_rects,
+                            region_desc.Width,
+                            region_desc.Height,
+                        );
                     let region_unchanged = dirty_mode_available && slot.dirty_rects.is_empty();
                     slot.capture_time = Some(capture_time);
                     slot.present_time_ticks = time_ticks;
@@ -1712,6 +1800,12 @@ impl WindowsGraphicsCaptureCapturer {
                 if dirty_mode.is_none() {
                     slot.dirty_rects.clear();
                 }
+                slot.dirty_copy_preferred = slot.dirty_mode_available
+                    && should_use_dirty_copy(
+                        &slot.dirty_rects,
+                        effective_desc.Width,
+                        effective_desc.Height,
+                    );
                 slot.capture_time = Some(capture_time);
                 slot.present_time_ticks = time_ticks;
                 slot.is_duplicate = source_is_duplicate;
@@ -1723,12 +1817,7 @@ impl WindowsGraphicsCaptureCapturer {
                 .cast()
                 .context("failed to cast WGC frame texture to ID3D11Resource")
                 .map_err(CaptureError::Platform)?;
-            self.copy_source_to_slot(
-                write_slot,
-                &source_resource,
-                &effective_desc,
-                can_use_dirty_gpu_copy,
-            )?;
+            self.copy_source_to_slot(write_slot, &source_resource, can_use_dirty_gpu_copy)?;
 
             self.maybe_flush_after_submit(write_slot, read_slot);
             self.read_slot_into_output(read_slot, &mut out, destination_has_history)?;
@@ -1910,6 +1999,158 @@ mod tests {
             WGC_DIRTY_COPY_MAX_RECTS + 1
         ];
         assert!(!should_use_dirty_copy(&rects, 1920, 1080));
+    }
+
+    #[test]
+    fn normalize_dirty_rects_merges_touching_spans() {
+        let mut rects = vec![
+            DirtyRect {
+                x: 100,
+                y: 100,
+                width: 40,
+                height: 20,
+            },
+            DirtyRect {
+                x: 140,
+                y: 100,
+                width: 30,
+                height: 20,
+            },
+            DirtyRect {
+                x: 150,
+                y: 115,
+                width: 20,
+                height: 25,
+            },
+        ];
+
+        normalize_dirty_rects_in_place(&mut rects, 1920, 1080);
+
+        assert_eq!(
+            rects,
+            vec![DirtyRect {
+                x: 100,
+                y: 100,
+                width: 70,
+                height: 40
+            }]
+        );
+    }
+
+    #[test]
+    fn normalize_dirty_rects_clamps_and_discards_out_of_bounds() {
+        let mut rects = vec![
+            DirtyRect {
+                x: 1910,
+                y: 1070,
+                width: 40,
+                height: 20,
+            },
+            DirtyRect {
+                x: 3000,
+                y: 40,
+                width: 10,
+                height: 10,
+            },
+            DirtyRect {
+                x: 10,
+                y: 20,
+                width: 0,
+                height: 50,
+            },
+        ];
+
+        normalize_dirty_rects_in_place(&mut rects, 1920, 1080);
+
+        assert_eq!(
+            rects,
+            vec![DirtyRect {
+                x: 1910,
+                y: 1070,
+                width: 10,
+                height: 10
+            }]
+        );
+    }
+
+    #[test]
+    fn normalize_dirty_rects_keeps_corner_contact_separate() {
+        let mut rects = vec![
+            DirtyRect {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+            },
+            DirtyRect {
+                x: 16,
+                y: 16,
+                width: 8,
+                height: 8,
+            },
+        ];
+
+        normalize_dirty_rects_in_place(&mut rects, 1920, 1080);
+
+        assert_eq!(
+            rects,
+            vec![
+                DirtyRect {
+                    x: 0,
+                    y: 0,
+                    width: 16,
+                    height: 16
+                },
+                DirtyRect {
+                    x: 16,
+                    y: 16,
+                    width: 8,
+                    height: 8
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_dirty_rects_merges_after_late_expansion() {
+        let mut rects = vec![
+            DirtyRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            DirtyRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 2,
+            },
+            DirtyRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 3,
+            },
+            DirtyRect {
+                x: 0,
+                y: 3,
+                width: 1,
+                height: 1,
+            },
+        ];
+
+        normalize_dirty_rects_in_place(&mut rects, 1920, 1080);
+
+        assert_eq!(
+            rects,
+            vec![DirtyRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 4
+            }]
+        );
     }
 
     #[test]

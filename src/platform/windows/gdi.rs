@@ -174,6 +174,23 @@ fn gdi_incremental_convert_enabled() -> bool {
 }
 
 #[inline]
+fn gdi_incremental_span_convert_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_SPAN_CONVERT")
+            .map(|raw| {
+                let normalized = raw.trim().to_ascii_lowercase();
+                !(normalized == "1"
+                    || normalized == "true"
+                    || normalized == "yes"
+                    || normalized == "on")
+            })
+            .unwrap_or(true)
+    })
+}
+
+#[inline]
 fn gdi_swap_history_surfaces_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -259,6 +276,7 @@ fn gdi_parallel_row_scan_enabled() -> bool {
 }
 
 const GDI_INCREMENTAL_MIN_PIXELS: usize = 160_000;
+const GDI_INCREMENTAL_SPAN_MIN_PIXELS: usize = 131_072;
 const GDI_INCREMENTAL_MAX_DIRTY_ROW_NUMERATOR: usize = 3;
 const GDI_INCREMENTAL_MAX_DIRTY_ROW_DENOMINATOR: usize = 4;
 const GDI_INCREMENTAL_TOO_DIRTY_PROBE_MIN_PIXELS: usize = 786_432;
@@ -268,11 +286,32 @@ const GDI_INCREMENTAL_TOO_DIRTY_PROBE_DIRTY_DENOMINATOR: usize = 5;
 const GDI_PARALLEL_ROW_SCAN_MIN_PIXELS: usize = 2_000_000;
 const GDI_PARALLEL_ROW_SCAN_MIN_CHUNK_PIXELS: usize = 131_072;
 const GDI_PARALLEL_ROW_SCAN_MAX_WORKERS: usize = 9;
+const BGRA_BYTES_PER_PIXEL: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
 struct DirtyRowRun {
     start_row: usize,
     row_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DirtyRowSpan {
+    start_col: u32,
+    width: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DirtySpanRun {
+    start_row: usize,
+    row_count: usize,
+    start_col: usize,
+    width: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DirtyScanResult {
+    dirty_rows: usize,
+    used_spans: bool,
 }
 
 fn build_dirty_row_runs_from_flags(flags: &[u8], runs: &mut Vec<DirtyRowRun>) {
@@ -301,6 +340,87 @@ fn build_dirty_row_runs_from_flags(flags: &[u8], runs: &mut Vec<DirtyRowRun>) {
             row_count: flags.len() - start,
         });
     }
+}
+
+fn build_dirty_span_runs_from_spans(spans: &[DirtyRowSpan], runs: &mut Vec<DirtySpanRun>) {
+    runs.clear();
+    let mut active_run: Option<DirtySpanRun> = None;
+
+    for (row, span) in spans.iter().enumerate() {
+        if span.width == 0 {
+            if let Some(run) = active_run.take() {
+                runs.push(run);
+            }
+            continue;
+        }
+
+        let start_col = span.start_col as usize;
+        let width = span.width as usize;
+        if let Some(run) = active_run.as_mut()
+            && run.start_row + run.row_count == row
+            && run.start_col == start_col
+            && run.width == width
+        {
+            run.row_count += 1;
+            continue;
+        }
+
+        if let Some(run) = active_run.take() {
+            runs.push(run);
+        }
+        active_run = Some(DirtySpanRun {
+            start_row: row,
+            row_count: 1,
+            start_col,
+            width,
+        });
+    }
+
+    if let Some(run) = active_run {
+        runs.push(run);
+    }
+}
+
+unsafe fn row_diff_bounds_scalar(
+    lhs: *const u8,
+    rhs: *const u8,
+    len: usize,
+) -> Option<(usize, usize)> {
+    if len == 0 {
+        return None;
+    }
+
+    let mut start = 0usize;
+    while start + size_of::<u64>() <= len {
+        let left = unsafe { std::ptr::read_unaligned(lhs.add(start).cast::<u64>()) };
+        let right = unsafe { std::ptr::read_unaligned(rhs.add(start).cast::<u64>()) };
+        if left != right {
+            break;
+        }
+        start += size_of::<u64>();
+    }
+    while start < len && unsafe { *lhs.add(start) == *rhs.add(start) } {
+        start += 1;
+    }
+    if start == len {
+        return None;
+    }
+
+    let mut end = len;
+    while end >= size_of::<u64>() {
+        let block_start = end - size_of::<u64>();
+        let left = unsafe { std::ptr::read_unaligned(lhs.add(block_start).cast::<u64>()) };
+        let right = unsafe { std::ptr::read_unaligned(rhs.add(block_start).cast::<u64>()) };
+        if left != right {
+            break;
+        }
+        end -= size_of::<u64>();
+    }
+    while end > start && unsafe { *lhs.add(end - 1) == *rhs.add(end - 1) } {
+        end -= 1;
+    }
+
+    Some((start, end))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,6 +455,15 @@ fn parallel_row_scan_eligible(pixel_count: usize, height: usize) -> bool {
             GDI_PARALLEL_ROW_SCAN_MIN_CHUNK_PIXELS,
             GDI_PARALLEL_ROW_SCAN_MAX_WORKERS,
         )
+}
+
+#[inline(always)]
+fn incremental_span_convert_eligible(pixel_count: usize, width: usize, height: usize) -> bool {
+    gdi_incremental_span_convert_enabled()
+        && width > 1
+        && height > 1
+        && pixel_count >= GDI_INCREMENTAL_SPAN_MIN_PIXELS
+        && !parallel_row_scan_eligible(pixel_count, height)
 }
 
 unsafe fn incremental_too_dirty_probe(
@@ -435,6 +564,26 @@ fn bgra_row_converter() -> convert::SurfaceRowConverter {
             convert::SurfaceConversionOptions::default(),
         )
     })
+}
+
+#[inline(always)]
+unsafe fn row_diff_span_pixels(
+    lhs: *const u8,
+    rhs: *const u8,
+    row_bytes: usize,
+    width: usize,
+) -> Option<(usize, usize)> {
+    let (start_byte, end_byte) = unsafe { row_diff_bounds_scalar(lhs, rhs, row_bytes)? };
+    let start_col = start_byte / BGRA_BYTES_PER_PIXEL;
+    let end_col = end_byte
+        .checked_add(BGRA_BYTES_PER_PIXEL - 1)
+        .map(|value| value / BGRA_BYTES_PER_PIXEL)
+        .unwrap_or(width)
+        .min(width);
+    if end_col <= start_col {
+        return None;
+    }
+    Some((start_col, end_col))
 }
 
 unsafe fn row_equal_scalar(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
@@ -703,6 +852,8 @@ struct GdiResources {
     bgra_history: Vec<u8>,
     dirty_row_flags: Vec<u8>,
     dirty_row_runs: Vec<DirtyRowRun>,
+    dirty_row_spans: Vec<DirtyRowSpan>,
+    dirty_span_runs: Vec<DirtySpanRun>,
 }
 
 impl GdiResources {
@@ -742,6 +893,8 @@ impl GdiResources {
             bgra_history: Vec::new(),
             dirty_row_flags: Vec::new(),
             dirty_row_runs: Vec::new(),
+            dirty_row_spans: Vec::new(),
+            dirty_span_runs: Vec::new(),
         })
     }
 
@@ -974,8 +1127,22 @@ impl GdiResources {
         }
     }
 
+    fn ensure_dirty_row_spans(&mut self, row_count: usize) {
+        if self.dirty_row_spans.len() != row_count {
+            self.dirty_row_spans
+                .resize(row_count, DirtyRowSpan::default());
+        }
+    }
+
     fn build_dirty_row_runs_from_flags(&mut self, height: usize) {
         build_dirty_row_runs_from_flags(&self.dirty_row_flags[..height], &mut self.dirty_row_runs);
+    }
+
+    fn build_dirty_span_runs_from_spans(&mut self, height: usize) {
+        build_dirty_span_runs_from_spans(
+            &self.dirty_row_spans[..height],
+            &mut self.dirty_span_runs,
+        );
     }
 
     fn scan_dirty_row_runs_parallel(
@@ -986,7 +1153,7 @@ impl GdiResources {
         history_stride: usize,
         copy_changed_rows_to_history: bool,
         compare_row: RowCompareKernel,
-    ) -> usize {
+    ) -> DirtyScanResult {
         self.ensure_dirty_row_flags(height);
 
         let src_addr = self.bits as usize;
@@ -1023,7 +1190,11 @@ impl GdiResources {
         });
 
         self.build_dirty_row_runs_from_flags(height);
-        dirty_rows
+        self.dirty_span_runs.clear();
+        DirtyScanResult {
+            dirty_rows,
+            used_spans: false,
+        }
     }
 
     fn scan_dirty_row_runs(
@@ -1033,21 +1204,27 @@ impl GdiResources {
         history_base: *mut u8,
         history_stride: usize,
         copy_changed_rows_to_history: bool,
-    ) -> CaptureResult<Option<usize>> {
+    ) -> CaptureResult<Option<DirtyScanResult>> {
         if history_base.is_null() {
             return Ok(None);
         }
         if history_stride < row_bytes {
             return Err(CaptureError::BufferOverflow);
         }
+        if row_bytes % BGRA_BYTES_PER_PIXEL != 0 {
+            return Err(CaptureError::BufferOverflow);
+        }
 
+        let compare_row = row_compare_kernel();
+        let width = row_bytes / BGRA_BYTES_PER_PIXEL;
+        let pixel_count = width
+            .checked_mul(height)
+            .ok_or(CaptureError::BufferOverflow)?;
         let max_dirty_rows = height.saturating_mul(GDI_INCREMENTAL_MAX_DIRTY_ROW_NUMERATOR)
             / GDI_INCREMENTAL_MAX_DIRTY_ROW_DENOMINATOR;
-        let compare_row = row_compare_kernel();
-        let pixel_count = row_bytes
-            .checked_div(4)
-            .and_then(|width| width.checked_mul(height))
-            .ok_or(CaptureError::BufferOverflow)?;
+        let max_dirty_pixels = pixel_count.saturating_mul(GDI_INCREMENTAL_MAX_DIRTY_ROW_NUMERATOR)
+            / GDI_INCREMENTAL_MAX_DIRTY_ROW_DENOMINATOR;
+        let spans_enabled = incremental_span_convert_eligible(pixel_count, width, height);
         if incremental_too_dirty_probe_eligible(pixel_count, height)
             && self.incremental_too_dirty_hint
             && unsafe {
@@ -1063,11 +1240,12 @@ impl GdiResources {
             }
         {
             self.dirty_row_runs.clear();
+            self.dirty_span_runs.clear();
             return Ok(None);
         }
 
         if parallel_row_scan_eligible(pixel_count, height) {
-            let dirty_rows = self.scan_dirty_row_runs_parallel(
+            let result = self.scan_dirty_row_runs_parallel(
                 row_bytes,
                 height,
                 history_base,
@@ -1075,16 +1253,23 @@ impl GdiResources {
                 copy_changed_rows_to_history,
                 compare_row,
             );
-            if dirty_rows > max_dirty_rows {
+            if result.dirty_rows > max_dirty_rows {
                 self.dirty_row_runs.clear();
+                self.dirty_span_runs.clear();
                 return Ok(None);
             }
-            return Ok(Some(dirty_rows));
+            return Ok(Some(result));
         }
 
         self.dirty_row_runs.clear();
+        self.dirty_span_runs.clear();
+        if spans_enabled {
+            self.ensure_dirty_row_spans(height);
+            self.dirty_row_spans[..height].fill(DirtyRowSpan::default());
+        }
 
         let mut dirty_rows = 0usize;
+        let mut dirty_pixels = 0usize;
         let mut run_start = None::<usize>;
         let mut src_row = self.bits.cast_const();
         let mut history_row = history_base;
@@ -1092,7 +1277,7 @@ impl GdiResources {
         for row in 0..height {
             let changed = unsafe { !compare_row(src_row, history_row.cast_const(), row_bytes) };
             if !changed {
-                if let Some(start) = run_start.take() {
+                if !spans_enabled && let Some(start) = run_start.take() {
                     self.dirty_row_runs.push(DirtyRowRun {
                         start_row: start,
                         row_count: row - start,
@@ -1100,16 +1285,42 @@ impl GdiResources {
                 }
             } else {
                 dirty_rows = dirty_rows.saturating_add(1);
+
+                let row_dirty_pixels = if spans_enabled {
+                    let (start_col, end_col) = unsafe {
+                        row_diff_span_pixels(src_row, history_row.cast_const(), row_bytes, width)
+                    }
+                    .unwrap_or((0, width));
+                    let span_width = end_col.saturating_sub(start_col);
+                    let start_col_u32 =
+                        u32::try_from(start_col).map_err(|_| CaptureError::BufferOverflow)?;
+                    let span_width_u32 =
+                        u32::try_from(span_width).map_err(|_| CaptureError::BufferOverflow)?;
+                    self.dirty_row_spans[row] = DirtyRowSpan {
+                        start_col: start_col_u32,
+                        width: span_width_u32,
+                    };
+                    span_width
+                } else {
+                    width
+                };
+                dirty_pixels = dirty_pixels.saturating_add(row_dirty_pixels);
+
                 if copy_changed_rows_to_history {
                     unsafe {
                         std::ptr::copy_nonoverlapping(src_row, history_row, row_bytes);
                     }
                 }
-                if run_start.is_none() {
+                if !spans_enabled && run_start.is_none() {
                     run_start = Some(row);
                 }
 
-                if dirty_rows > max_dirty_rows {
+                if spans_enabled {
+                    if dirty_pixels > max_dirty_pixels {
+                        self.dirty_span_runs.clear();
+                        return Ok(None);
+                    }
+                } else if dirty_rows > max_dirty_rows {
                     return Ok(None);
                 }
             }
@@ -1120,14 +1331,19 @@ impl GdiResources {
             }
         }
 
-        if let Some(start) = run_start {
+        if spans_enabled {
+            self.build_dirty_span_runs_from_spans(height);
+        } else if let Some(start) = run_start {
             self.dirty_row_runs.push(DirtyRowRun {
                 start_row: start,
                 row_count: height - start,
             });
         }
 
-        Ok(Some(dirty_rows))
+        Ok(Some(DirtyScanResult {
+            dirty_rows,
+            used_spans: spans_enabled,
+        }))
     }
 
     fn convert_dirty_row_runs_into(
@@ -1167,6 +1383,53 @@ impl GdiResources {
         Ok(())
     }
 
+    fn convert_dirty_span_runs_into(
+        &mut self,
+        dst_ptr: *mut u8,
+        dst_pitch: usize,
+    ) -> CaptureResult<()> {
+        let converter = bgra_row_converter();
+        let src_base = self.bits.cast_const();
+        let dst_addr = dst_ptr as usize;
+
+        for run in &self.dirty_span_runs {
+            let src_offset = run
+                .start_row
+                .checked_mul(self.stride)
+                .and_then(|offset| {
+                    run.start_col
+                        .checked_mul(BGRA_BYTES_PER_PIXEL)
+                        .and_then(|xoff| offset.checked_add(xoff))
+                })
+                .ok_or(CaptureError::BufferOverflow)?;
+            let dst_offset = run
+                .start_row
+                .checked_mul(dst_pitch)
+                .and_then(|offset| {
+                    run.start_col
+                        .checked_mul(BGRA_BYTES_PER_PIXEL)
+                        .and_then(|xoff| offset.checked_add(xoff))
+                })
+                .ok_or(CaptureError::BufferOverflow)?;
+            let src_ptr = unsafe { src_base.add(src_offset) };
+            let dst_ptr = dst_addr
+                .checked_add(dst_offset)
+                .ok_or(CaptureError::BufferOverflow)? as *mut u8;
+            unsafe {
+                converter.convert_rows_maybe_parallel_unchecked(
+                    src_ptr,
+                    self.stride,
+                    dst_ptr,
+                    dst_pitch,
+                    run.width,
+                    run.row_count,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     fn try_convert_incremental_rows_with_vec_history_into(
         &mut self,
         dst_ptr: *mut u8,
@@ -1174,7 +1437,9 @@ impl GdiResources {
         width: usize,
         height: usize,
     ) -> CaptureResult<IncrementalConvertStatus> {
-        let row_bytes = width.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+        let row_bytes = width
+            .checked_mul(BGRA_BYTES_PER_PIXEL)
+            .ok_or(CaptureError::BufferOverflow)?;
         if dst_pitch < row_bytes {
             return Err(CaptureError::BufferOverflow);
         }
@@ -1186,17 +1451,21 @@ impl GdiResources {
         }
 
         let history_ptr = self.bgra_history.as_mut_ptr();
-        let dirty_rows =
+        let dirty_scan =
             self.scan_dirty_row_runs(row_bytes, height, history_ptr, row_bytes, true)?;
-        let Some(dirty_rows) = dirty_rows else {
+        let Some(dirty_scan) = dirty_scan else {
             return Ok(IncrementalConvertStatus::TooDirty);
         };
-        if dirty_rows == 0 {
+        if dirty_scan.dirty_rows == 0 {
             return Ok(IncrementalConvertStatus::Duplicate);
         }
 
-        self.convert_dirty_row_runs_into(dst_ptr, dst_pitch, width)?;
-        Ok(IncrementalConvertStatus::Updated(dirty_rows))
+        if dirty_scan.used_spans {
+            self.convert_dirty_span_runs_into(dst_ptr, dst_pitch)?;
+        } else {
+            self.convert_dirty_row_runs_into(dst_ptr, dst_pitch, width)?;
+        }
+        Ok(IncrementalConvertStatus::Updated(dirty_scan.dirty_rows))
     }
 
     fn try_convert_incremental_rows_with_surface_history_into(
@@ -1206,7 +1475,9 @@ impl GdiResources {
         width: usize,
         height: usize,
     ) -> CaptureResult<IncrementalConvertStatus> {
-        let row_bytes = width.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+        let row_bytes = width
+            .checked_mul(BGRA_BYTES_PER_PIXEL)
+            .ok_or(CaptureError::BufferOverflow)?;
         if dst_pitch < row_bytes {
             return Err(CaptureError::BufferOverflow);
         }
@@ -1214,17 +1485,21 @@ impl GdiResources {
             return Ok(IncrementalConvertStatus::NotAvailable);
         }
 
-        let dirty_rows =
+        let dirty_scan =
             self.scan_dirty_row_runs(row_bytes, height, self.history_bits, self.stride, false)?;
-        let Some(dirty_rows) = dirty_rows else {
+        let Some(dirty_scan) = dirty_scan else {
             return Ok(IncrementalConvertStatus::TooDirty);
         };
-        if dirty_rows == 0 {
+        if dirty_scan.dirty_rows == 0 {
             return Ok(IncrementalConvertStatus::Duplicate);
         }
 
-        self.convert_dirty_row_runs_into(dst_ptr, dst_pitch, width)?;
-        Ok(IncrementalConvertStatus::Updated(dirty_rows))
+        if dirty_scan.used_spans {
+            self.convert_dirty_span_runs_into(dst_ptr, dst_pitch)?;
+        } else {
+            self.convert_dirty_row_runs_into(dst_ptr, dst_pitch, width)?;
+        }
+        Ok(IncrementalConvertStatus::Updated(dirty_scan.dirty_rows))
     }
 
     fn commit_incremental_history(&mut self, total_bytes: usize) -> CaptureResult<()> {
@@ -1717,6 +1992,8 @@ impl GdiResources {
         self.bgra_history.clear();
         self.dirty_row_flags.clear();
         self.dirty_row_runs.clear();
+        self.dirty_row_spans.clear();
+        self.dirty_span_runs.clear();
     }
 }
 
@@ -2169,6 +2446,51 @@ mod tests {
     }
 
     #[test]
+    fn dirty_span_run_builder_merges_only_matching_spans() {
+        let spans = [
+            DirtyRowSpan {
+                start_col: 4,
+                width: 6,
+            },
+            DirtyRowSpan {
+                start_col: 4,
+                width: 6,
+            },
+            DirtyRowSpan::default(),
+            DirtyRowSpan {
+                start_col: 2,
+                width: 5,
+            },
+            DirtyRowSpan {
+                start_col: 2,
+                width: 5,
+            },
+            DirtyRowSpan {
+                start_col: 3,
+                width: 5,
+            },
+        ];
+        let mut runs = Vec::new();
+        build_dirty_span_runs_from_spans(&spans, &mut runs);
+
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].start_row, 0);
+        assert_eq!(runs[0].row_count, 2);
+        assert_eq!(runs[0].start_col, 4);
+        assert_eq!(runs[0].width, 6);
+
+        assert_eq!(runs[1].start_row, 3);
+        assert_eq!(runs[1].row_count, 2);
+        assert_eq!(runs[1].start_col, 2);
+        assert_eq!(runs[1].width, 5);
+
+        assert_eq!(runs[2].start_row, 5);
+        assert_eq!(runs[2].row_count, 1);
+        assert_eq!(runs[2].start_col, 3);
+        assert_eq!(runs[2].width, 5);
+    }
+
+    #[test]
     fn row_compare_scalar_detects_changes() {
         let mut lhs = vec![0u8; 257];
         for (idx, value) in lhs.iter_mut().enumerate() {
@@ -2180,6 +2502,38 @@ mod tests {
 
         rhs[128] ^= 0x7F;
         assert!(!unsafe { row_equal_scalar(lhs.as_ptr(), rhs.as_ptr(), lhs.len()) });
+    }
+
+    #[test]
+    fn row_diff_bounds_scalar_returns_trimmed_change_window() {
+        let mut lhs = vec![0u8; 96];
+        for (idx, value) in lhs.iter_mut().enumerate() {
+            *value = (idx as u8).wrapping_mul(9).wrapping_add(1);
+        }
+        let mut rhs = lhs.clone();
+        rhs[17] ^= 0x44;
+        rhs[73] ^= 0x12;
+
+        let bounds = unsafe { row_diff_bounds_scalar(lhs.as_ptr(), rhs.as_ptr(), lhs.len()) };
+        assert_eq!(bounds, Some((17, 74)));
+    }
+
+    #[test]
+    fn row_diff_span_pixels_expands_to_full_pixels() {
+        let width = 12usize;
+        let mut lhs = vec![0u8; width * BGRA_BYTES_PER_PIXEL];
+        for (idx, value) in lhs.iter_mut().enumerate() {
+            *value = (idx as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        let mut rhs = lhs.clone();
+
+        // Change only one channel of pixel 3 and pixel 9.
+        rhs[3 * BGRA_BYTES_PER_PIXEL + 1] ^= 0x1F;
+        rhs[9 * BGRA_BYTES_PER_PIXEL + 2] ^= 0x2A;
+
+        let span =
+            unsafe { row_diff_span_pixels(lhs.as_ptr(), rhs.as_ptr(), lhs.len(), width).unwrap() };
+        assert_eq!(span, (3, 10));
     }
 
     #[test]

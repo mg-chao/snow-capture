@@ -96,6 +96,16 @@ fn window_low_latency_region_enabled() -> bool {
 }
 
 #[inline]
+fn region_full_slot_map_fastpath_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    // Experimental opt-in path: map/copy the full staging slot directly
+    // when the destination frame exactly matches region dimensions.
+    // Keep disabled by default until workload benchmarks confirm wins.
+    *ENABLED
+        .get_or_init(|| env_var_truthy("SNOW_CAPTURE_DXGI_ENABLE_REGION_FULL_SLOT_MAP_FASTPATH"))
+}
+
+#[inline]
 fn borrowed_source_resource_cast_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_BORROWED_SOURCE_RESOURCE"))
@@ -1589,47 +1599,75 @@ impl OutputCapturer {
             && !slot.dirty_rects.is_empty()
             && (slot.dirty_copy_preferred
                 || should_use_dirty_copy(&slot.dirty_rects, source_desc.Width, source_desc.Height));
+        let write_full_slot_direct = region_full_slot_map_fastpath_enabled()
+            && blit.dst_x == 0
+            && blit.dst_y == 0
+            && out.width() == source_desc.Width
+            && out.height() == source_desc.Height;
+        let map_full_slot = |out: &mut Frame| -> CaptureResult<()> {
+            if write_full_slot_direct {
+                surface::map_staging_to_frame(
+                    &self.context,
+                    staging,
+                    Some(staging_resource),
+                    &source_desc,
+                    out,
+                    slot.hdr_to_sdr,
+                    "failed to map DXGI region staging texture",
+                )?;
+            } else {
+                surface::map_staging_rect_to_frame(
+                    &self.context,
+                    staging,
+                    Some(staging_resource),
+                    &source_desc,
+                    out,
+                    staging_blit,
+                    slot.hdr_to_sdr,
+                    "failed to map DXGI region staging texture",
+                )?;
+            }
+            Ok(())
+        };
 
         if use_dirty_copy {
-            match surface::map_staging_dirty_rects_to_frame_with_offset(
-                &self.context,
-                staging,
-                Some(staging_resource),
-                &source_desc,
-                out,
-                &slot.dirty_rects,
-                blit.dst_x,
-                blit.dst_y,
-                true,
-                slot.hdr_to_sdr,
-                "failed to map DXGI region staging texture (dirty regions)",
-            ) {
+            let dirty_map_result = if write_full_slot_direct {
+                surface::map_staging_dirty_rects_to_frame(
+                    &self.context,
+                    staging,
+                    Some(staging_resource),
+                    &source_desc,
+                    out,
+                    &slot.dirty_rects,
+                    true,
+                    slot.hdr_to_sdr,
+                    "failed to map DXGI region staging texture (dirty regions)",
+                )
+            } else {
+                surface::map_staging_dirty_rects_to_frame_with_offset(
+                    &self.context,
+                    staging,
+                    Some(staging_resource),
+                    &source_desc,
+                    out,
+                    &slot.dirty_rects,
+                    blit.dst_x,
+                    blit.dst_y,
+                    true,
+                    slot.hdr_to_sdr,
+                    "failed to map DXGI region staging texture (dirty regions)",
+                )
+            };
+
+            match dirty_map_result {
                 Ok(converted) if converted > 0 => Ok(sample),
                 Ok(_) | Err(_) => {
-                    surface::map_staging_rect_to_frame(
-                        &self.context,
-                        staging,
-                        Some(staging_resource),
-                        &source_desc,
-                        out,
-                        staging_blit,
-                        slot.hdr_to_sdr,
-                        "failed to map DXGI region staging texture",
-                    )?;
+                    map_full_slot(out)?;
                     Ok(sample)
                 }
             }
         } else {
-            surface::map_staging_rect_to_frame(
-                &self.context,
-                staging,
-                Some(staging_resource),
-                &source_desc,
-                out,
-                staging_blit,
-                slot.hdr_to_sdr,
-                "failed to map DXGI region staging texture",
-            )?;
+            map_full_slot(out)?;
             Ok(sample)
         }
     }

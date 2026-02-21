@@ -496,6 +496,12 @@ Tip: compare DXGI trusted dirty-rect direct conversion in window mode:
   legacy (cmd.exe):    setlocal && set SNOW_CAPTURE_DISABLE_DIRTY_RECT_TRUSTED_DIRECT=1 && cargo run --release --example benchmark -- --backends dxgi --window-under-cursor && endlocal
   legacy (bash):       SNOW_CAPTURE_DISABLE_DIRTY_RECT_TRUSTED_DIRECT=1 cargo run --release --example benchmark -- --backends dxgi --window-under-cursor
 
+Tip: compare WGC dirty-rect conversion hints in window mode:
+  optimized: cargo run --release --example benchmark -- --backends wgc --window-under-cursor
+  legacy (PowerShell): $env:SNOW_CAPTURE_WGC_DISABLE_DIRTY_HINTS=1; cargo run --release --example benchmark -- --backends wgc --window-under-cursor; Remove-Item Env:SNOW_CAPTURE_WGC_DISABLE_DIRTY_HINTS
+  legacy (cmd.exe):    setlocal && set SNOW_CAPTURE_WGC_DISABLE_DIRTY_HINTS=1 && cargo run --release --example benchmark -- --backends wgc --window-under-cursor && endlocal
+  legacy (bash):       SNOW_CAPTURE_WGC_DISABLE_DIRTY_HINTS=1 cargo run --release --example benchmark -- --backends wgc --window-under-cursor
+
 Tip: compare the GDI span single-scan incremental path (sequential + parallel):
   optimized: cargo run --release --example benchmark -- --backends gdi --region-center 1600x900
   legacy (PowerShell): $env:SNOW_CAPTURE_DISABLE_GDI_SPAN_SINGLE_SCAN=1; cargo run --release --example benchmark -- --backends gdi --region-center 1600x900; Remove-Item Env:SNOW_CAPTURE_DISABLE_GDI_SPAN_SINGLE_SCAN

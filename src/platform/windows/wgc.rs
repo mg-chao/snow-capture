@@ -71,6 +71,7 @@ struct DirtyCopyStrategy {
     cpu: bool,
     gpu: bool,
     gpu_low_latency: bool,
+    dirty_pixels: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -127,6 +128,12 @@ fn region_low_latency_slot_enabled() -> bool {
 fn region_full_slot_map_fastpath_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_REGION_FULL_SLOT_MAP"))
+}
+
+#[inline]
+fn dirty_rect_conversion_hints_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_DIRTY_HINTS"))
 }
 
 #[inline]
@@ -655,6 +662,41 @@ fn extract_region_dirty_rects(
     true
 }
 
+#[inline(always)]
+fn dirty_rect_conversion_hints(
+    rects: &[DirtyRect],
+    dirty_pixels: u64,
+    trusted_bounds: bool,
+) -> surface::DirtyRectConversionHints {
+    if !dirty_rect_conversion_hints_enabled() {
+        return surface::DirtyRectConversionHints::default();
+    }
+
+    surface::DirtyRectConversionHints {
+        trusted_bounds,
+        non_empty_rects: Some(rects.len()),
+        total_dirty_pixels: usize::try_from(dirty_pixels).ok(),
+    }
+}
+
+#[inline(always)]
+fn dirty_rect_destination_bounds_trusted(
+    dst_x: u32,
+    dst_y: u32,
+    copy_width: u32,
+    copy_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+) -> bool {
+    let Some(dst_right) = dst_x.checked_add(copy_width) else {
+        return false;
+    };
+    let Some(dst_bottom) = dst_y.checked_add(copy_height) else {
+        return false;
+    };
+    dst_right <= dst_width && dst_bottom <= dst_height
+}
+
 fn evaluate_dirty_copy_strategy(rects: &[DirtyRect], width: u32, height: u32) -> DirtyCopyStrategy {
     if rects.is_empty() {
         return DirtyCopyStrategy::default();
@@ -665,32 +707,74 @@ fn evaluate_dirty_copy_strategy(rects: &[DirtyRect], width: u32, height: u32) ->
         return DirtyCopyStrategy::default();
     }
 
-    let mut cpu = rects.len() <= WGC_DIRTY_COPY_MAX_RECTS;
-    let mut gpu = rects.len() <= WGC_DIRTY_GPU_COPY_MAX_RECTS;
-    let mut gpu_low_latency = rects.len() <= WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS;
-    if !cpu && !gpu && !gpu_low_latency {
+    if rects.len() > WGC_DIRTY_COPY_MAX_RECTS {
         return DirtyCopyStrategy::default();
     }
+    let gpu_candidate = rects.len() <= WGC_DIRTY_GPU_COPY_MAX_RECTS;
+    let low_latency_candidate = rects.len() <= WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS;
 
     let cpu_limit = total_pixels.saturating_mul(WGC_DIRTY_COPY_MAX_AREA_PERCENT);
+    let mut dirty_pixels = 0u64;
+
+    if !gpu_candidate {
+        for rect in rects {
+            dirty_pixels =
+                dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+            if dirty_pixels.saturating_mul(100) > cpu_limit {
+                return DirtyCopyStrategy::default();
+            }
+        }
+        return DirtyCopyStrategy {
+            cpu: true,
+            gpu: false,
+            gpu_low_latency: false,
+            dirty_pixels,
+        };
+    }
+
     let gpu_limit = total_pixels.saturating_mul(WGC_DIRTY_GPU_COPY_MAX_AREA_PERCENT);
+    if !low_latency_candidate {
+        let mut cpu = true;
+        let mut gpu = true;
+        for rect in rects {
+            dirty_pixels =
+                dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+            let dirty_percent_scaled = dirty_pixels.saturating_mul(100);
+            if gpu && dirty_percent_scaled > gpu_limit {
+                gpu = false;
+            }
+            if cpu && dirty_percent_scaled > cpu_limit {
+                cpu = false;
+            }
+            if !cpu && !gpu {
+                break;
+            }
+        }
+        return DirtyCopyStrategy {
+            cpu,
+            gpu,
+            gpu_low_latency: false,
+            dirty_pixels,
+        };
+    }
+
     let gpu_low_latency_limit =
         total_pixels.saturating_mul(WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT);
-
-    let mut dirty_pixels = 0u64;
+    let mut cpu = true;
+    let mut gpu = true;
+    let mut gpu_low_latency = true;
     for rect in rects {
         dirty_pixels =
             dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
         let dirty_percent_scaled = dirty_pixels.saturating_mul(100);
-
-        if cpu && dirty_percent_scaled > cpu_limit {
-            cpu = false;
+        if gpu_low_latency && dirty_percent_scaled > gpu_low_latency_limit {
+            gpu_low_latency = false;
         }
         if gpu && dirty_percent_scaled > gpu_limit {
             gpu = false;
         }
-        if gpu_low_latency && dirty_percent_scaled > gpu_low_latency_limit {
-            gpu_low_latency = false;
+        if cpu && dirty_percent_scaled > cpu_limit {
+            cpu = false;
         }
         if !cpu && !gpu && !gpu_low_latency {
             break;
@@ -701,6 +785,7 @@ fn evaluate_dirty_copy_strategy(rects: &[DirtyRect], width: u32, height: u32) ->
         cpu,
         gpu,
         gpu_low_latency,
+        dirty_pixels,
     }
 }
 
@@ -764,6 +849,7 @@ struct WgcStagingSlot {
     dirty_mode_available: bool,
     dirty_cpu_copy_preferred: bool,
     dirty_gpu_copy_preferred: bool,
+    dirty_total_pixels: u64,
     dirty_rects: Vec<DirtyRect>,
     populated: bool,
 }
@@ -781,6 +867,7 @@ impl WgcStagingSlot {
         self.dirty_mode_available = false;
         self.dirty_cpu_copy_preferred = false;
         self.dirty_gpu_copy_preferred = false;
+        self.dirty_total_pixels = 0;
         self.dirty_rects.clear();
         self.populated = false;
     }
@@ -1973,6 +2060,20 @@ impl WindowsGraphicsCaptureCapturer {
                 && blit.dst_y == 0
                 && out.width() == source_desc.Width
                 && out.height() == source_desc.Height;
+            let dirty_bounds_trusted = write_full_slot_direct
+                || dirty_rect_destination_bounds_trusted(
+                    blit.dst_x,
+                    blit.dst_y,
+                    source_desc.Width,
+                    source_desc.Height,
+                    out.width(),
+                    out.height(),
+                );
+            let dirty_hints = dirty_rect_conversion_hints(
+                &slot.dirty_rects,
+                slot.dirty_total_pixels,
+                dirty_bounds_trusted,
+            );
             let map_full_slot = |out: &mut Frame| -> CaptureResult<()> {
                 if write_full_slot_direct {
                     surface::map_staging_to_frame(
@@ -2016,7 +2117,7 @@ impl WindowsGraphicsCaptureCapturer {
                         out,
                         &slot.dirty_rects,
                         true,
-                        surface::DirtyRectConversionHints::default(),
+                        dirty_hints,
                         slot.hdr_to_sdr,
                         "failed to map WGC region staging texture (dirty regions)",
                     )
@@ -2031,7 +2132,7 @@ impl WindowsGraphicsCaptureCapturer {
                         blit.dst_x,
                         blit.dst_y,
                         true,
-                        surface::DirtyRectConversionHints::default(),
+                        dirty_hints,
                         slot.hdr_to_sdr,
                         "failed to map WGC region staging texture (dirty regions)",
                     )
@@ -2110,6 +2211,7 @@ impl WindowsGraphicsCaptureCapturer {
             slot.dirty_mode_available = true;
             slot.dirty_cpu_copy_preferred = false;
             slot.dirty_gpu_copy_preferred = false;
+            slot.dirty_total_pixels = 0;
             slot.dirty_rects.clear();
         }
 
@@ -2189,6 +2291,8 @@ impl WindowsGraphicsCaptureCapturer {
                 && out_matches_source
                 && slot.dirty_cpu_copy_preferred
                 && !slot.dirty_rects.is_empty();
+            let dirty_hints =
+                dirty_rect_conversion_hints(&slot.dirty_rects, slot.dirty_total_pixels, true);
 
             if use_dirty_copy {
                 match surface::map_staging_dirty_rects_to_frame(
@@ -2199,7 +2303,7 @@ impl WindowsGraphicsCaptureCapturer {
                     out,
                     &slot.dirty_rects,
                     true,
-                    surface::DirtyRectConversionHints::default(),
+                    dirty_hints,
                     slot.hdr_to_sdr,
                     "failed to map WGC staging texture (dirty regions)",
                 ) {
@@ -2462,6 +2566,7 @@ impl WindowsGraphicsCaptureCapturer {
                 slot.dirty_mode_available = region_dirty_available;
                 slot.dirty_cpu_copy_preferred = false;
                 slot.dirty_gpu_copy_preferred = false;
+                slot.dirty_total_pixels = 0;
                 slot.dirty_rects.clear();
                 slot.populated = true;
                 slot_idx
@@ -2496,6 +2601,7 @@ impl WindowsGraphicsCaptureCapturer {
                     slot.dirty_gpu_copy_preferred = can_use_dirty_gpu_copy
                         && region_dirty_available
                         && dirty_gpu_copy_preferred;
+                    slot.dirty_total_pixels = region_dirty_strategy.dirty_pixels;
                     slot.populated = true;
                 }
 
@@ -2738,6 +2844,7 @@ impl WindowsGraphicsCaptureCapturer {
                 slot.dirty_mode_available = source_dirty_available;
                 slot.dirty_cpu_copy_preferred = false;
                 slot.dirty_gpu_copy_preferred = false;
+                slot.dirty_total_pixels = 0;
                 slot.dirty_rects.clear();
                 slot.populated = true;
                 slot_idx
@@ -2762,6 +2869,7 @@ impl WindowsGraphicsCaptureCapturer {
                     slot.dirty_cpu_copy_preferred = source_dirty_available && strategy.cpu;
                     slot.dirty_gpu_copy_preferred =
                         can_use_dirty_gpu_copy && source_dirty_available && strategy.gpu;
+                    slot.dirty_total_pixels = strategy.dirty_pixels;
                     slot.capture_time = Some(capture_time);
                     slot.present_time_ticks = time_ticks;
                     slot.is_duplicate = source_is_duplicate || source_unchanged;
@@ -3033,6 +3141,26 @@ mod tests {
     }
 
     #[test]
+    fn dirty_copy_strategy_reports_dirty_pixel_totals() {
+        let rects = vec![
+            DirtyRect {
+                x: 10,
+                y: 10,
+                width: 32,
+                height: 24,
+            },
+            DirtyRect {
+                x: 100,
+                y: 80,
+                width: 16,
+                height: 12,
+            },
+        ];
+        let strategy = evaluate_dirty_copy_strategy(&rects, 1920, 1080);
+        assert_eq!(strategy.dirty_pixels, (32_u64 * 24_u64) + (16_u64 * 12_u64));
+    }
+
+    #[test]
     fn low_latency_dirty_gpu_copy_heuristic_is_stricter() {
         let rects = vec![
             DirtyRect {
@@ -3044,6 +3172,36 @@ mod tests {
             WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS + 1
         ];
         assert!(!should_use_low_latency_dirty_gpu_copy(&rects, 1920, 1080));
+    }
+
+    #[test]
+    fn dirty_rect_destination_bounds_trusted_requires_in_bounds_destination() {
+        assert!(dirty_rect_destination_bounds_trusted(
+            32, 48, 640, 360, 1920, 1080
+        ));
+        assert!(!dirty_rect_destination_bounds_trusted(
+            1500, 900, 640, 360, 1920, 1080
+        ));
+    }
+
+    #[test]
+    fn dirty_rect_destination_bounds_trusted_rejects_coordinate_overflow() {
+        assert!(!dirty_rect_destination_bounds_trusted(
+            u32::MAX,
+            12,
+            8,
+            8,
+            u32::MAX,
+            u32::MAX,
+        ));
+        assert!(!dirty_rect_destination_bounds_trusted(
+            12,
+            u32::MAX,
+            8,
+            8,
+            u32::MAX,
+            u32::MAX,
+        ));
     }
 
     #[test]
@@ -3391,6 +3549,186 @@ mod tests {
         assert!(dirty_region_mode_supported(
             GraphicsCaptureDirtyRegionMode::ReportAndRender
         ));
+    }
+
+    fn should_use_dirty_copy_legacy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
+        if rects.is_empty() || rects.len() > WGC_DIRTY_COPY_MAX_RECTS {
+            return false;
+        }
+        let total_pixels = (width as u64).saturating_mul(height as u64);
+        if total_pixels == 0 {
+            return false;
+        }
+        let cpu_limit = total_pixels.saturating_mul(WGC_DIRTY_COPY_MAX_AREA_PERCENT);
+        let mut dirty_pixels = 0u64;
+        for rect in rects {
+            dirty_pixels =
+                dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+            if dirty_pixels.saturating_mul(100) > cpu_limit {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn should_use_dirty_gpu_copy_legacy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
+        if rects.is_empty() || rects.len() > WGC_DIRTY_GPU_COPY_MAX_RECTS {
+            return false;
+        }
+        let total_pixels = (width as u64).saturating_mul(height as u64);
+        if total_pixels == 0 {
+            return false;
+        }
+        let gpu_limit = total_pixels.saturating_mul(WGC_DIRTY_GPU_COPY_MAX_AREA_PERCENT);
+        let mut dirty_pixels = 0u64;
+        for rect in rects {
+            dirty_pixels =
+                dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+            if dirty_pixels.saturating_mul(100) > gpu_limit {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn should_use_low_latency_dirty_gpu_copy_legacy(
+        rects: &[DirtyRect],
+        width: u32,
+        height: u32,
+    ) -> bool {
+        if rects.is_empty() || rects.len() > WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS {
+            return false;
+        }
+        let total_pixels = (width as u64).saturating_mul(height as u64);
+        if total_pixels == 0 {
+            return false;
+        }
+        let limit = total_pixels.saturating_mul(WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT);
+        let mut dirty_pixels = 0u64;
+        for rect in rects {
+            dirty_pixels =
+                dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+            if dirty_pixels.saturating_mul(100) > limit {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    #[ignore = "performance benchmark guard; run explicitly with --ignored --nocapture"]
+    fn bench_dirty_copy_strategy_single_pass_vs_legacy() {
+        use std::hint::black_box;
+
+        let workloads = vec![
+            vec![
+                DirtyRect {
+                    x: 0,
+                    y: 0,
+                    width: 320,
+                    height: 180,
+                },
+                DirtyRect {
+                    x: 1280,
+                    y: 720,
+                    width: 200,
+                    height: 120,
+                },
+            ],
+            vec![
+                DirtyRect {
+                    x: 40,
+                    y: 32,
+                    width: 64,
+                    height: 48,
+                };
+                WGC_DIRTY_GPU_COPY_MAX_RECTS + 4
+            ],
+            vec![
+                DirtyRect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 540,
+                },
+                DirtyRect {
+                    x: 0,
+                    y: 540,
+                    width: 1920,
+                    height: 300,
+                },
+            ],
+        ];
+
+        for rects in &workloads {
+            let legacy_cpu = should_use_dirty_copy_legacy(rects, 1920, 1080);
+            let legacy_gpu = should_use_dirty_gpu_copy_legacy(rects, 1920, 1080);
+            let legacy_gpu_low = should_use_low_latency_dirty_gpu_copy_legacy(rects, 1920, 1080);
+            let optimized = evaluate_dirty_copy_strategy(rects, 1920, 1080);
+            assert_eq!(optimized.cpu, legacy_cpu);
+            assert_eq!(optimized.gpu, legacy_gpu);
+            assert_eq!(optimized.gpu_low_latency, legacy_gpu_low);
+        }
+
+        let warmup_iters = 10_000usize;
+        let measure_iters = 150_000usize;
+        let mut sink = 0usize;
+
+        for iter in 0..warmup_iters {
+            let rects = black_box(&workloads[iter % workloads.len()]);
+            let width = black_box(1920u32);
+            let height = black_box(1080u32);
+            sink ^= should_use_dirty_copy_legacy(rects, width, height) as usize;
+            sink ^= (should_use_dirty_gpu_copy_legacy(rects, width, height) as usize) << 1;
+            sink ^=
+                (should_use_low_latency_dirty_gpu_copy_legacy(rects, width, height) as usize) << 2;
+            let strategy = evaluate_dirty_copy_strategy(rects, width, height);
+            sink ^= (strategy.cpu as usize) << 3;
+            sink ^= (strategy.gpu as usize) << 4;
+            sink ^= (strategy.gpu_low_latency as usize) << 5;
+        }
+
+        let legacy_start = std::time::Instant::now();
+        for iter in 0..measure_iters {
+            let rects = black_box(&workloads[iter % workloads.len()]);
+            let width = black_box(1920u32);
+            let height = black_box(1080u32);
+            sink ^= should_use_dirty_copy_legacy(rects, width, height) as usize;
+            sink ^= (should_use_dirty_gpu_copy_legacy(rects, width, height) as usize) << 1;
+            sink ^=
+                (should_use_low_latency_dirty_gpu_copy_legacy(rects, width, height) as usize) << 2;
+        }
+        let legacy_elapsed = legacy_start.elapsed();
+
+        let optimized_start = std::time::Instant::now();
+        for iter in 0..measure_iters {
+            let rects = black_box(&workloads[iter % workloads.len()]);
+            let width = black_box(1920u32);
+            let height = black_box(1080u32);
+            let strategy = evaluate_dirty_copy_strategy(rects, width, height);
+            sink ^= strategy.cpu as usize;
+            sink ^= (strategy.gpu as usize) << 1;
+            sink ^= (strategy.gpu_low_latency as usize) << 2;
+            sink ^= (strategy.dirty_pixels as usize) << 3;
+        }
+        let optimized_elapsed = optimized_start.elapsed();
+        black_box(sink);
+
+        let legacy_ms = legacy_elapsed.as_secs_f64() * 1000.0;
+        let optimized_ms = optimized_elapsed.as_secs_f64() * 1000.0;
+        let speedup = if optimized_ms > 0.0 {
+            legacy_ms / optimized_ms
+        } else {
+            f64::INFINITY
+        };
+        println!(
+            "wgc dirty strategy benchmark: legacy={legacy_ms:.3} ms optimized={optimized_ms:.3} ms speedup={speedup:.2}x"
+        );
+
+        assert!(
+            optimized_ms <= legacy_ms * 1.05,
+            "single-pass dirty strategy regressed: legacy={legacy_ms:.3}ms optimized={optimized_ms:.3}ms ({speedup:.2}x)"
+        );
     }
 
     #[test]

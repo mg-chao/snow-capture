@@ -193,6 +193,43 @@ fn work_items_non_overlapping(work_items: &[DirtyRectWorkItem]) -> bool {
     true
 }
 
+#[inline(always)]
+fn dirty_rects_overlap(a: DirtyRect, b: DirtyRect) -> bool {
+    if a.width == 0 || a.height == 0 || b.width == 0 || b.height == 0 {
+        return false;
+    }
+
+    let Some(a_right) = a.x.checked_add(a.width) else {
+        return true;
+    };
+    let Some(a_bottom) = a.y.checked_add(a.height) else {
+        return true;
+    };
+    let Some(b_right) = b.x.checked_add(b.width) else {
+        return true;
+    };
+    let Some(b_bottom) = b.y.checked_add(b.height) else {
+        return true;
+    };
+
+    a.x < b_right && b.x < a_right && a.y < b_bottom && b.y < a_bottom
+}
+
+fn dirty_rects_non_overlapping_checked(dirty_rects: &[DirtyRect]) -> bool {
+    if dirty_rects.len() <= 1 {
+        return true;
+    }
+
+    for i in 0..dirty_rects.len() {
+        for j in (i + 1)..dirty_rects.len() {
+            if dirty_rects_overlap(dirty_rects[i], dirty_rects[j]) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[inline]
 fn env_var_truthy(var_name: &'static str) -> bool {
     std::env::var(var_name)
@@ -221,6 +258,11 @@ fn dirty_rect_non_overlap_shortcut_enabled() -> bool {
 fn dirty_rect_trusted_fastpath_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_DIRTY_RECT_TRUSTED_FASTPATH"))
+}
+
+fn dirty_rect_trusted_direct_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_DIRTY_RECT_TRUSTED_DIRECT"))
 }
 
 fn map_spin_wait_enabled() -> bool {
@@ -404,6 +446,120 @@ unsafe fn build_dirty_rect_work_item_trusted(
         width: copy_w,
         height: copy_h,
     })
+}
+
+#[inline(always)]
+unsafe fn convert_dirty_rects_trusted_direct_unchecked(
+    converter: convert::SurfaceRowConverter,
+    src_base: *const u8,
+    src_pitch: usize,
+    src_bytes_per_pixel: usize,
+    dst_base: *mut u8,
+    dst_pitch: usize,
+    dirty_rects: &[DirtyRect],
+    dst_origin_x: usize,
+    dst_origin_y: usize,
+) -> CaptureResult<usize> {
+    let mut converted = 0usize;
+    let mut total_dirty_pixels = 0usize;
+    for rect in dirty_rects {
+        let width = rect.width as usize;
+        let height = rect.height as usize;
+        if width == 0 || height == 0 {
+            continue;
+        }
+        let dirty_pixels = width
+            .checked_mul(height)
+            .ok_or(CaptureError::BufferOverflow)?;
+        total_dirty_pixels = total_dirty_pixels
+            .checked_add(dirty_pixels)
+            .ok_or(CaptureError::BufferOverflow)?;
+        converted = converted.saturating_add(1);
+    }
+    if converted == 0 {
+        return Ok(0);
+    }
+
+    let should_parallelize = convert::should_parallelize_work(
+        total_dirty_pixels,
+        DIRTY_RECT_PARALLEL_MIN_PIXELS,
+        DIRTY_RECT_PARALLEL_MIN_CHUNK_PIXELS,
+        DIRTY_RECT_PARALLEL_MAX_WORKERS,
+    );
+    let can_parallel = dirty_rect_parallel_enabled()
+        && converted >= DIRTY_RECT_PARALLEL_MIN_RECTS
+        && should_parallelize
+        && (dirty_rect_non_overlap_shortcut_enabled()
+            || dirty_rects_non_overlapping_checked(dirty_rects));
+
+    if can_parallel {
+        use rayon::prelude::*;
+
+        let src_addr = src_base as usize;
+        let dst_addr = dst_base as usize;
+        convert::with_conversion_pool(DIRTY_RECT_PARALLEL_MAX_WORKERS, || {
+            dirty_rects.par_iter().for_each(|rect| {
+                let width = rect.width as usize;
+                let height = rect.height as usize;
+                if width == 0 || height == 0 {
+                    return;
+                }
+
+                let x = rect.x as usize;
+                let y = rect.y as usize;
+                let src_offset = y * src_pitch + x * src_bytes_per_pixel;
+                let dst_offset = (dst_origin_y + y) * dst_pitch + (dst_origin_x + x) * 4;
+                unsafe {
+                    converter.convert_rows_unchecked(
+                        (src_addr + src_offset) as *const u8,
+                        src_pitch,
+                        (dst_addr + dst_offset) as *mut u8,
+                        dst_pitch,
+                        width,
+                        height,
+                    );
+                }
+            });
+        });
+        return Ok(converted);
+    }
+
+    let allow_inner_parallel = converted == 1;
+    for rect in dirty_rects {
+        let width = rect.width as usize;
+        let height = rect.height as usize;
+        if width == 0 || height == 0 {
+            continue;
+        }
+
+        let x = rect.x as usize;
+        let y = rect.y as usize;
+        let src_offset = y * src_pitch + x * src_bytes_per_pixel;
+        let dst_offset = (dst_origin_y + y) * dst_pitch + (dst_origin_x + x) * 4;
+        unsafe {
+            if allow_inner_parallel {
+                converter.convert_rows_maybe_parallel_unchecked(
+                    src_base.add(src_offset),
+                    src_pitch,
+                    dst_base.add(dst_offset),
+                    dst_pitch,
+                    width,
+                    height,
+                );
+            } else {
+                converter.convert_rows_unchecked(
+                    src_base.add(src_offset),
+                    src_pitch,
+                    dst_base.add(dst_offset),
+                    dst_pitch,
+                    width,
+                    height,
+                );
+            }
+        }
+    }
+
+    Ok(converted)
 }
 
 pub(crate) fn ensure_staging_texture<'a>(
@@ -773,6 +929,24 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
                 dst_height_u32,
             );
 
+        if trusted_fastpath && dirty_rect_trusted_direct_enabled() {
+            // SAFETY: `trusted_fastpath` guarantees all dirty rectangles are
+            // in-bounds for both source and destination surfaces.
+            return unsafe {
+                convert_dirty_rects_trusted_direct_unchecked(
+                    converter,
+                    src_base,
+                    src_pitch,
+                    src_bytes_per_pixel,
+                    dst_base,
+                    dst_pitch,
+                    dirty_rects,
+                    dst_origin_x,
+                    dst_origin_y,
+                )
+            };
+        }
+
         if dirty_rect_fastpath_enabled() && dirty_rects.len() < DIRTY_RECT_PARALLEL_MIN_RECTS {
             let allow_inner_parallel = dirty_rects.len() == 1;
             let mut converted = 0usize;
@@ -1015,6 +1189,50 @@ mod tests {
     }
 
     #[test]
+    fn dirty_rects_non_overlapping_checked_detects_overlap() {
+        let dirty_rects = vec![
+            DirtyRect {
+                x: 4,
+                y: 8,
+                width: 16,
+                height: 12,
+            },
+            DirtyRect {
+                x: 12,
+                y: 10,
+                width: 8,
+                height: 8,
+            },
+        ];
+        assert!(!dirty_rects_non_overlapping_checked(&dirty_rects));
+    }
+
+    #[test]
+    fn dirty_rects_non_overlapping_checked_ignores_zero_sized_rects() {
+        let dirty_rects = vec![
+            DirtyRect {
+                x: 2,
+                y: 2,
+                width: 24,
+                height: 8,
+            },
+            DirtyRect {
+                x: 10,
+                y: 4,
+                width: 0,
+                height: 8,
+            },
+            DirtyRect {
+                x: 30,
+                y: 2,
+                width: 12,
+                height: 8,
+            },
+        ];
+        assert!(dirty_rects_non_overlapping_checked(&dirty_rects));
+    }
+
+    #[test]
     fn build_dirty_rect_work_item_clamps_to_source_bounds() {
         let rect = DirtyRect {
             x: 1910,
@@ -1090,5 +1308,129 @@ mod tests {
         assert_eq!(checked.dst_offset, trusted.dst_offset);
         assert_eq!(checked.width, trusted.width);
         assert_eq!(checked.height, trusted.height);
+    }
+
+    #[test]
+    fn trusted_direct_dirty_rect_conversion_matches_work_item_path() {
+        let src_width = 160usize;
+        let src_height = 96usize;
+        let src_pitch = src_width * 4 + 64;
+        let src_len = src_pitch * (src_height - 1) + src_width * 4;
+        let mut src = vec![0u8; src_len];
+        for (idx, byte) in src.iter_mut().enumerate() {
+            *byte = (idx as u8).wrapping_mul(29).wrapping_add(7);
+        }
+
+        let dst_origin_x = 7usize;
+        let dst_origin_y = 11usize;
+        let dst_width = 220usize;
+        let dst_height = 170usize;
+        let dst_pitch = dst_width * 4;
+        let dst_len = dst_pitch * dst_height;
+
+        let dirty_rects = vec![
+            DirtyRect {
+                x: 2,
+                y: 3,
+                width: 24,
+                height: 12,
+            },
+            DirtyRect {
+                x: 40,
+                y: 10,
+                width: 20,
+                height: 8,
+            },
+            DirtyRect {
+                x: 90,
+                y: 22,
+                width: 30,
+                height: 10,
+            },
+            DirtyRect {
+                x: 18,
+                y: 48,
+                width: 42,
+                height: 16,
+            },
+            DirtyRect {
+                x: 130,
+                y: 60,
+                width: 18,
+                height: 14,
+            },
+            DirtyRect {
+                x: 12,
+                y: 80,
+                width: 0,
+                height: 4,
+            },
+        ];
+
+        assert!(dirty_rects_fit_bounds(
+            &dirty_rects,
+            src_width as u32,
+            src_height as u32,
+            dst_origin_x as u32,
+            dst_origin_y as u32,
+            dst_width as u32,
+            dst_height as u32
+        ));
+
+        let converter = convert::SurfaceRowConverter::new(
+            SurfacePixelFormat::Bgra8,
+            SurfaceConversionOptions { hdr_to_sdr: None },
+        );
+
+        let mut expected = vec![0u8; dst_len];
+        let mut expected_converted = 0usize;
+        for rect in &dirty_rects {
+            let item = build_dirty_rect_work_item(
+                rect,
+                src_width,
+                src_height,
+                dst_origin_x,
+                dst_origin_y,
+                dst_width,
+                dst_height,
+                src_pitch,
+                4,
+                dst_pitch,
+            )
+            .expect("checked work-item conversion failed");
+            let Some(item) = item else {
+                continue;
+            };
+            expected_converted = expected_converted.saturating_add(1);
+            unsafe {
+                converter.convert_rows_unchecked(
+                    src.as_ptr().add(item.src_offset),
+                    src_pitch,
+                    expected.as_mut_ptr().add(item.dst_offset),
+                    dst_pitch,
+                    item.width,
+                    item.height,
+                );
+            }
+        }
+
+        let mut direct = vec![0u8; dst_len];
+        let converted = unsafe {
+            convert_dirty_rects_trusted_direct_unchecked(
+                converter,
+                src.as_ptr(),
+                src_pitch,
+                4,
+                direct.as_mut_ptr(),
+                dst_pitch,
+                &dirty_rects,
+                dst_origin_x,
+                dst_origin_y,
+            )
+        }
+        .expect("trusted direct conversion failed");
+
+        assert_eq!(converted, expected_converted);
+        assert_eq!(direct, expected);
     }
 }

@@ -490,6 +490,12 @@ Tip: compare the GDI duplicate-frame fast path with legacy behavior:
   legacy (cmd.exe):    setlocal && set SNOW_CAPTURE_DISABLE_GDI_DUPLICATE_PROBE=1 && cargo run --release --example benchmark -- --backends gdi --region-center 1920x1080 && endlocal
   legacy (bash):       SNOW_CAPTURE_DISABLE_GDI_DUPLICATE_PROBE=1 cargo run --release --example benchmark -- --backends gdi --region-center 1920x1080
 
+Tip: compare DXGI trusted dirty-rect direct conversion in window mode:
+  optimized: cargo run --release --example benchmark -- --backends dxgi --window-under-cursor
+  legacy (PowerShell): $env:SNOW_CAPTURE_DISABLE_DIRTY_RECT_TRUSTED_DIRECT=1; cargo run --release --example benchmark -- --backends dxgi --window-under-cursor; Remove-Item Env:SNOW_CAPTURE_DISABLE_DIRTY_RECT_TRUSTED_DIRECT
+  legacy (cmd.exe):    setlocal && set SNOW_CAPTURE_DISABLE_DIRTY_RECT_TRUSTED_DIRECT=1 && cargo run --release --example benchmark -- --backends dxgi --window-under-cursor && endlocal
+  legacy (bash):       SNOW_CAPTURE_DISABLE_DIRTY_RECT_TRUSTED_DIRECT=1 cargo run --release --example benchmark -- --backends dxgi --window-under-cursor
+
 Tip: compare the GDI span single-scan incremental path:
   optimized: cargo run --release --example benchmark -- --backends gdi --region-center 1600x900
   legacy (PowerShell): $env:SNOW_CAPTURE_DISABLE_GDI_SPAN_SINGLE_SCAN=1; cargo run --release --example benchmark -- --backends gdi --region-center 1600x900; Remove-Item Env:SNOW_CAPTURE_DISABLE_GDI_SPAN_SINGLE_SCAN

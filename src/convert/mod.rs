@@ -644,6 +644,22 @@ fn nt_rows_are_aligned(dst: *const u8, dst_pitch: usize) -> bool {
     alignment <= 1 || (ptr_is_aligned(dst, alignment) && dst_pitch.is_multiple_of(alignment))
 }
 
+#[inline]
+fn bgra_nt_unaligned_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_DISABLE_BGRA_NT_UNALIGNED")
+            .map(|raw| {
+                let normalized = raw.trim().to_ascii_lowercase();
+                !(normalized == "1"
+                    || normalized == "true"
+                    || normalized == "yes"
+                    || normalized == "on")
+            })
+            .unwrap_or(true)
+    })
+}
+
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
 struct BgraNtKernelSet {
@@ -681,19 +697,20 @@ fn bgra_nt_kernel_set() -> &'static BgraNtKernelSet {
 fn bgra_nt_kernel_for_destination(dst: *const u8) -> Option<PixelKernel> {
     #[cfg(target_arch = "x86_64")]
     {
+        let allow_unaligned = bgra_nt_unaligned_enabled();
         let kernels = bgra_nt_kernel_set();
         if let Some(kernel) = kernels.avx512
-            && ptr_is_aligned(dst, 64)
+            && (allow_unaligned || ptr_is_aligned(dst, 64))
         {
             return Some(kernel);
         }
         if let Some(kernel) = kernels.avx2
-            && ptr_is_aligned(dst, 32)
+            && (allow_unaligned || ptr_is_aligned(dst, 32))
         {
             return Some(kernel);
         }
         if let Some(kernel) = kernels.ssse3
-            && ptr_is_aligned(dst, 16)
+            && (allow_unaligned || ptr_is_aligned(dst, 16))
         {
             return Some(kernel);
         }
@@ -710,22 +727,20 @@ fn bgra_nt_kernel_for_destination(dst: *const u8) -> Option<PixelKernel> {
 fn bgra_nt_kernel_for_rows(dst: *const u8, dst_pitch: usize) -> Option<PixelKernel> {
     #[cfg(target_arch = "x86_64")]
     {
+        let allow_unaligned = bgra_nt_unaligned_enabled();
         let kernels = bgra_nt_kernel_set();
         if let Some(kernel) = kernels.avx512
-            && ptr_is_aligned(dst, 64)
-            && dst_pitch.is_multiple_of(64)
+            && (allow_unaligned || (ptr_is_aligned(dst, 64) && dst_pitch.is_multiple_of(64)))
         {
             return Some(kernel);
         }
         if let Some(kernel) = kernels.avx2
-            && ptr_is_aligned(dst, 32)
-            && dst_pitch.is_multiple_of(32)
+            && (allow_unaligned || (ptr_is_aligned(dst, 32) && dst_pitch.is_multiple_of(32)))
         {
             return Some(kernel);
         }
         if let Some(kernel) = kernels.ssse3
-            && ptr_is_aligned(dst, 16)
-            && dst_pitch.is_multiple_of(16)
+            && (allow_unaligned || (ptr_is_aligned(dst, 16) && dst_pitch.is_multiple_of(16)))
         {
             return Some(kernel);
         }

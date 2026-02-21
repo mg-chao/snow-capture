@@ -109,6 +109,36 @@ fn gdi_direct_region_capture_enabled() -> bool {
     })
 }
 
+#[inline]
+fn gdi_window_state_cache_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_DISABLE_GDI_WINDOW_STATE_CACHE")
+            .map(|raw| {
+                let normalized = raw.trim().to_ascii_lowercase();
+                !(normalized == "1"
+                    || normalized == "true"
+                    || normalized == "yes"
+                    || normalized == "on")
+            })
+            .unwrap_or(true)
+    })
+}
+
+#[inline]
+fn gdi_window_state_refresh_interval_frames() -> u32 {
+    use std::sync::OnceLock;
+    static INTERVAL: OnceLock<u32> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_GDI_WINDOW_STATE_REFRESH_FRAMES")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            .map(|value| value.max(1))
+            .unwrap_or(8)
+    })
+}
+
 #[inline(always)]
 fn window_capture_order(mode: CaptureMode) -> &'static [WindowCapturePath; 4] {
     match mode {
@@ -757,6 +787,8 @@ pub(crate) struct WindowsWindowCapturer {
     hwnd: HWND,
     capture_mode: CaptureMode,
     preferred_path: Option<WindowCapturePath>,
+    cached_rect: Option<RECT>,
+    frames_until_state_refresh: u32,
 }
 
 // GdiResources contains raw pointers (HDC, HBITMAP, *mut u8) that are
@@ -787,21 +819,13 @@ impl WindowsWindowCapturer {
             hwnd,
             capture_mode: CaptureMode::Screenshot,
             preferred_path: None,
+            cached_rect: None,
+            frames_until_state_refresh: 0,
         })
     }
-}
 
-impl MonitorCapturer for WindowsWindowCapturer {
-    fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
-        if !unsafe { IsWindow(self.hwnd) }.as_bool() {
-            return Err(CaptureError::InvalidTarget(
-                "window no longer exists".into(),
-            ));
-        }
-        if unsafe { IsIconic(self.hwnd) }.as_bool() {
-            return Err(CaptureError::InvalidTarget("window is minimized".into()));
-        }
-        if !unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
+    fn refresh_window_rect(&mut self, require_visible: bool) -> CaptureResult<RECT> {
+        if require_visible && !unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
             return Err(CaptureError::InvalidTarget("window is not visible".into()));
         }
 
@@ -819,15 +843,91 @@ impl MonitorCapturer for WindowsWindowCapturer {
             ));
         }
 
+        self.cached_rect = Some(rect);
+        self.frames_until_state_refresh =
+            gdi_window_state_refresh_interval_frames().saturating_sub(1);
+        Ok(rect)
+    }
+
+    fn resolve_window_rect(&mut self) -> CaptureResult<(RECT, bool)> {
+        if self.capture_mode != CaptureMode::ScreenRecording || !gdi_window_state_cache_enabled() {
+            return self.refresh_window_rect(true).map(|rect| (rect, false));
+        }
+
+        if self.frames_until_state_refresh > 0 {
+            if let Some(rect) = self.cached_rect {
+                self.frames_until_state_refresh -= 1;
+                return Ok((rect, true));
+            }
+            self.frames_until_state_refresh = 0;
+        }
+
+        self.refresh_window_rect(true).map(|rect| (rect, false))
+    }
+
+    fn invalidate_window_state_cache(&mut self) {
+        self.cached_rect = None;
+        self.frames_until_state_refresh = 0;
+    }
+}
+
+impl MonitorCapturer for WindowsWindowCapturer {
+    fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
+        if !unsafe { IsWindow(self.hwnd) }.as_bool() {
+            return Err(CaptureError::InvalidTarget(
+                "window no longer exists".into(),
+            ));
+        }
+        if unsafe { IsIconic(self.hwnd) }.as_bool() {
+            self.invalidate_window_state_cache();
+            return Err(CaptureError::InvalidTarget("window is minimized".into()));
+        }
+        if !unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
+            self.invalidate_window_state_cache();
+            return Err(CaptureError::InvalidTarget("window is not visible".into()));
+        }
+        let (mut rect, used_cached_rect) = self.resolve_window_rect()?;
+        let width = rect.right.saturating_sub(rect.left);
+        let height = rect.bottom.saturating_sub(rect.top);
+        if width <= 0 || height <= 0 {
+            self.invalidate_window_state_cache();
+            return Err(CaptureError::InvalidTarget(
+                "window has empty bounds".into(),
+            ));
+        }
+
         let capture_time = Instant::now();
-        let (mut frame, used_path) = self.resources.capture_window_to_rgba(
+        let first_attempt = self.resources.capture_window_to_rgba(
             self.hwnd,
             width,
             height,
             reuse,
             self.capture_mode,
             self.preferred_path,
-        )?;
+        );
+        let (mut frame, used_path) = match first_attempt {
+            Ok(result) => result,
+            Err(_) if used_cached_rect => {
+                rect = self.refresh_window_rect(true)?;
+                let retry_width = rect.right.saturating_sub(rect.left);
+                let retry_height = rect.bottom.saturating_sub(rect.top);
+                if retry_width <= 0 || retry_height <= 0 {
+                    self.invalidate_window_state_cache();
+                    return Err(CaptureError::InvalidTarget(
+                        "window has empty bounds".into(),
+                    ));
+                }
+                self.resources.capture_window_to_rgba(
+                    self.hwnd,
+                    retry_width,
+                    retry_height,
+                    None,
+                    self.capture_mode,
+                    self.preferred_path,
+                )?
+            }
+            Err(error) => return Err(error),
+        };
         self.preferred_path = match self.capture_mode {
             CaptureMode::ScreenRecording => Some(used_path),
             CaptureMode::Screenshot => None,
@@ -840,6 +940,7 @@ impl MonitorCapturer for WindowsWindowCapturer {
     fn set_capture_mode(&mut self, mode: CaptureMode) {
         if self.capture_mode != mode {
             self.preferred_path = None;
+            self.invalidate_window_state_cache();
         }
         self.capture_mode = mode;
     }

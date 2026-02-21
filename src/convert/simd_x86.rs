@@ -4,6 +4,22 @@ use super::f16::{
 };
 use super::scalar::convert_bgra_to_rgba_scalar_unchecked;
 
+#[inline(always)]
+fn nt_prefix_pixels(dst: *mut u8, pixel_count: usize, alignment: usize) -> usize {
+    if pixel_count == 0 || alignment <= 1 {
+        return 0;
+    }
+    let misalign = (dst as usize) & (alignment - 1);
+    if misalign == 0 {
+        return 0;
+    }
+    let bytes_to_align = alignment - misalign;
+    if !bytes_to_align.is_multiple_of(4) {
+        return pixel_count;
+    }
+    (bytes_to_align / 4).min(pixel_count)
+}
+
 // ---------------------------------------------------------------------------
 // AVX-512
 // ---------------------------------------------------------------------------
@@ -56,6 +72,18 @@ unsafe fn avx512_bgra_core(src: *const u8, dst: *mut u8, pixel_count: usize, non
     }
 
     let mut x = 0usize;
+    if nontemporal {
+        let prefix = nt_prefix_pixels(dst, pixel_count, 64);
+        if prefix > 0 {
+            unsafe {
+                convert_bgra_to_rgba_scalar_unchecked(src, dst, prefix);
+            }
+            x = prefix;
+            if x == pixel_count {
+                return;
+            }
+        }
+    }
 
     // Process 128 pixels (8×16) per iteration to better amortise loop
     // overhead and improve instruction-level parallelism.
@@ -166,6 +194,18 @@ unsafe fn avx2_bgra_core(src: *const u8, dst: *mut u8, pixel_count: usize, nonte
     }
 
     let mut x = 0usize;
+    if nontemporal {
+        let prefix = nt_prefix_pixels(dst, pixel_count, 32);
+        if prefix > 0 {
+            unsafe {
+                convert_bgra_to_rgba_scalar_unchecked(src, dst, prefix);
+            }
+            x = prefix;
+            if x == pixel_count {
+                return;
+            }
+        }
+    }
     while x + 32 <= pixel_count {
         let offset = x * 4;
         // Prefetch source data ~4 iterations ahead (512 bytes) to hide
@@ -259,6 +299,18 @@ unsafe fn ssse3_bgra_core(src: *const u8, dst: *mut u8, pixel_count: usize, nont
     }
 
     let mut x = 0usize;
+    if nontemporal {
+        let prefix = nt_prefix_pixels(dst, pixel_count, 16);
+        if prefix > 0 {
+            unsafe {
+                convert_bgra_to_rgba_scalar_unchecked(src, dst, prefix);
+            }
+            x = prefix;
+            if x == pixel_count {
+                return;
+            }
+        }
+    }
     while x + 16 <= pixel_count {
         let offset = x * 4;
         let input0 = unsafe { _mm_loadu_si128(src.add(offset) as *const __m128i) };

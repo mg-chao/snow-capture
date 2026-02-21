@@ -86,34 +86,29 @@ fn work_items_non_overlapping(work_items: &[DirtyRectWorkItem]) -> bool {
     true
 }
 
+#[inline]
+fn env_var_truthy(var_name: &'static str) -> bool {
+    std::env::var(var_name)
+        .map(|raw| {
+            let normalized = raw.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
+        })
+        .unwrap_or(false)
+}
+
 fn dirty_rect_parallel_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_DIRTY_RECT_PARALLEL")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
-    })
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_DIRTY_RECT_PARALLEL"))
 }
 
 fn dirty_rect_fastpath_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_DIRTY_RECT_FASTPATH")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
-    })
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_DIRTY_RECT_FASTPATH"))
+}
+
+fn dirty_rect_non_overlap_shortcut_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_DIRTY_RECT_NON_OVERLAP_SHORTCUT"))
 }
 
 #[inline(always)]
@@ -496,6 +491,7 @@ pub(crate) fn map_staging_dirty_rects_to_frame(
     desc: &D3D11_TEXTURE2D_DESC,
     frame: &mut Frame,
     dirty_rects: &[DirtyRect],
+    dirty_rects_non_overlapping: bool,
     hdr_to_sdr: Option<HdrToSdrParams>,
     map_context: &'static str,
 ) -> CaptureResult<usize> {
@@ -509,6 +505,7 @@ pub(crate) fn map_staging_dirty_rects_to_frame(
         dirty_rects,
         0,
         0,
+        dirty_rects_non_overlapping,
         hdr_to_sdr,
         map_context,
     )
@@ -528,6 +525,7 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
     dirty_rects: &[DirtyRect],
     dst_origin_x: u32,
     dst_origin_y: u32,
+    dirty_rects_non_overlapping: bool,
     hdr_to_sdr: Option<HdrToSdrParams>,
     map_context: &'static str,
 ) -> CaptureResult<usize> {
@@ -663,10 +661,17 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
             DIRTY_RECT_PARALLEL_MIN_CHUNK_PIXELS,
             DIRTY_RECT_PARALLEL_MAX_WORKERS,
         );
+        let non_overlapping =
+            if dirty_rects_non_overlapping && dirty_rect_non_overlap_shortcut_enabled() {
+                debug_assert!(work_items_non_overlapping(&work_items));
+                true
+            } else {
+                work_items_non_overlapping(&work_items)
+            };
         let can_parallel = dirty_rect_parallel_enabled()
             && work_items.len() >= DIRTY_RECT_PARALLEL_MIN_RECTS
             && should_parallelize
-            && work_items_non_overlapping(&work_items);
+            && non_overlapping;
 
         if can_parallel {
             use rayon::prelude::*;

@@ -1650,6 +1650,7 @@ impl WindowsGraphicsCaptureCapturer {
                     &slot.dirty_rects,
                     blit.dst_x,
                     blit.dst_y,
+                    true,
                     slot.hdr_to_sdr,
                     "failed to map WGC region staging texture (dirty regions)",
                 ) {
@@ -1798,6 +1799,7 @@ impl WindowsGraphicsCaptureCapturer {
                     &source_desc,
                     out,
                     &slot.dirty_rects,
+                    true,
                     slot.hdr_to_sdr,
                     "failed to map WGC staging texture (dirty regions)",
                 ) {

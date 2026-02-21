@@ -95,6 +95,34 @@ fn window_low_latency_region_enabled() -> bool {
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_WINDOW_LOW_LATENCY_REGION"))
 }
 
+#[inline]
+fn borrowed_source_resource_cast_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_BORROWED_SOURCE_RESOURCE"))
+}
+
+#[inline(always)]
+fn with_texture_resource<T>(
+    texture: &ID3D11Texture2D,
+    cast_context: &'static str,
+    f: impl FnOnce(&ID3D11Resource) -> CaptureResult<T>,
+) -> CaptureResult<T> {
+    if borrowed_source_resource_cast_enabled() {
+        let raw = texture.as_raw();
+        // SAFETY: ID3D11Texture2D inherits from ID3D11Resource, so the
+        // COM pointer is valid when viewed through the base interface.
+        if let Some(resource) = unsafe { ID3D11Resource::from_raw_borrowed(&raw) } {
+            return f(resource);
+        }
+    }
+
+    let owned_resource: ID3D11Resource = texture
+        .cast()
+        .context(cast_context)
+        .map_err(CaptureError::Platform)?;
+    f(&owned_resource)
+}
+
 #[derive(Default)]
 struct RegionStagingSlot {
     staging: Option<ID3D11Texture2D>,
@@ -646,7 +674,7 @@ impl StagingRing {
         &mut self,
         context: &ID3D11DeviceContext,
         source: &ID3D11Texture2D,
-    ) -> Option<usize> {
+    ) -> CaptureResult<Option<usize>> {
         let prev_pending = self.pending;
         let read_idx = if prev_pending {
             // The previous write slot becomes the new read slot.
@@ -654,21 +682,26 @@ impl StagingRing {
         } else {
             None
         };
+        let write_idx = if prev_pending {
+            (self.write_idx + 1) % STAGING_SLOTS
+        } else {
+            self.write_idx
+        };
 
-        // Advance to the next slot in the ring for the new write.
-        if prev_pending {
-            self.write_idx = (self.write_idx + 1) % STAGING_SLOTS;
-        }
-
-        let staging_res = self.slot_resources[self.write_idx].as_ref().unwrap();
-        let source_res: ID3D11Resource = source.cast().unwrap();
-
-        unsafe {
-            context.CopyResource(staging_res, &source_res);
-        }
+        let staging_res = self.slot_resources[write_idx].as_ref().unwrap();
+        with_texture_resource(
+            source,
+            "failed to cast DXGI source texture to ID3D11Resource",
+            |source_res| {
+                unsafe {
+                    context.CopyResource(staging_res, source_res);
+                }
+                Ok(())
+            },
+        )?;
 
         // Signal the event query so we can poll for completion.
-        if let Some(ref query) = self.queries[self.write_idx] {
+        if let Some(ref query) = self.queries[write_idx] {
             unsafe { context.End(query) };
         }
 
@@ -699,9 +732,10 @@ impl StagingRing {
             unsafe { context.Flush() };
         }
 
+        self.write_idx = write_idx;
         self.pending = true;
         self.read_idx = read_idx;
-        read_idx
+        Ok(read_idx)
     }
 
     #[inline(always)]
@@ -787,6 +821,7 @@ impl StagingRing {
                 desc,
                 frame,
                 dirty_rects,
+                true,
                 hdr_to_sdr,
                 "failed to map staging texture (dirty regions)",
             ) {
@@ -827,11 +862,16 @@ impl StagingRing {
         hdr_to_sdr: Option<HdrToSdrParams>,
     ) -> CaptureResult<()> {
         let staging_res = self.slot_resources[self.write_idx].as_ref().unwrap();
-        let source_res: ID3D11Resource = source.cast().unwrap();
-
-        unsafe {
-            context.CopyResource(staging_res, &source_res);
-        }
+        with_texture_resource(
+            source,
+            "failed to cast DXGI source texture to ID3D11Resource",
+            |source_res| {
+                unsafe {
+                    context.CopyResource(staging_res, source_res);
+                }
+                Ok(())
+            },
+        )?;
 
         // Signal the event query and flush to kick off the copy.
         if let Some(ref query) = self.queries[self.write_idx] {
@@ -1389,7 +1429,7 @@ impl OutputCapturer {
     fn copy_region_source_to_slot(
         &self,
         slot_idx: usize,
-        source_resource: &ID3D11Resource,
+        source: &ID3D11Texture2D,
         blit: CaptureBlitRegion,
         can_use_dirty_gpu_copy: bool,
     ) -> CaptureResult<()> {
@@ -1399,80 +1439,89 @@ impl OutputCapturer {
                 "DXGI region slot missing staging resource after initialization"
             ))
         })?;
+        with_texture_resource(
+            source,
+            "failed to cast region source texture to ID3D11Resource",
+            |source_resource| {
+                let mut used_dirty_copy = false;
+                if can_use_dirty_gpu_copy
+                    && region_dirty_gpu_copy_enabled()
+                    && slot.dirty_copy_preferred
+                {
+                    for rect in &slot.dirty_rects {
+                        let source_left = blit
+                            .src_x
+                            .checked_add(rect.x)
+                            .ok_or(CaptureError::BufferOverflow)?;
+                        let source_top = blit
+                            .src_y
+                            .checked_add(rect.y)
+                            .ok_or(CaptureError::BufferOverflow)?;
+                        let source_right = source_left
+                            .checked_add(rect.width)
+                            .ok_or(CaptureError::BufferOverflow)?;
+                        let source_bottom = source_top
+                            .checked_add(rect.height)
+                            .ok_or(CaptureError::BufferOverflow)?;
+                        let source_box = D3D11_BOX {
+                            left: source_left,
+                            top: source_top,
+                            front: 0,
+                            right: source_right,
+                            bottom: source_bottom,
+                            back: 1,
+                        };
 
-        let mut used_dirty_copy = false;
-        if can_use_dirty_gpu_copy && region_dirty_gpu_copy_enabled() && slot.dirty_copy_preferred {
-            for rect in &slot.dirty_rects {
-                let source_left = blit
-                    .src_x
-                    .checked_add(rect.x)
-                    .ok_or(CaptureError::BufferOverflow)?;
-                let source_top = blit
-                    .src_y
-                    .checked_add(rect.y)
-                    .ok_or(CaptureError::BufferOverflow)?;
-                let source_right = source_left
-                    .checked_add(rect.width)
-                    .ok_or(CaptureError::BufferOverflow)?;
-                let source_bottom = source_top
-                    .checked_add(rect.height)
-                    .ok_or(CaptureError::BufferOverflow)?;
-                let source_box = D3D11_BOX {
-                    left: source_left,
-                    top: source_top,
-                    front: 0,
-                    right: source_right,
-                    bottom: source_bottom,
-                    back: 1,
-                };
-
-                unsafe {
-                    self.context.CopySubresourceRegion(
-                        staging_resource,
-                        0,
-                        rect.x,
-                        rect.y,
-                        0,
-                        source_resource,
-                        0,
-                        Some(&source_box),
-                    );
+                        unsafe {
+                            self.context.CopySubresourceRegion(
+                                staging_resource,
+                                0,
+                                rect.x,
+                                rect.y,
+                                0,
+                                source_resource,
+                                0,
+                                Some(&source_box),
+                            );
+                        }
+                    }
+                    used_dirty_copy = true;
                 }
-            }
-            used_dirty_copy = true;
-        }
 
-        if !used_dirty_copy {
-            let src_right = blit
-                .src_x
-                .checked_add(blit.width)
-                .ok_or(CaptureError::BufferOverflow)?;
-            let src_bottom = blit
-                .src_y
-                .checked_add(blit.height)
-                .ok_or(CaptureError::BufferOverflow)?;
-            let source_box = D3D11_BOX {
-                left: blit.src_x,
-                top: blit.src_y,
-                front: 0,
-                right: src_right,
-                bottom: src_bottom,
-                back: 1,
-            };
+                if !used_dirty_copy {
+                    let src_right = blit
+                        .src_x
+                        .checked_add(blit.width)
+                        .ok_or(CaptureError::BufferOverflow)?;
+                    let src_bottom = blit
+                        .src_y
+                        .checked_add(blit.height)
+                        .ok_or(CaptureError::BufferOverflow)?;
+                    let source_box = D3D11_BOX {
+                        left: blit.src_x,
+                        top: blit.src_y,
+                        front: 0,
+                        right: src_right,
+                        bottom: src_bottom,
+                        back: 1,
+                    };
 
-            unsafe {
-                self.context.CopySubresourceRegion(
-                    staging_resource,
-                    0,
-                    0,
-                    0,
-                    0,
-                    source_resource,
-                    0,
-                    Some(&source_box),
-                );
-            }
-        }
+                    unsafe {
+                        self.context.CopySubresourceRegion(
+                            staging_resource,
+                            0,
+                            0,
+                            0,
+                            0,
+                            source_resource,
+                            0,
+                            Some(&source_box),
+                        );
+                    }
+                }
+                Ok(())
+            },
+        )?;
 
         unsafe {
             if let Some(query) = slot.query.as_ref() {
@@ -1551,6 +1600,7 @@ impl OutputCapturer {
                 &slot.dirty_rects,
                 blit.dst_x,
                 blit.dst_y,
+                true,
                 slot.hdr_to_sdr,
                 "failed to map DXGI region staging texture (dirty regions)",
             ) {
@@ -1797,13 +1847,9 @@ impl OutputCapturer {
                     slot.populated = true;
                 }
 
-                let source_resource: ID3D11Resource = effective_source
-                    .cast()
-                    .context("failed to cast region source texture to ID3D11Resource")
-                    .map_err(CaptureError::Platform)?;
                 self.copy_region_source_to_slot(
                     write_slot,
-                    &source_resource,
+                    &effective_source,
                     blit,
                     can_use_dirty_gpu_copy,
                 )?;
@@ -1967,7 +2013,7 @@ impl OutputCapturer {
             } else {
                 let submitted_read_slot = self
                     .staging_ring
-                    .submit_copy(&self.context, &effective_source);
+                    .submit_copy(&self.context, &effective_source)?;
                 if let (Some(slot), Some(prev_desc)) =
                     (submitted_read_slot, self.pending_desc.as_ref())
                 {

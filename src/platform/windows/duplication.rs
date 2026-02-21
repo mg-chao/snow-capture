@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use anyhow::Context;
@@ -47,7 +47,25 @@ const STEADY_STATE_ATTEMPTS: usize = 20;
 const STEADY_STATE_TIMEOUT_MS: u32 = 100;
 const DXGI_DIRTY_COPY_MAX_RECTS: usize = 192;
 const DXGI_DIRTY_COPY_MAX_AREA_PERCENT: u64 = 70;
+const DXGI_DIRTY_GPU_COPY_MAX_RECTS: usize = 64;
+const DXGI_DIRTY_GPU_COPY_MAX_AREA_PERCENT: u64 = 45;
 const DXGI_REGION_STAGING_SLOTS: usize = 3;
+
+#[inline]
+fn env_var_truthy(var_name: &'static str) -> bool {
+    std::env::var(var_name)
+        .map(|raw| {
+            let normalized = raw.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
+        })
+        .unwrap_or(false)
+}
+
+#[inline]
+fn region_dirty_gpu_copy_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_GPU_COPY"))
+}
 
 #[derive(Default)]
 struct RegionStagingSlot {
@@ -61,6 +79,7 @@ struct RegionStagingSlot {
     present_time_qpc: i64,
     is_duplicate: bool,
     dirty_mode_available: bool,
+    dirty_copy_preferred: bool,
     dirty_rects: Vec<DirtyRect>,
     populated: bool,
 }
@@ -73,6 +92,7 @@ impl RegionStagingSlot {
         self.present_time_qpc = 0;
         self.is_duplicate = false;
         self.dirty_mode_available = false;
+        self.dirty_copy_preferred = false;
         self.dirty_rects.clear();
         self.populated = false;
     }
@@ -811,6 +831,30 @@ fn should_use_dirty_copy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
     true
 }
 
+fn should_use_dirty_gpu_copy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
+    if rects.is_empty() || rects.len() > DXGI_DIRTY_GPU_COPY_MAX_RECTS {
+        return false;
+    }
+
+    let total_pixels = (width as u64).saturating_mul(height as u64);
+    if total_pixels == 0 {
+        return false;
+    }
+
+    let mut dirty_pixels = 0u64;
+    for rect in rects {
+        dirty_pixels =
+            dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+        if dirty_pixels.saturating_mul(100)
+            > total_pixels.saturating_mul(DXGI_DIRTY_GPU_COPY_MAX_AREA_PERCENT)
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// Extract cursor shape and position from the DXGI duplication frame.
 /// Returns `None` if cursor data is unavailable or extraction fails.
 fn extract_cursor_data(
@@ -1197,6 +1241,7 @@ impl OutputCapturer {
         slot_idx: usize,
         source_resource: &ID3D11Resource,
         blit: CaptureBlitRegion,
+        can_use_dirty_gpu_copy: bool,
     ) -> CaptureResult<()> {
         let slot = &self.region_slots[slot_idx];
         let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
@@ -1205,34 +1250,81 @@ impl OutputCapturer {
             ))
         })?;
 
-        let src_right = blit
-            .src_x
-            .checked_add(blit.width)
-            .ok_or(CaptureError::BufferOverflow)?;
-        let src_bottom = blit
-            .src_y
-            .checked_add(blit.height)
-            .ok_or(CaptureError::BufferOverflow)?;
-        let source_box = D3D11_BOX {
-            left: blit.src_x,
-            top: blit.src_y,
-            front: 0,
-            right: src_right,
-            bottom: src_bottom,
-            back: 1,
-        };
+        let mut used_dirty_copy = false;
+        if can_use_dirty_gpu_copy && region_dirty_gpu_copy_enabled() && slot.dirty_copy_preferred {
+            for rect in &slot.dirty_rects {
+                let source_left = blit
+                    .src_x
+                    .checked_add(rect.x)
+                    .ok_or(CaptureError::BufferOverflow)?;
+                let source_top = blit
+                    .src_y
+                    .checked_add(rect.y)
+                    .ok_or(CaptureError::BufferOverflow)?;
+                let source_right = source_left
+                    .checked_add(rect.width)
+                    .ok_or(CaptureError::BufferOverflow)?;
+                let source_bottom = source_top
+                    .checked_add(rect.height)
+                    .ok_or(CaptureError::BufferOverflow)?;
+                let source_box = D3D11_BOX {
+                    left: source_left,
+                    top: source_top,
+                    front: 0,
+                    right: source_right,
+                    bottom: source_bottom,
+                    back: 1,
+                };
+
+                unsafe {
+                    self.context.CopySubresourceRegion(
+                        staging_resource,
+                        0,
+                        rect.x,
+                        rect.y,
+                        0,
+                        source_resource,
+                        0,
+                        Some(&source_box),
+                    );
+                }
+            }
+            used_dirty_copy = true;
+        }
+
+        if !used_dirty_copy {
+            let src_right = blit
+                .src_x
+                .checked_add(blit.width)
+                .ok_or(CaptureError::BufferOverflow)?;
+            let src_bottom = blit
+                .src_y
+                .checked_add(blit.height)
+                .ok_or(CaptureError::BufferOverflow)?;
+            let source_box = D3D11_BOX {
+                left: blit.src_x,
+                top: blit.src_y,
+                front: 0,
+                right: src_right,
+                bottom: src_bottom,
+                back: 1,
+            };
+
+            unsafe {
+                self.context.CopySubresourceRegion(
+                    staging_resource,
+                    0,
+                    0,
+                    0,
+                    0,
+                    source_resource,
+                    0,
+                    Some(&source_box),
+                );
+            }
+        }
 
         unsafe {
-            self.context.CopySubresourceRegion(
-                staging_resource,
-                0,
-                0,
-                0,
-                0,
-                source_resource,
-                0,
-                Some(&source_box),
-            );
             if let Some(query) = slot.query.as_ref() {
                 self.context.End(query);
             }
@@ -1296,7 +1388,8 @@ impl OutputCapturer {
         let use_dirty_copy = destination_has_history
             && slot.dirty_mode_available
             && !slot.dirty_rects.is_empty()
-            && should_use_dirty_copy(&slot.dirty_rects, source_desc.Width, source_desc.Height);
+            && (slot.dirty_copy_preferred
+                || should_use_dirty_copy(&slot.dirty_rects, source_desc.Width, source_desc.Height));
 
         if use_dirty_copy {
             match surface::map_staging_dirty_rects_to_frame_with_offset(
@@ -1497,11 +1590,17 @@ impl OutputCapturer {
                 slot.hdr_to_sdr = effective_hdr;
                 slot.source_desc = Some(region_desc);
                 slot.dirty_mode_available = region_dirty_available;
+                slot.dirty_copy_preferred = false;
                 slot.dirty_rects.clear();
                 slot.populated = true;
                 slot_idx
             } else {
                 self.ensure_region_slot(write_slot, &region_desc)?;
+                // Dirty GPU copy needs the slot to already hold the previous frame.
+                // The recording pipeline rotates slots, so only the single-slot
+                // screenshot path can safely preserve unchanged pixels this way.
+                let can_use_dirty_gpu_copy =
+                    destination_has_history && self.capture_mode != CaptureMode::ScreenRecording;
                 {
                     let slot = &mut self.region_slots[write_slot];
                     slot.capture_time = Some(capture_time);
@@ -1512,6 +1611,13 @@ impl OutputCapturer {
                     slot.dirty_mode_available = region_dirty_available;
                     slot.dirty_rects.clear();
                     slot.dirty_rects.extend_from_slice(&region_dirty_rects);
+                    slot.dirty_copy_preferred = can_use_dirty_gpu_copy
+                        && region_dirty_available
+                        && should_use_dirty_gpu_copy(
+                            &slot.dirty_rects,
+                            region_desc.Width,
+                            region_desc.Height,
+                        );
                     slot.populated = true;
                 }
 
@@ -1519,7 +1625,12 @@ impl OutputCapturer {
                     .cast()
                     .context("failed to cast region source texture to ID3D11Resource")
                     .map_err(CaptureError::Platform)?;
-                self.copy_region_source_to_slot(write_slot, &source_resource, blit)?;
+                self.copy_region_source_to_slot(
+                    write_slot,
+                    &source_resource,
+                    blit,
+                    can_use_dirty_gpu_copy,
+                )?;
                 self.maybe_flush_region_after_submit(write_slot, read_slot);
                 read_slot
             };
@@ -2094,6 +2205,50 @@ mod tests {
             DXGI_DIRTY_COPY_MAX_RECTS + 1
         ];
         assert!(!should_use_dirty_copy(&rects, 1920, 1080));
+    }
+
+    #[test]
+    fn dirty_gpu_copy_heuristic_accepts_sparse_updates() {
+        let rects = vec![
+            DirtyRect {
+                x: 64,
+                y: 64,
+                width: 128,
+                height: 96,
+            },
+            DirtyRect {
+                x: 640,
+                y: 400,
+                width: 96,
+                height: 72,
+            },
+        ];
+        assert!(should_use_dirty_gpu_copy(&rects, 1920, 1080));
+    }
+
+    #[test]
+    fn dirty_gpu_copy_heuristic_rejects_wide_damage() {
+        let rects = vec![DirtyRect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1000,
+        }];
+        assert!(!should_use_dirty_gpu_copy(&rects, 1920, 1080));
+    }
+
+    #[test]
+    fn dirty_gpu_copy_heuristic_rejects_excessive_rect_count() {
+        let rects = vec![
+            DirtyRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            };
+            DXGI_DIRTY_GPU_COPY_MAX_RECTS + 1
+        ];
+        assert!(!should_use_dirty_gpu_copy(&rects, 1920, 1080));
     }
 
     #[test]

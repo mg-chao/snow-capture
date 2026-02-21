@@ -634,6 +634,8 @@ struct StagingRing {
     /// `INITIAL_SPIN_POLLS` and adjusts based on whether the GPU copy
     /// completes within the spin window.
     adaptive_spin_polls: u32,
+    /// Number of staging slots currently allocated for the active mode.
+    allocated_slots: usize,
 }
 
 impl StagingRing {
@@ -659,6 +661,7 @@ impl StagingRing {
             read_idx: None,
             cached_desc: None,
             adaptive_spin_polls: Self::INITIAL_SPIN_POLLS,
+            allocated_slots: 0,
         }
     }
 
@@ -670,6 +673,7 @@ impl StagingRing {
         self.read_idx = None;
         self.cached_desc = None;
         self.adaptive_spin_polls = Self::INITIAL_SPIN_POLLS;
+        self.allocated_slots = 0;
     }
 
     fn reset_pipeline(&mut self) {
@@ -679,19 +683,21 @@ impl StagingRing {
         self.adaptive_spin_polls = Self::INITIAL_SPIN_POLLS;
     }
 
-    /// Ensure both staging slots match the given texture description.
+    /// Ensure the active staging slots match the given texture description.
     /// Skips the per-slot `GetDesc()` COM call when the cached
     /// (width, height, format) triple already matches.
     fn ensure_slots(
         &mut self,
         device: &ID3D11Device,
         desc: &D3D11_TEXTURE2D_DESC,
+        requested_slots: usize,
     ) -> CaptureResult<()> {
+        let target_slots = requested_slots.clamp(1, STAGING_SLOTS);
         let key = (desc.Width, desc.Height, desc.Format);
-        let needs_recreate = self.cached_desc != Some(key);
+        let desc_changed = self.cached_desc != Some(key);
 
-        if needs_recreate {
-            for i in 0..STAGING_SLOTS {
+        if desc_changed || self.allocated_slots < target_slots {
+            for i in 0..target_slots {
                 surface::ensure_staging_texture(
                     device,
                     &mut self.slots[i],
@@ -704,10 +710,18 @@ impl StagingRing {
                     .as_ref()
                     .map(|tex| tex.cast::<ID3D11Resource>().unwrap());
             }
-            self.cached_desc = Some(key);
         }
-        // Create event queries for async readback
-        for i in 0..STAGING_SLOTS {
+
+        if desc_changed || self.allocated_slots > target_slots {
+            for i in target_slots..STAGING_SLOTS {
+                self.slots[i] = None;
+                self.slot_resources[i] = None;
+                self.queries[i] = None;
+            }
+        }
+
+        // Create event queries for active slots only.
+        for i in 0..target_slots {
             if self.queries[i].is_none() {
                 let query_desc = D3D11_QUERY_DESC {
                     Query: D3D11_QUERY_EVENT,
@@ -720,6 +734,9 @@ impl StagingRing {
                 self.queries[i] = query;
             }
         }
+
+        self.cached_desc = Some(key);
+        self.allocated_slots = target_slots;
         Ok(())
     }
 
@@ -2147,9 +2164,9 @@ impl OutputCapturer {
             self.effective_source(&desktop_texture, src_desc)?;
 
         // Ensure staging ring has matching textures.
-        self.staging_ring
-            .ensure_slots(&self.device, &effective_desc)?;
         if self.capture_mode == CaptureMode::ScreenRecording {
+            self.staging_ring
+                .ensure_slots(&self.device, &effective_desc, STAGING_SLOTS)?;
             let frame_pixels_unchanged = frame.metadata.is_duplicate || source_unchanged;
             let pending_slot_compatible = self.pending_desc.as_ref().is_some_and(|desc| {
                 desc.Width == effective_desc.Width
@@ -2242,6 +2259,8 @@ impl OutputCapturer {
             }
         } else {
             // Screenshot mode avoids recording-only buffering.
+            self.staging_ring
+                .ensure_slots(&self.device, &effective_desc, 1)?;
             self.pending_desc = None;
             self.pending_hdr = None;
             self.pending_is_duplicate = false;

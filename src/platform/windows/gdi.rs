@@ -224,9 +224,30 @@ fn gdi_row_compare_bidirectional_enabled() -> bool {
     })
 }
 
+#[inline]
+fn gdi_incremental_too_dirty_probe_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_DISABLE_GDI_TOO_DIRTY_PROBE")
+            .map(|raw| {
+                let normalized = raw.trim().to_ascii_lowercase();
+                !(normalized == "1"
+                    || normalized == "true"
+                    || normalized == "yes"
+                    || normalized == "on")
+            })
+            .unwrap_or(true)
+    })
+}
+
 const GDI_INCREMENTAL_MIN_PIXELS: usize = 160_000;
 const GDI_INCREMENTAL_MAX_DIRTY_ROW_NUMERATOR: usize = 3;
 const GDI_INCREMENTAL_MAX_DIRTY_ROW_DENOMINATOR: usize = 4;
+const GDI_INCREMENTAL_TOO_DIRTY_PROBE_MIN_PIXELS: usize = 786_432;
+const GDI_INCREMENTAL_TOO_DIRTY_PROBE_MAX_ROWS: usize = 24;
+const GDI_INCREMENTAL_TOO_DIRTY_PROBE_DIRTY_NUMERATOR: usize = 4;
+const GDI_INCREMENTAL_TOO_DIRTY_PROBE_DIRTY_DENOMINATOR: usize = 5;
 
 #[derive(Clone, Copy, Debug)]
 struct DirtyRowRun {
@@ -248,6 +269,63 @@ enum IncrementalConvertStatus {
 }
 
 type RowCompareKernel = unsafe fn(*const u8, *const u8, usize) -> bool;
+
+#[inline(always)]
+fn incremental_too_dirty_probe_eligible(pixel_count: usize, height: usize) -> bool {
+    gdi_incremental_too_dirty_probe_enabled()
+        && pixel_count >= GDI_INCREMENTAL_TOO_DIRTY_PROBE_MIN_PIXELS
+        && height > 1
+}
+
+unsafe fn incremental_too_dirty_probe(
+    src_base: *const u8,
+    src_stride: usize,
+    history_base: *const u8,
+    history_stride: usize,
+    row_bytes: usize,
+    height: usize,
+    compare_row: RowCompareKernel,
+) -> bool {
+    if height == 0 || row_bytes == 0 {
+        return false;
+    }
+
+    let sample_rows = height.clamp(1, GDI_INCREMENTAL_TOO_DIRTY_PROBE_MAX_ROWS);
+    let dirty_threshold_lhs =
+        sample_rows.saturating_mul(GDI_INCREMENTAL_TOO_DIRTY_PROBE_DIRTY_NUMERATOR);
+
+    let mut dirty_samples = 0usize;
+    for sample_idx in 0..sample_rows {
+        // Evenly sample rows across the surface instead of scanning from
+        // the top only, so localised animations do not trigger false
+        // "too dirty" classifications.
+        let row = sample_idx
+            .checked_mul(height)
+            .map(|value| value / sample_rows)
+            .unwrap_or(height - 1)
+            .min(height - 1);
+        let Some(src_offset) = row.checked_mul(src_stride) else {
+            return true;
+        };
+        let Some(history_offset) = row.checked_mul(history_stride) else {
+            return true;
+        };
+
+        let src_row = unsafe { src_base.add(src_offset) };
+        let history_row = unsafe { history_base.add(history_offset) };
+        let changed = unsafe { !compare_row(src_row, history_row, row_bytes) };
+        if changed {
+            dirty_samples = dirty_samples.saturating_add(1);
+            let dirty_lhs =
+                dirty_samples.saturating_mul(GDI_INCREMENTAL_TOO_DIRTY_PROBE_DIRTY_DENOMINATOR);
+            if dirty_lhs > dirty_threshold_lhs {
+                return true;
+            }
+        }
+    }
+
+    false
+}
 
 #[inline(always)]
 fn row_compare_kernel() -> RowCompareKernel {
@@ -561,6 +639,7 @@ struct GdiResources {
     width: i32,
     height: i32,
     stride: usize,
+    incremental_too_dirty_hint: bool,
     bgra_history: Vec<u8>,
     dirty_row_runs: Vec<DirtyRowRun>,
 }
@@ -598,6 +677,7 @@ impl GdiResources {
             width: 0,
             height: 0,
             stride: 0,
+            incremental_too_dirty_hint: false,
             bgra_history: Vec::new(),
             dirty_row_runs: Vec::new(),
         })
@@ -799,6 +879,7 @@ impl GdiResources {
             .ok()
             .and_then(|w| w.checked_mul(4))
             .ok_or(CaptureError::BufferOverflow)?;
+        self.incremental_too_dirty_hint = false;
         Ok(())
     }
 
@@ -846,6 +927,27 @@ impl GdiResources {
         let max_dirty_rows = height.saturating_mul(GDI_INCREMENTAL_MAX_DIRTY_ROW_NUMERATOR)
             / GDI_INCREMENTAL_MAX_DIRTY_ROW_DENOMINATOR;
         let compare_row = row_compare_kernel();
+        let pixel_count = row_bytes
+            .checked_div(4)
+            .and_then(|width| width.checked_mul(height))
+            .ok_or(CaptureError::BufferOverflow)?;
+        if incremental_too_dirty_probe_eligible(pixel_count, height)
+            && self.incremental_too_dirty_hint
+            && unsafe {
+                incremental_too_dirty_probe(
+                    self.bits.cast_const(),
+                    self.stride,
+                    history_base.cast_const(),
+                    history_stride,
+                    row_bytes,
+                    height,
+                    compare_row,
+                )
+            }
+        {
+            self.dirty_row_runs.clear();
+            return Ok(None);
+        }
         self.dirty_row_runs.clear();
 
         let mut dirty_rows = 0usize;
@@ -1053,6 +1155,7 @@ impl GdiResources {
         };
         let incremental_enabled = track_incremental_history && destination_has_history;
         let use_surface_history = track_incremental_history && gdi_swap_history_surfaces_enabled();
+        let mut next_too_dirty_hint = false;
         if incremental_enabled {
             let incremental_status = if use_surface_history {
                 self.try_convert_incremental_rows_with_surface_history_into(
@@ -1072,16 +1175,21 @@ impl GdiResources {
 
             match incremental_status {
                 IncrementalConvertStatus::Duplicate => {
+                    self.incremental_too_dirty_hint = false;
                     frame.metadata.is_duplicate = true;
                     return Ok(frame);
                 }
                 IncrementalConvertStatus::Updated(_) => {
+                    self.incremental_too_dirty_hint = false;
                     if use_surface_history && let Some(total_bytes) = total_bytes {
                         self.commit_incremental_history(total_bytes)?;
                     }
                     return Ok(frame);
                 }
-                IncrementalConvertStatus::NotAvailable | IncrementalConvertStatus::TooDirty => {}
+                IncrementalConvertStatus::NotAvailable => {}
+                IncrementalConvertStatus::TooDirty => {
+                    next_too_dirty_hint = true;
+                }
             }
         }
 
@@ -1105,6 +1213,7 @@ impl GdiResources {
         if let Some(total_bytes) = total_bytes {
             self.commit_incremental_history(total_bytes)?;
         }
+        self.incremental_too_dirty_hint = next_too_dirty_hint;
 
         Ok(frame)
     }
@@ -1236,6 +1345,7 @@ impl GdiResources {
         };
         let incremental_enabled = track_incremental_history && destination_has_history;
         let use_surface_history = track_incremental_history && gdi_swap_history_surfaces_enabled();
+        let mut next_too_dirty_hint = false;
         if incremental_enabled {
             let incremental_status = if use_surface_history {
                 self.try_convert_incremental_rows_with_surface_history_into(
@@ -1248,14 +1358,21 @@ impl GdiResources {
             }?;
 
             match incremental_status {
-                IncrementalConvertStatus::Duplicate => return Ok(true),
+                IncrementalConvertStatus::Duplicate => {
+                    self.incremental_too_dirty_hint = false;
+                    return Ok(true);
+                }
                 IncrementalConvertStatus::Updated(_) => {
+                    self.incremental_too_dirty_hint = false;
                     if use_surface_history && let Some(total_bytes) = total_bytes {
                         self.commit_incremental_history(total_bytes)?;
                     }
                     return Ok(false);
                 }
-                IncrementalConvertStatus::NotAvailable | IncrementalConvertStatus::TooDirty => {}
+                IncrementalConvertStatus::NotAvailable => {}
+                IncrementalConvertStatus::TooDirty => {
+                    next_too_dirty_hint = true;
+                }
             }
         }
 
@@ -1298,6 +1415,7 @@ impl GdiResources {
         if let Some(total_bytes) = total_bytes {
             self.commit_incremental_history(total_bytes)?;
         }
+        self.incremental_too_dirty_hint = next_too_dirty_hint;
 
         Ok(false)
     }
@@ -1469,6 +1587,7 @@ impl GdiResources {
         self.width = 0;
         self.height = 0;
         self.stride = 0;
+        self.incremental_too_dirty_hint = false;
         self.bgra_history.clear();
         self.dirty_row_runs.clear();
     }
@@ -1925,6 +2044,110 @@ mod tests {
         let scalar_diff = unsafe { row_equal_scalar(lhs.as_ptr(), rhs.as_ptr(), lhs.len()) };
         let kernel_diff = unsafe { kernel(lhs.as_ptr(), rhs.as_ptr(), lhs.len()) };
         assert_eq!(kernel_diff, scalar_diff);
+    }
+
+    #[test]
+    fn too_dirty_probe_detects_highly_dynamic_surface() {
+        let width = 64usize;
+        let height = 96usize;
+        let row_bytes = width * 4;
+        let mut current = vec![0u8; row_bytes * height];
+        let history = current.clone();
+
+        for (idx, byte) in current.iter_mut().enumerate() {
+            *byte = (idx as u8).wrapping_add(19);
+        }
+
+        assert!(unsafe {
+            incremental_too_dirty_probe(
+                current.as_ptr(),
+                row_bytes,
+                history.as_ptr(),
+                row_bytes,
+                row_bytes,
+                height,
+                row_equal_scalar,
+            )
+        });
+    }
+
+    #[test]
+    fn too_dirty_probe_ignores_sparse_row_updates() {
+        let width = 96usize;
+        let height = 120usize;
+        let row_bytes = width * 4;
+        let mut current = vec![0u8; row_bytes * height];
+        for (idx, value) in current.iter_mut().enumerate() {
+            *value = (idx as u8).wrapping_mul(5).wrapping_add(3);
+        }
+        let mut history = current.clone();
+
+        let sparse_rows = [4usize, 19, 37, 74, 101];
+        for &row in &sparse_rows {
+            let start = row * row_bytes;
+            let end = start + row_bytes;
+            for byte in &mut history[start..end] {
+                *byte ^= 0x5A;
+            }
+        }
+
+        assert!(!unsafe {
+            incremental_too_dirty_probe(
+                current.as_ptr(),
+                row_bytes,
+                history.as_ptr(),
+                row_bytes,
+                row_bytes,
+                height,
+                row_equal_scalar,
+            )
+        });
+    }
+
+    #[test]
+    fn too_dirty_probe_respects_threshold_boundary() {
+        let width = 48usize;
+        let height = 24usize;
+        let row_bytes = width * 4;
+        let mut current = vec![0u8; row_bytes * height];
+        let mut history = vec![0u8; row_bytes * height];
+
+        for row in 0..19usize {
+            let start = row * row_bytes;
+            let end = start + row_bytes;
+            for byte in &mut current[start..end] {
+                *byte = 0x33;
+            }
+        }
+        assert!(!unsafe {
+            incremental_too_dirty_probe(
+                current.as_ptr(),
+                row_bytes,
+                history.as_ptr(),
+                row_bytes,
+                row_bytes,
+                height,
+                row_equal_scalar,
+            )
+        });
+
+        let row = 19usize;
+        let start = row * row_bytes;
+        let end = start + row_bytes;
+        for byte in &mut history[start..end] {
+            *byte = 0x77;
+        }
+        assert!(unsafe {
+            incremental_too_dirty_probe(
+                current.as_ptr(),
+                row_bytes,
+                history.as_ptr(),
+                row_bytes,
+                row_bytes,
+                height,
+                row_equal_scalar,
+            )
+        });
     }
 
     #[cfg(target_arch = "x86_64")]

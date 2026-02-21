@@ -10,7 +10,7 @@ use windows::Graphics::Capture::{
 };
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
-use windows::Graphics::SizeInt32;
+use windows::Graphics::{RectInt32, SizeInt32};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BOX, D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_TEXTURE2D_DESC, ID3D11Device,
@@ -55,6 +55,7 @@ const WGC_DIRTY_GPU_COPY_MAX_RECTS: usize = 64;
 const WGC_DIRTY_GPU_COPY_MAX_AREA_PERCENT: u64 = 45;
 const WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS: usize = 8;
 const WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT: u64 = 18;
+const WGC_DIRTY_REGION_FETCH_BATCH: usize = 64;
 const WGC_STALE_POLL_SPIN_MIN: u32 = 16;
 const WGC_STALE_POLL_SPIN_MAX: u32 = 256;
 const WGC_STALE_POLL_SPIN_INITIAL: u32 = 64;
@@ -134,6 +135,12 @@ fn region_full_slot_map_fastpath_enabled() -> bool {
 fn dirty_rect_conversion_hints_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_DIRTY_HINTS"))
+}
+
+#[inline]
+fn dirty_region_batch_fetch_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_DIRTY_REGION_BATCH_FETCH"))
 }
 
 #[inline]
@@ -243,6 +250,81 @@ fn dirty_region_mode_supported(mode: GraphicsCaptureDirtyRegionMode) -> bool {
         || mode == GraphicsCaptureDirtyRegionMode::ReportAndRender
 }
 
+#[inline(always)]
+fn clamp_dirty_region_rect(raw: RectInt32, width: u32, height: u32) -> Option<DirtyRect> {
+    if raw.Width <= 0 || raw.Height <= 0 {
+        return None;
+    }
+
+    let x = raw.X.max(0) as u32;
+    let y = raw.Y.max(0) as u32;
+    if x >= width || y >= height {
+        return None;
+    }
+
+    let rect_width = raw.Width as u32;
+    let rect_height = raw.Height as u32;
+    let clamped_w = rect_width.min(width - x);
+    let clamped_h = rect_height.min(height - y);
+    if clamped_w == 0 || clamped_h == 0 {
+        return None;
+    }
+
+    Some(DirtyRect {
+        x,
+        y,
+        width: clamped_w,
+        height: clamped_h,
+    })
+}
+
+fn for_each_dirty_region(
+    frame: &Direct3D11CaptureFrame,
+    mut visit: impl FnMut(RectInt32),
+) -> Option<GraphicsCaptureDirtyRegionMode> {
+    let mode = frame.DirtyRegionMode().ok()?;
+    if !dirty_region_mode_supported(mode) {
+        return None;
+    }
+    let regions = frame.DirtyRegions().ok()?;
+    let count = regions.Size().ok()?;
+    if count == 0 {
+        return Some(mode);
+    }
+
+    let mut start_idx = 0u32;
+    if dirty_region_batch_fetch_enabled() {
+        let mut batch = [RectInt32::default(); WGC_DIRTY_REGION_FETCH_BATCH];
+        while start_idx < count {
+            let remaining = usize::try_from(count - start_idx).ok()?;
+            let batch_len = remaining.min(batch.len());
+            let fetched = match regions.GetMany(start_idx, &mut batch[..batch_len]) {
+                Ok(value) => value,
+                Err(_) => break,
+            };
+            let fetched_len = usize::try_from(fetched).ok()?.min(batch_len);
+            if fetched_len == 0 {
+                break;
+            }
+
+            for raw in &batch[..fetched_len] {
+                visit(*raw);
+            }
+            start_idx = start_idx.saturating_add(u32::try_from(fetched_len).ok()?);
+        }
+    }
+
+    if start_idx < count {
+        for idx in start_idx..count {
+            if let Ok(raw) = regions.GetAt(idx) {
+                visit(raw);
+            }
+        }
+    }
+
+    Some(mode)
+}
+
 fn extract_dirty_rects(
     frame: &Direct3D11CaptureFrame,
     width: u32,
@@ -250,40 +332,11 @@ fn extract_dirty_rects(
     out: &mut Vec<DirtyRect>,
 ) -> Option<GraphicsCaptureDirtyRegionMode> {
     out.clear();
-    let mode = frame.DirtyRegionMode().ok()?;
-    if !dirty_region_mode_supported(mode) {
-        return None;
-    }
-    let regions = frame.DirtyRegions().ok()?;
-    let count = regions.Size().ok()?;
-
-    for idx in 0..count {
-        let Ok(rect) = regions.GetAt(idx) else {
-            continue;
-        };
-
-        if rect.Width <= 0 || rect.Height <= 0 {
-            continue;
-        }
-
-        let x = rect.X.max(0) as u32;
-        let y = rect.Y.max(0) as u32;
-        let rect_width = rect.Width as u32;
-        let rect_height = rect.Height as u32;
-
-        if let Some(clamped) = clamp_dirty_rect(
-            DirtyRect {
-                x,
-                y,
-                width: rect_width,
-                height: rect_height,
-            },
-            width,
-            height,
-        ) {
+    let mode = for_each_dirty_region(frame, |raw| {
+        if let Some(clamped) = clamp_dirty_region_rect(raw, width, height) {
             out.push(clamped);
         }
-    }
+    })?;
 
     normalize_dirty_rects_in_place(out, width, height);
     Some(mode)
@@ -595,19 +648,6 @@ fn extract_region_dirty_rects(
     out: &mut Vec<DirtyRect>,
 ) -> bool {
     out.clear();
-    let Some(mode) = frame.DirtyRegionMode().ok() else {
-        return false;
-    };
-    if !dirty_region_mode_supported(mode) {
-        return false;
-    }
-    let Some(regions) = frame.DirtyRegions().ok() else {
-        return false;
-    };
-    let Some(count) = regions.Size().ok() else {
-        return false;
-    };
-
     let Some(region_bounds) = clamp_dirty_rect(
         DirtyRect {
             x: blit.src_x,
@@ -620,35 +660,13 @@ fn extract_region_dirty_rects(
     ) else {
         return false;
     };
-
-    for idx in 0..count {
-        let Ok(rect) = regions.GetAt(idx) else {
-            continue;
-        };
-
-        if rect.Width <= 0 || rect.Height <= 0 {
-            continue;
-        }
-
-        let x = rect.X.max(0) as u32;
-        let y = rect.Y.max(0) as u32;
-        let rect_width = rect.Width as u32;
-        let rect_height = rect.Height as u32;
-        let Some(clamped) = clamp_dirty_rect(
-            DirtyRect {
-                x,
-                y,
-                width: rect_width,
-                height: rect_height,
-            },
-            source_width,
-            source_height,
-        ) else {
-            continue;
+    if for_each_dirty_region(frame, |raw| {
+        let Some(clamped) = clamp_dirty_region_rect(raw, source_width, source_height) else {
+            return;
         };
 
         let Some(intersection) = intersect_dirty_rects(clamped, region_bounds) else {
-            continue;
+            return;
         };
         out.push(DirtyRect {
             x: intersection.x.saturating_sub(region_bounds.x),
@@ -656,6 +674,10 @@ fn extract_region_dirty_rects(
             width: intersection.width,
             height: intersection.height,
         });
+    })
+    .is_none()
+    {
+        return false;
     }
 
     normalize_dirty_rects_in_place(out, region_bounds.width, region_bounds.height);
@@ -3551,6 +3573,87 @@ mod tests {
         ));
     }
 
+    fn clamp_dirty_region_rect_legacy(
+        raw: RectInt32,
+        width: u32,
+        height: u32,
+    ) -> Option<DirtyRect> {
+        if raw.Width <= 0 || raw.Height <= 0 {
+            return None;
+        }
+        let x = raw.X.max(0) as u32;
+        let y = raw.Y.max(0) as u32;
+        let rect_width = raw.Width as u32;
+        let rect_height = raw.Height as u32;
+        clamp_dirty_rect(
+            DirtyRect {
+                x,
+                y,
+                width: rect_width,
+                height: rect_height,
+            },
+            width,
+            height,
+        )
+    }
+
+    fn normalize_raw_dirty_rects_legacy(
+        raw_rects: &[RectInt32],
+        width: u32,
+        height: u32,
+        out: &mut Vec<DirtyRect>,
+    ) {
+        out.clear();
+        out.reserve(raw_rects.len());
+        for raw in raw_rects {
+            if let Some(clamped) = clamp_dirty_region_rect_legacy(*raw, width, height) {
+                out.push(clamped);
+            }
+        }
+        normalize_dirty_rects_in_place(out, width, height);
+    }
+
+    fn normalize_raw_dirty_rects_optimized(
+        raw_rects: &[RectInt32],
+        width: u32,
+        height: u32,
+        out: &mut Vec<DirtyRect>,
+    ) {
+        out.clear();
+        out.reserve(raw_rects.len());
+        for raw in raw_rects {
+            if let Some(clamped) = clamp_dirty_region_rect(*raw, width, height) {
+                out.push(clamped);
+            }
+        }
+        normalize_dirty_rects_in_place(out, width, height);
+    }
+
+    #[test]
+    fn dirty_region_rect_clamp_matches_legacy_logic() {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        for _ in 0..1024 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let x = (((state >> 8) as i32) % 2800) - 400;
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let y = (((state >> 16) as i32) % 1700) - 300;
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let width = (((state >> 24) as i32) % 1400) - 40;
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let height = (((state >> 32) as i32) % 900) - 30;
+
+            let raw = RectInt32 {
+                X: x,
+                Y: y,
+                Width: width,
+                Height: height,
+            };
+            let legacy = clamp_dirty_region_rect_legacy(raw, 1920, 1080);
+            let optimized = clamp_dirty_region_rect(raw, 1920, 1080);
+            assert_eq!(optimized, legacy);
+        }
+    }
+
     fn should_use_dirty_copy_legacy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
         if rects.is_empty() || rects.len() > WGC_DIRTY_COPY_MAX_RECTS {
             return false;
@@ -3613,6 +3716,124 @@ mod tests {
             }
         }
         true
+    }
+
+    fn row_major_raw_rects(
+        start_x: i32,
+        start_y: i32,
+        cols: i32,
+        rows: i32,
+        rect_w: i32,
+        rect_h: i32,
+        gap_x: i32,
+        gap_y: i32,
+        limit: usize,
+    ) -> Vec<RectInt32> {
+        let mut out = Vec::with_capacity(limit);
+        for row in 0..rows {
+            for col in 0..cols {
+                if out.len() == limit {
+                    return out;
+                }
+                out.push(RectInt32 {
+                    X: start_x + col * (rect_w + gap_x),
+                    Y: start_y + row * (rect_h + gap_y),
+                    Width: rect_w,
+                    Height: rect_h,
+                });
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "performance benchmark guard; run explicitly with --ignored --nocapture"]
+    fn bench_dirty_region_rect_clamp_and_normalize_vs_legacy() {
+        use std::hint::black_box;
+
+        let mut random_workload = Vec::with_capacity(220);
+        let mut state = 0xfeed_f00d_cafe_babe_u64;
+        for _ in 0..220 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let x = (((state >> 5) as i32) % 2600) - 280;
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let y = (((state >> 15) as i32) % 1500) - 220;
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let width = (((state >> 23) as i32) % 420) - 24;
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let height = (((state >> 31) as i32) % 260) - 16;
+            random_workload.push(RectInt32 {
+                X: x,
+                Y: y,
+                Width: width,
+                Height: height,
+            });
+        }
+
+        let workloads = vec![
+            row_major_raw_rects(12, 12, 12, 4, 20, 18, 10, 10, 48),
+            row_major_raw_rects(4, 4, 22, 9, 8, 7, 5, 4, 180),
+            random_workload,
+        ];
+
+        let mut legacy = Vec::<DirtyRect>::new();
+        let mut optimized = Vec::<DirtyRect>::new();
+        for rects in &workloads {
+            normalize_raw_dirty_rects_legacy(rects, 1920, 1080, &mut legacy);
+            normalize_raw_dirty_rects_optimized(rects, 1920, 1080, &mut optimized);
+            assert_eq!(optimized, legacy);
+        }
+
+        let warmup_iters = 8_000usize;
+        let measure_iters = 60_000usize;
+        let mut sink = 0usize;
+
+        for iter in 0..warmup_iters {
+            let rects = black_box(&workloads[iter % workloads.len()]);
+            normalize_raw_dirty_rects_legacy(rects, 1920, 1080, &mut legacy);
+            sink ^= legacy.len();
+            normalize_raw_dirty_rects_optimized(rects, 1920, 1080, &mut optimized);
+            sink ^= optimized.len() << 1;
+        }
+
+        let legacy_start = std::time::Instant::now();
+        for iter in 0..measure_iters {
+            let rects = black_box(&workloads[iter % workloads.len()]);
+            normalize_raw_dirty_rects_legacy(rects, 1920, 1080, &mut legacy);
+            sink ^= legacy.len();
+            sink ^= legacy.first().map(|rect| rect.width as usize).unwrap_or(0);
+        }
+        let legacy_elapsed = legacy_start.elapsed();
+
+        let optimized_start = std::time::Instant::now();
+        for iter in 0..measure_iters {
+            let rects = black_box(&workloads[iter % workloads.len()]);
+            normalize_raw_dirty_rects_optimized(rects, 1920, 1080, &mut optimized);
+            sink ^= optimized.len() << 1;
+            sink ^= optimized
+                .first()
+                .map(|rect| rect.height as usize)
+                .unwrap_or(0);
+        }
+        let optimized_elapsed = optimized_start.elapsed();
+
+        black_box(sink);
+
+        let legacy_ms = legacy_elapsed.as_secs_f64() * 1000.0;
+        let optimized_ms = optimized_elapsed.as_secs_f64() * 1000.0;
+        let speedup = if optimized_ms > 0.0 {
+            legacy_ms / optimized_ms
+        } else {
+            f64::INFINITY
+        };
+        println!(
+            "wgc dirty-rect clamp benchmark: legacy={legacy_ms:.3} ms optimized={optimized_ms:.3} ms speedup={speedup:.2}x"
+        );
+
+        assert!(
+            optimized_ms <= legacy_ms * 1.05,
+            "dirty-rect clamp/normalize regressed: legacy={legacy_ms:.3}ms optimized={optimized_ms:.3}ms ({speedup:.2}x)"
+        );
     }
 
     #[test]

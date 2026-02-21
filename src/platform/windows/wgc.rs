@@ -400,16 +400,6 @@ fn normalize_dirty_rects_legacy_after_clamp(rects: &mut Vec<DirtyRect>) {
     rects.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
 }
 
-#[inline(always)]
-unsafe fn remove_dirty_rect_at_unchecked(rects: &mut Vec<DirtyRect>, idx: usize) {
-    let len = rects.len();
-    let ptr = rects.as_mut_ptr();
-    unsafe {
-        std::ptr::copy(ptr.add(idx + 1), ptr.add(idx), len - idx - 1);
-        rects.set_len(len - 1);
-    }
-}
-
 fn should_use_legacy_dense_merge(rects: &[DirtyRect]) -> bool {
     if rects.len() < WGC_DIRTY_RECT_DENSE_MERGE_LEGACY_MIN_RECTS {
         return false;
@@ -471,8 +461,7 @@ fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height
 
                 if dirty_rects_can_merge(candidate, existing) {
                     candidate = merge_dirty_rects(candidate, existing);
-                    // SAFETY: `idx` is bounded by the loop condition (`idx < rects.len()`).
-                    unsafe { remove_dirty_rect_at_unchecked(rects, idx) };
+                    rects.remove(idx);
                     merged_any = true;
                 } else {
                     idx += 1;

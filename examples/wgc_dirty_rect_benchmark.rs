@@ -8,7 +8,7 @@ const BENCH_WIDTH: u32 = 1920;
 const BENCH_HEIGHT: u32 = 1080;
 const DEFAULT_ROUNDS: usize = 8;
 const DEFAULT_ITERATIONS: usize = 15_000;
-const DEFAULT_MAX_REGRESSION_PCT: f64 = 5.0;
+const DEFAULT_MAX_REGRESSION_PCT: f64 = 3.0;
 const DENSE_MERGE_LEGACY_MIN_RECTS: usize = 64;
 const DENSE_MERGE_LEGACY_MAX_VERTICAL_SPAN: u32 = 96;
 
@@ -486,7 +486,7 @@ fn parse_args() -> Result<(usize, usize, f64)> {
                     "Usage: cargo run --release --example wgc_dirty_rect_benchmark -- [options]
   --rounds <n>               Benchmark rounds per workload (default: {DEFAULT_ROUNDS})
   --iterations <n>           Iterations per workload per round (default: {DEFAULT_ITERATIONS})
-  --max-regression-pct <f>   Allowed optimized-v2 slowdown vs optimized-v1 before failing (default: {DEFAULT_MAX_REGRESSION_PCT})"
+  --max-regression-pct <f>   Allowed safe-remove slowdown vs unsafe-remove before failing (default: {DEFAULT_MAX_REGRESSION_PCT})"
                 );
                 std::process::exit(0);
             }
@@ -575,8 +575,8 @@ fn main() -> Result<()> {
         rounds, iterations, max_regression_pct
     );
     println!(
-        "{:<20} {:>12} {:>12} {:>12} {:>11} {:>11}",
-        "workload", "legacy(ns)", "opt-v1(ns)", "opt-v2(ns)", "v2/v1", "v2/legacy"
+        "{:<20} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "workload", "legacy(ns)", "safe(ns)", "unsafe(ns)", "safe/unsafe", "safe/legacy"
     );
 
     let mut regressions = Vec::new();
@@ -584,32 +584,32 @@ fn main() -> Result<()> {
         verify_equivalence(workload)?;
         let timing = run_case(workload, rounds, iterations);
         let legacy_ns = ns_per_iter(timing.legacy, iterations);
-        let optimized_v1_ns = ns_per_iter(timing.optimized_v1, iterations);
-        let optimized_v2_ns = ns_per_iter(timing.optimized_v2, iterations);
-        let v2_vs_v1 = if optimized_v2_ns > 0.0 {
-            optimized_v1_ns / optimized_v2_ns
+        let safe_ns = ns_per_iter(timing.optimized_v1, iterations);
+        let unsafe_ns = ns_per_iter(timing.optimized_v2, iterations);
+        let safe_vs_unsafe = if unsafe_ns > 0.0 {
+            safe_ns / unsafe_ns
         } else {
             f64::INFINITY
         };
-        let v2_vs_legacy = if optimized_v2_ns > 0.0 {
-            legacy_ns / optimized_v2_ns
+        let safe_vs_legacy = if legacy_ns > 0.0 {
+            safe_ns / legacy_ns
         } else {
             f64::INFINITY
         };
         println!(
-            "{:<20} {:>12.1} {:>12.1} {:>12.1} {:>10.2}x {:>10.2}x",
-            workload.name, legacy_ns, optimized_v1_ns, optimized_v2_ns, v2_vs_v1, v2_vs_legacy
+            "{:<20} {:>12.1} {:>12.1} {:>12.1} {:>11.2}x {:>11.2}x",
+            workload.name, legacy_ns, safe_ns, unsafe_ns, safe_vs_unsafe, safe_vs_legacy
         );
 
-        let delta_pct = if optimized_v1_ns > 0.0 {
-            ((optimized_v2_ns - optimized_v1_ns) / optimized_v1_ns) * 100.0
+        let delta_pct = if unsafe_ns > 0.0 {
+            ((safe_ns - unsafe_ns) / unsafe_ns) * 100.0
         } else {
             0.0
         };
         if delta_pct > max_regression_pct {
             regressions.push(format!(
-                "{} regressed by {:.2}% (optimized-v1 {:.1} ns -> optimized-v2 {:.1} ns)",
-                workload.name, delta_pct, optimized_v1_ns, optimized_v2_ns
+                "{} regressed by {:.2}% (unsafe {:.1} ns -> safe {:.1} ns)",
+                workload.name, delta_pct, unsafe_ns, safe_ns
             ));
         }
     }

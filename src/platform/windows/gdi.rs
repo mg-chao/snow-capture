@@ -241,6 +241,23 @@ fn gdi_incremental_too_dirty_probe_enabled() -> bool {
     })
 }
 
+#[inline]
+fn gdi_parallel_row_scan_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_DISABLE_GDI_PARALLEL_ROW_SCAN")
+            .map(|raw| {
+                let normalized = raw.trim().to_ascii_lowercase();
+                !(normalized == "1"
+                    || normalized == "true"
+                    || normalized == "yes"
+                    || normalized == "on")
+            })
+            .unwrap_or(true)
+    })
+}
+
 const GDI_INCREMENTAL_MIN_PIXELS: usize = 160_000;
 const GDI_INCREMENTAL_MAX_DIRTY_ROW_NUMERATOR: usize = 3;
 const GDI_INCREMENTAL_MAX_DIRTY_ROW_DENOMINATOR: usize = 4;
@@ -248,11 +265,42 @@ const GDI_INCREMENTAL_TOO_DIRTY_PROBE_MIN_PIXELS: usize = 786_432;
 const GDI_INCREMENTAL_TOO_DIRTY_PROBE_MAX_ROWS: usize = 24;
 const GDI_INCREMENTAL_TOO_DIRTY_PROBE_DIRTY_NUMERATOR: usize = 4;
 const GDI_INCREMENTAL_TOO_DIRTY_PROBE_DIRTY_DENOMINATOR: usize = 5;
+const GDI_PARALLEL_ROW_SCAN_MIN_PIXELS: usize = 2_000_000;
+const GDI_PARALLEL_ROW_SCAN_MIN_CHUNK_PIXELS: usize = 131_072;
+const GDI_PARALLEL_ROW_SCAN_MAX_WORKERS: usize = 9;
 
 #[derive(Clone, Copy, Debug)]
 struct DirtyRowRun {
     start_row: usize,
     row_count: usize,
+}
+
+fn build_dirty_row_runs_from_flags(flags: &[u8], runs: &mut Vec<DirtyRowRun>) {
+    runs.clear();
+
+    let mut run_start = None::<usize>;
+    for (row, &flag) in flags.iter().enumerate() {
+        if flag == 0 {
+            if let Some(start) = run_start.take() {
+                runs.push(DirtyRowRun {
+                    start_row: start,
+                    row_count: row - start,
+                });
+            }
+            continue;
+        }
+
+        if run_start.is_none() {
+            run_start = Some(row);
+        }
+    }
+
+    if let Some(start) = run_start {
+        runs.push(DirtyRowRun {
+            start_row: start,
+            row_count: flags.len() - start,
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,6 +323,18 @@ fn incremental_too_dirty_probe_eligible(pixel_count: usize, height: usize) -> bo
     gdi_incremental_too_dirty_probe_enabled()
         && pixel_count >= GDI_INCREMENTAL_TOO_DIRTY_PROBE_MIN_PIXELS
         && height > 1
+}
+
+#[inline(always)]
+fn parallel_row_scan_eligible(pixel_count: usize, height: usize) -> bool {
+    gdi_parallel_row_scan_enabled()
+        && height > 1
+        && convert::should_parallelize_work(
+            pixel_count,
+            GDI_PARALLEL_ROW_SCAN_MIN_PIXELS,
+            GDI_PARALLEL_ROW_SCAN_MIN_CHUNK_PIXELS,
+            GDI_PARALLEL_ROW_SCAN_MAX_WORKERS,
+        )
 }
 
 unsafe fn incremental_too_dirty_probe(
@@ -641,6 +701,7 @@ struct GdiResources {
     stride: usize,
     incremental_too_dirty_hint: bool,
     bgra_history: Vec<u8>,
+    dirty_row_flags: Vec<u8>,
     dirty_row_runs: Vec<DirtyRowRun>,
 }
 
@@ -679,6 +740,7 @@ impl GdiResources {
             stride: 0,
             incremental_too_dirty_hint: false,
             bgra_history: Vec::new(),
+            dirty_row_flags: Vec::new(),
             dirty_row_runs: Vec::new(),
         })
     }
@@ -906,17 +968,72 @@ impl GdiResources {
         }
     }
 
-    fn scan_dirty_row_runs<F>(
+    fn ensure_dirty_row_flags(&mut self, row_count: usize) {
+        if self.dirty_row_flags.len() != row_count {
+            self.dirty_row_flags.resize(row_count, 0);
+        }
+    }
+
+    fn build_dirty_row_runs_from_flags(&mut self, height: usize) {
+        build_dirty_row_runs_from_flags(&self.dirty_row_flags[..height], &mut self.dirty_row_runs);
+    }
+
+    fn scan_dirty_row_runs_parallel(
         &mut self,
         row_bytes: usize,
         height: usize,
         history_base: *mut u8,
         history_stride: usize,
-        mut on_changed_row: F,
-    ) -> CaptureResult<Option<usize>>
-    where
-        F: FnMut(*const u8, *mut u8, usize),
-    {
+        copy_changed_rows_to_history: bool,
+        compare_row: RowCompareKernel,
+    ) -> usize {
+        self.ensure_dirty_row_flags(height);
+
+        let src_addr = self.bits as usize;
+        let src_stride = self.stride;
+        let history_addr = history_base as usize;
+        let flags = &mut self.dirty_row_flags[..height];
+
+        let mut dirty_rows = 0usize;
+        convert::with_conversion_pool(GDI_PARALLEL_ROW_SCAN_MAX_WORKERS, || {
+            use rayon::prelude::*;
+            dirty_rows = flags
+                .par_iter_mut()
+                .enumerate()
+                .map(|(row, flag)| {
+                    let src_row = (src_addr + row * src_stride) as *const u8;
+                    let history_row = (history_addr + row * history_stride) as *mut u8;
+                    let changed =
+                        unsafe { !compare_row(src_row, history_row.cast_const(), row_bytes) };
+
+                    *flag = if changed { 1u8 } else { 0u8 };
+
+                    if !changed {
+                        return 0usize;
+                    }
+
+                    if copy_changed_rows_to_history {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(src_row, history_row, row_bytes);
+                        }
+                    }
+                    1usize
+                })
+                .sum::<usize>();
+        });
+
+        self.build_dirty_row_runs_from_flags(height);
+        dirty_rows
+    }
+
+    fn scan_dirty_row_runs(
+        &mut self,
+        row_bytes: usize,
+        height: usize,
+        history_base: *mut u8,
+        history_stride: usize,
+        copy_changed_rows_to_history: bool,
+    ) -> CaptureResult<Option<usize>> {
         if history_base.is_null() {
             return Ok(None);
         }
@@ -948,6 +1065,23 @@ impl GdiResources {
             self.dirty_row_runs.clear();
             return Ok(None);
         }
+
+        if parallel_row_scan_eligible(pixel_count, height) {
+            let dirty_rows = self.scan_dirty_row_runs_parallel(
+                row_bytes,
+                height,
+                history_base,
+                history_stride,
+                copy_changed_rows_to_history,
+                compare_row,
+            );
+            if dirty_rows > max_dirty_rows {
+                self.dirty_row_runs.clear();
+                return Ok(None);
+            }
+            return Ok(Some(dirty_rows));
+        }
+
         self.dirty_row_runs.clear();
 
         let mut dirty_rows = 0usize;
@@ -966,7 +1100,11 @@ impl GdiResources {
                 }
             } else {
                 dirty_rows = dirty_rows.saturating_add(1);
-                on_changed_row(src_row, history_row, row_bytes);
+                if copy_changed_rows_to_history {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src_row, history_row, row_bytes);
+                    }
+                }
                 if run_start.is_none() {
                     run_start = Some(row);
                 }
@@ -1048,15 +1186,8 @@ impl GdiResources {
         }
 
         let history_ptr = self.bgra_history.as_mut_ptr();
-        let dirty_rows = self.scan_dirty_row_runs(
-            row_bytes,
-            height,
-            history_ptr,
-            row_bytes,
-            |src_row, history_row, row_len| unsafe {
-                std::ptr::copy_nonoverlapping(src_row, history_row, row_len);
-            },
-        )?;
+        let dirty_rows =
+            self.scan_dirty_row_runs(row_bytes, height, history_ptr, row_bytes, true)?;
         let Some(dirty_rows) = dirty_rows else {
             return Ok(IncrementalConvertStatus::TooDirty);
         };
@@ -1083,13 +1214,8 @@ impl GdiResources {
             return Ok(IncrementalConvertStatus::NotAvailable);
         }
 
-        let dirty_rows = self.scan_dirty_row_runs(
-            row_bytes,
-            height,
-            self.history_bits,
-            self.stride,
-            |_src_row, _history_row, _row_len| {},
-        )?;
+        let dirty_rows =
+            self.scan_dirty_row_runs(row_bytes, height, self.history_bits, self.stride, false)?;
         let Some(dirty_rows) = dirty_rows else {
             return Ok(IncrementalConvertStatus::TooDirty);
         };
@@ -1589,6 +1715,7 @@ impl GdiResources {
         self.stride = 0;
         self.incremental_too_dirty_hint = false;
         self.bgra_history.clear();
+        self.dirty_row_flags.clear();
         self.dirty_row_runs.clear();
     }
 }
@@ -2011,6 +2138,34 @@ mod tests {
             WindowCapturePath::PrintWindow(PRINT_WINDOW_RENDER_FULL)
         );
         assert_eq!(attempts[3], WindowCapturePath::WindowDcBitBlt);
+    }
+
+    #[test]
+    fn dirty_row_run_builder_merges_adjacent_rows() {
+        let flags = [0u8, 1, 1, 0, 1, 0, 1, 1, 1, 0];
+        let mut runs = Vec::new();
+        build_dirty_row_runs_from_flags(&flags, &mut runs);
+
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].start_row, 1);
+        assert_eq!(runs[0].row_count, 2);
+        assert_eq!(runs[1].start_row, 4);
+        assert_eq!(runs[1].row_count, 1);
+        assert_eq!(runs[2].start_row, 6);
+        assert_eq!(runs[2].row_count, 3);
+    }
+
+    #[test]
+    fn dirty_row_run_builder_handles_empty_and_trailing_runs() {
+        let mut runs = Vec::new();
+        build_dirty_row_runs_from_flags(&[], &mut runs);
+        assert!(runs.is_empty());
+
+        let flags = [1u8, 1, 1];
+        build_dirty_row_runs_from_flags(&flags, &mut runs);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].start_row, 0);
+        assert_eq!(runs[0].row_count, 3);
     }
 
     #[test]

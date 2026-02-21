@@ -12,6 +12,7 @@ Runs an in-process synthetic sparse-damage benchmark that compares:
 - optimized parallel sparse-span incremental conversion
 - legacy parallel compare-then-diff span scan
 - optimized adaptive parallel span scan (single-scan when sampled damage is detected)
+- optimized adaptive parallel span scan mode history (reuses prior mode decisions instead of re-probing every frame)
 
 Command:
 
@@ -42,3 +43,4 @@ Useful options:
 - `-GuardBaselinePath <csv>`: enforce regression check against a saved baseline
 - `-MinImprovementPct <value>`: required p50 improvement vs legacy
 - `-MaxDuplicatePct <value>`: duplicate-frame budget guard for workload validity
+- Legacy toggle for A/B: `SNOW_CAPTURE_DISABLE_GDI_PARALLEL_SPAN_MODE_HISTORY=1`

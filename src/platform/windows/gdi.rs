@@ -327,6 +327,23 @@ fn gdi_parallel_span_scan_enabled() -> bool {
 }
 
 #[inline]
+fn gdi_parallel_span_mode_history_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_DISABLE_GDI_PARALLEL_SPAN_MODE_HISTORY")
+            .map(|raw| {
+                let normalized = raw.trim().to_ascii_lowercase();
+                !(normalized == "1"
+                    || normalized == "true"
+                    || normalized == "yes"
+                    || normalized == "on")
+            })
+            .unwrap_or(true)
+    })
+}
+
+#[inline]
 fn gdi_incremental_duplicate_probe_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -356,6 +373,12 @@ const GDI_PARALLEL_ROW_SCAN_MIN_PIXELS: usize = 2_000_000;
 const GDI_PARALLEL_ROW_SCAN_MIN_CHUNK_PIXELS: usize = 131_072;
 const GDI_PARALLEL_ROW_SCAN_MAX_WORKERS: usize = 9;
 const GDI_PARALLEL_SPAN_SINGLE_SCAN_PROBE_ROWS: usize = 8;
+const GDI_PARALLEL_SPAN_HINT_FORCE_SINGLE_ROW_NUMERATOR: usize = 7;
+const GDI_PARALLEL_SPAN_HINT_FORCE_SINGLE_ROW_DENOMINATOR: usize = 8;
+const GDI_PARALLEL_SPAN_HINT_DENSE_ROW_NUMERATOR: usize = 2;
+const GDI_PARALLEL_SPAN_HINT_DENSE_ROW_DENOMINATOR: usize = 3;
+const GDI_PARALLEL_SPAN_HINT_DENSE_PIXEL_NUMERATOR: usize = 3;
+const GDI_PARALLEL_SPAN_HINT_DENSE_PIXEL_DENOMINATOR: usize = 10;
 const BGRA_BYTES_PER_PIXEL: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
@@ -730,6 +753,38 @@ unsafe fn parallel_span_single_scan_probe_detects_change(
     false
 }
 
+#[inline(always)]
+fn recommend_parallel_span_scan_mode(
+    dirty_rows: usize,
+    dirty_pixels: usize,
+    width: usize,
+    height: usize,
+) -> ParallelSpanScanMode {
+    if dirty_rows == 0 || width == 0 || height == 0 {
+        return ParallelSpanScanMode::CompareThenDiff;
+    }
+
+    let total_pixels = width.saturating_mul(height).max(1);
+    let force_single_scan = dirty_rows
+        .saturating_mul(GDI_PARALLEL_SPAN_HINT_FORCE_SINGLE_ROW_DENOMINATOR)
+        >= height.saturating_mul(GDI_PARALLEL_SPAN_HINT_FORCE_SINGLE_ROW_NUMERATOR);
+    if force_single_scan {
+        return ParallelSpanScanMode::SingleScanDiff;
+    }
+
+    let dense_rows = dirty_rows.saturating_mul(GDI_PARALLEL_SPAN_HINT_DENSE_ROW_DENOMINATOR)
+        >= height.saturating_mul(GDI_PARALLEL_SPAN_HINT_DENSE_ROW_NUMERATOR);
+    let dense_pixels = dirty_pixels.saturating_mul(GDI_PARALLEL_SPAN_HINT_DENSE_PIXEL_DENOMINATOR)
+        >= total_pixels.saturating_mul(GDI_PARALLEL_SPAN_HINT_DENSE_PIXEL_NUMERATOR);
+
+    if dense_rows && dense_pixels {
+        ParallelSpanScanMode::SingleScanDiff
+    } else {
+        ParallelSpanScanMode::CompareThenDiff
+    }
+}
+
+#[inline(always)]
 fn select_parallel_span_scan_mode(
     src_base: *const u8,
     src_stride: usize,
@@ -739,12 +794,16 @@ fn select_parallel_span_scan_mode(
     height: usize,
     compare_row: RowCompareKernel,
     duplicate_probe_hint: bool,
+    mode_hint: Option<ParallelSpanScanMode>,
 ) -> ParallelSpanScanMode {
     if !gdi_incremental_span_single_scan_enabled() {
         return ParallelSpanScanMode::CompareThenDiff;
     }
     if duplicate_probe_hint {
-        return ParallelSpanScanMode::SingleScanDiff;
+        return ParallelSpanScanMode::CompareThenDiff;
+    }
+    if let Some(mode) = mode_hint {
+        return mode;
     }
     if unsafe {
         parallel_span_single_scan_probe_detects_change(
@@ -1296,6 +1355,7 @@ struct GdiResources {
     stride: usize,
     incremental_duplicate_hint: bool,
     incremental_too_dirty_hint: bool,
+    parallel_span_mode_hint: Option<ParallelSpanScanMode>,
     bgra_history: Vec<u8>,
     dirty_row_flags: Vec<u8>,
     dirty_row_runs: Vec<DirtyRowRun>,
@@ -1338,6 +1398,7 @@ impl GdiResources {
             stride: 0,
             incremental_duplicate_hint: false,
             incremental_too_dirty_hint: false,
+            parallel_span_mode_hint: None,
             bgra_history: Vec::new(),
             dirty_row_flags: Vec::new(),
             dirty_row_runs: Vec::new(),
@@ -1544,6 +1605,7 @@ impl GdiResources {
             .ok_or(CaptureError::BufferOverflow)?;
         self.incremental_duplicate_hint = false;
         self.incremental_too_dirty_hint = false;
+        self.parallel_span_mode_hint = None;
         Ok(())
     }
 
@@ -1642,6 +1704,11 @@ impl GdiResources {
         }
         self.ensure_dirty_row_spans(height);
         self.dirty_row_spans[..height].fill(DirtyRowSpan::default());
+        let mode_hint = if gdi_parallel_span_mode_history_enabled() {
+            self.parallel_span_mode_hint
+        } else {
+            None
+        };
         let scan_mode = select_parallel_span_scan_mode(
             self.bits.cast_const(),
             self.stride,
@@ -1651,6 +1718,7 @@ impl GdiResources {
             height,
             compare_row,
             duplicate_probe_hint,
+            mode_hint,
         );
 
         let (dirty_rows, dirty_pixels) = scan_dirty_row_spans_parallel(
@@ -1666,6 +1734,16 @@ impl GdiResources {
             copy_changed_rows_to_history,
             scan_mode,
         );
+        if gdi_parallel_span_mode_history_enabled() {
+            self.parallel_span_mode_hint = Some(recommend_parallel_span_scan_mode(
+                dirty_rows,
+                dirty_pixels,
+                width,
+                height,
+            ));
+        } else {
+            self.parallel_span_mode_hint = None;
+        }
 
         if dirty_rows == 0 {
             return Ok(Some(DirtyScanResult {
@@ -1730,6 +1808,11 @@ impl GdiResources {
             if is_duplicate {
                 self.dirty_row_runs.clear();
                 self.dirty_span_runs.clear();
+                if gdi_parallel_span_mode_history_enabled() {
+                    self.parallel_span_mode_hint = Some(ParallelSpanScanMode::CompareThenDiff);
+                } else {
+                    self.parallel_span_mode_hint = None;
+                }
                 return Ok(Some(DirtyScanResult {
                     dirty_rows: 0,
                     used_spans: false,
@@ -1764,6 +1847,11 @@ impl GdiResources {
         {
             self.dirty_row_runs.clear();
             self.dirty_span_runs.clear();
+            if gdi_parallel_span_mode_history_enabled() {
+                self.parallel_span_mode_hint = Some(ParallelSpanScanMode::SingleScanDiff);
+            } else {
+                self.parallel_span_mode_hint = None;
+            }
             return Ok(None);
         }
 
@@ -2599,6 +2687,7 @@ impl GdiResources {
         self.stride = 0;
         self.incremental_duplicate_hint = false;
         self.incremental_too_dirty_hint = false;
+        self.parallel_span_mode_hint = None;
         self.bgra_history.clear();
         self.dirty_row_flags.clear();
         self.dirty_row_runs.clear();
@@ -3098,6 +3187,51 @@ mod tests {
         assert_eq!(runs[2].row_count, 1);
         assert_eq!(runs[2].start_col, 3);
         assert_eq!(runs[2].width, 5);
+    }
+
+    #[test]
+    fn parallel_span_mode_recommendation_prefers_compare_for_sparse_damage() {
+        assert_eq!(
+            recommend_parallel_span_scan_mode(0, 0, 2560, 1440),
+            ParallelSpanScanMode::CompareThenDiff
+        );
+        // Roughly 50% dirty rows with narrow spans should stay on compare+diff.
+        assert_eq!(
+            recommend_parallel_span_scan_mode(720, 69_120, 2560, 1440),
+            ParallelSpanScanMode::CompareThenDiff
+        );
+    }
+
+    #[test]
+    fn parallel_span_mode_recommendation_prefers_single_for_dense_damage() {
+        // High dirty-row coverage should force single-scan mode.
+        assert_eq!(
+            recommend_parallel_span_scan_mode(1300, 900_000, 2560, 1440),
+            ParallelSpanScanMode::SingleScanDiff
+        );
+        // Dense dirty rows + dirty pixels should also switch.
+        assert_eq!(
+            recommend_parallel_span_scan_mode(1000, 1_200_000, 2560, 1440),
+            ParallelSpanScanMode::SingleScanDiff
+        );
+    }
+
+    #[test]
+    fn parallel_span_mode_selection_prefers_duplicate_hint_over_mode_history() {
+        assert_eq!(
+            select_parallel_span_scan_mode(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                0,
+                row_compare_kernel(),
+                true,
+                Some(ParallelSpanScanMode::SingleScanDiff),
+            ),
+            ParallelSpanScanMode::CompareThenDiff
+        );
     }
 
     #[test]
@@ -3626,7 +3760,7 @@ mod tests {
         row_spans: &mut [DirtyRowSpan],
         span_runs: &mut Vec<DirtySpanRun>,
         scan_mode: ParallelSpanScanMode,
-    ) -> usize {
+    ) -> (usize, usize) {
         let row_bytes = width * BGRA_BYTES_PER_PIXEL;
         let spans = &mut row_spans[..height];
         spans.fill(DirtyRowSpan::default());
@@ -3645,7 +3779,7 @@ mod tests {
         );
         if dirty_rows == 0 {
             span_runs.clear();
-            return 0;
+            return (0, 0);
         }
 
         build_dirty_span_runs_from_spans(spans, span_runs);
@@ -3668,7 +3802,7 @@ mod tests {
             }
         }
 
-        dirty_pixels
+        (dirty_rows, dirty_pixels)
     }
 
     unsafe fn incremental_step_parallel_spans_compare_then_diff(
@@ -3697,6 +3831,7 @@ mod tests {
                 span_runs,
                 ParallelSpanScanMode::CompareThenDiff,
             )
+            .1
         }
     }
 
@@ -3726,6 +3861,7 @@ mod tests {
                 span_runs,
                 ParallelSpanScanMode::SingleScanDiff,
             )
+            .1
         }
     }
 
@@ -3739,6 +3875,7 @@ mod tests {
         width: usize,
         height: usize,
         duplicate_probe_hint: bool,
+        mode_hint: &mut Option<ParallelSpanScanMode>,
         row_spans: &mut [DirtyRowSpan],
         span_runs: &mut Vec<DirtySpanRun>,
     ) -> usize {
@@ -3752,8 +3889,9 @@ mod tests {
             height,
             row_compare_kernel(),
             duplicate_probe_hint,
+            *mode_hint,
         );
-        unsafe {
+        let (dirty_rows, dirty_pixels) = unsafe {
             incremental_step_parallel_spans_with_mode(
                 src_base,
                 src_stride,
@@ -3767,7 +3905,14 @@ mod tests {
                 span_runs,
                 scan_mode,
             )
-        }
+        };
+        *mode_hint = Some(recommend_parallel_span_scan_mode(
+            dirty_rows,
+            dirty_pixels,
+            width,
+            height,
+        ));
+        dirty_pixels
     }
 
     #[test]
@@ -4024,6 +4169,7 @@ mod tests {
         }
         let mut auto_spans = vec![DirtyRowSpan::default(); height];
         let mut auto_runs = Vec::new();
+        let mut auto_mode_hint = None;
         phase = 1usize;
         for _ in 0..warmup_iters {
             let src = frames[phase];
@@ -4038,6 +4184,7 @@ mod tests {
                     width,
                     height,
                     false,
+                    &mut auto_mode_hint,
                     &mut auto_spans,
                     &mut auto_runs,
                 )
@@ -4060,6 +4207,7 @@ mod tests {
                     width,
                     height,
                     false,
+                    &mut auto_mode_hint,
                     &mut auto_spans,
                     &mut auto_runs,
                 )
@@ -4082,7 +4230,7 @@ mod tests {
         );
 
         assert!(
-            auto_ms <= compare_ms * 1.20,
+            auto_ms <= compare_ms * 1.12,
             "parallel auto span path regressed: compare_then_diff={compare_ms:.3}ms auto={auto_ms:.3}ms ({improvement_pct:.2}% improvement)"
         );
     }
@@ -4103,8 +4251,8 @@ mod tests {
             *value = (idx as u8).wrapping_mul(17).wrapping_add(61);
         }
 
-        let warmup_iters = 20usize;
-        let measure_iters = 180usize;
+        let warmup_iters = 40usize;
+        let measure_iters = 1200usize;
 
         let mut compare_history = frame.clone();
         let mut compare_dst = vec![0u8; total_bytes];
@@ -4165,6 +4313,7 @@ mod tests {
         }
         let mut auto_spans = vec![DirtyRowSpan::default(); height];
         let mut auto_runs = Vec::new();
+        let mut auto_mode_hint = None;
         for _ in 0..warmup_iters {
             sink ^= unsafe {
                 incremental_step_parallel_spans_auto(
@@ -4177,6 +4326,7 @@ mod tests {
                     width,
                     height,
                     false,
+                    &mut auto_mode_hint,
                     &mut auto_spans,
                     &mut auto_runs,
                 )
@@ -4196,6 +4346,7 @@ mod tests {
                     width,
                     height,
                     false,
+                    &mut auto_mode_hint,
                     &mut auto_spans,
                     &mut auto_runs,
                 )
@@ -4217,7 +4368,7 @@ mod tests {
         );
 
         assert!(
-            auto_ms <= compare_ms * 1.80,
+            auto_ms <= compare_ms * 1.20,
             "parallel auto span duplicate path regressed: compare_then_diff={compare_ms:.3}ms auto={auto_ms:.3}ms ({delta_pct:.2}% delta)"
         );
     }

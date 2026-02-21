@@ -63,6 +63,17 @@ thread_local! {
     static DIRTY_WORK_ITEMS_SCRATCH: RefCell<Vec<DirtyRectWorkItem>> = const { RefCell::new(Vec::new()) };
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DirtyRectConversionHints {
+    /// Caller guarantees dirty rectangles are already in-bounds for both
+    /// source and destination surfaces.
+    pub trusted_bounds: bool,
+    /// Optional non-empty rectangle count precomputed by the caller.
+    pub non_empty_rects: Option<usize>,
+    /// Optional total dirty pixel count precomputed by the caller.
+    pub total_dirty_pixels: Option<usize>,
+}
+
 #[inline(always)]
 fn adaptive_map_spin_polls(max_polls: usize) -> usize {
     MAP_SPIN_POLLS_ADAPTIVE.with(|state| {
@@ -459,24 +470,43 @@ unsafe fn convert_dirty_rects_trusted_direct_unchecked(
     dirty_rects: &[DirtyRect],
     dst_origin_x: usize,
     dst_origin_y: usize,
+    hints: DirtyRectConversionHints,
 ) -> CaptureResult<usize> {
-    let mut converted = 0usize;
-    let mut total_dirty_pixels = 0usize;
-    for rect in dirty_rects {
-        let width = rect.width as usize;
-        let height = rect.height as usize;
-        if width == 0 || height == 0 {
-            continue;
+    let consistent_hints = match (hints.non_empty_rects, hints.total_dirty_pixels) {
+        (Some(non_empty_rects), Some(total_dirty_pixels))
+            if non_empty_rects <= dirty_rects.len()
+                && ((non_empty_rects == 0 && total_dirty_pixels == 0)
+                    || (non_empty_rects > 0 && total_dirty_pixels > 0)) =>
+        {
+            Some((non_empty_rects, total_dirty_pixels))
         }
-        let dirty_pixels = width
-            .checked_mul(height)
-            .ok_or(CaptureError::BufferOverflow)?;
-        total_dirty_pixels = total_dirty_pixels
-            .checked_add(dirty_pixels)
-            .ok_or(CaptureError::BufferOverflow)?;
-        converted = converted.saturating_add(1);
-    }
-    if converted == 0 {
+        _ => None,
+    };
+
+    let (converted, total_dirty_pixels) = if let Some(pair) = consistent_hints {
+        pair
+    } else {
+        let mut converted = 0usize;
+        let mut total_dirty_pixels = 0usize;
+        for rect in dirty_rects {
+            let width = rect.width as usize;
+            let height = rect.height as usize;
+            if width == 0 || height == 0 {
+                continue;
+            }
+            let dirty_pixels = width
+                .checked_mul(height)
+                .ok_or(CaptureError::BufferOverflow)?;
+            total_dirty_pixels = total_dirty_pixels
+                .checked_add(dirty_pixels)
+                .ok_or(CaptureError::BufferOverflow)?;
+            converted = converted
+                .checked_add(1)
+                .ok_or(CaptureError::BufferOverflow)?;
+        }
+        (converted, total_dirty_pixels)
+    };
+    if converted == 0 || total_dirty_pixels == 0 {
         return Ok(0);
     }
 
@@ -832,6 +862,7 @@ pub(crate) fn map_staging_dirty_rects_to_frame(
     frame: &mut Frame,
     dirty_rects: &[DirtyRect],
     dirty_rects_non_overlapping: bool,
+    hints: DirtyRectConversionHints,
     hdr_to_sdr: Option<HdrToSdrParams>,
     map_context: &'static str,
 ) -> CaptureResult<usize> {
@@ -846,6 +877,7 @@ pub(crate) fn map_staging_dirty_rects_to_frame(
         0,
         0,
         dirty_rects_non_overlapping,
+        hints,
         hdr_to_sdr,
         map_context,
     )
@@ -866,6 +898,7 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
     dst_origin_x: u32,
     dst_origin_y: u32,
     dirty_rects_non_overlapping: bool,
+    hints: DirtyRectConversionHints,
     hdr_to_sdr: Option<HdrToSdrParams>,
     map_context: &'static str,
 ) -> CaptureResult<usize> {
@@ -919,15 +952,16 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
         let converter = convert::SurfaceRowConverter::new(format, options);
         let trusted_fastpath = dirty_rect_trusted_fastpath_enabled()
             && dirty_rects_non_overlapping
-            && dirty_rects_fit_bounds(
-                dirty_rects,
-                width_u32,
-                height_u32,
-                dst_origin_x as u32,
-                dst_origin_y as u32,
-                dst_width_u32,
-                dst_height_u32,
-            );
+            && (hints.trusted_bounds
+                || dirty_rects_fit_bounds(
+                    dirty_rects,
+                    width_u32,
+                    height_u32,
+                    dst_origin_x as u32,
+                    dst_origin_y as u32,
+                    dst_width_u32,
+                    dst_height_u32,
+                ));
 
         if trusted_fastpath && dirty_rect_trusted_direct_enabled() {
             // SAFETY: `trusted_fastpath` guarantees all dirty rectangles are
@@ -943,6 +977,7 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
                     dirty_rects,
                     dst_origin_x,
                     dst_origin_y,
+                    hints,
                 )
             };
         }
@@ -1426,11 +1461,330 @@ mod tests {
                 &dirty_rects,
                 dst_origin_x,
                 dst_origin_y,
+                DirtyRectConversionHints::default(),
             )
         }
         .expect("trusted direct conversion failed");
 
         assert_eq!(converted, expected_converted);
         assert_eq!(direct, expected);
+    }
+
+    #[test]
+    fn trusted_direct_dirty_rect_conversion_recovers_from_invalid_hints() {
+        let src_width = 64usize;
+        let src_height = 48usize;
+        let src_pitch = src_width * 4;
+        let src_len = src_pitch * src_height;
+        let mut src = vec![0u8; src_len];
+        for (idx, byte) in src.iter_mut().enumerate() {
+            *byte = (idx as u8).wrapping_mul(19).wrapping_add(3);
+        }
+
+        let dst_pitch = src_pitch;
+        let dst_len = src_len;
+        let dirty_rects = vec![
+            DirtyRect {
+                x: 4,
+                y: 6,
+                width: 12,
+                height: 10,
+            },
+            DirtyRect {
+                x: 24,
+                y: 14,
+                width: 16,
+                height: 12,
+            },
+        ];
+
+        let converter = convert::SurfaceRowConverter::new(
+            SurfacePixelFormat::Bgra8,
+            SurfaceConversionOptions { hdr_to_sdr: None },
+        );
+
+        let mut baseline = vec![0u8; dst_len];
+        let baseline_converted = unsafe {
+            convert_dirty_rects_trusted_direct_unchecked(
+                converter,
+                src.as_ptr(),
+                src_pitch,
+                4,
+                baseline.as_mut_ptr(),
+                dst_pitch,
+                &dirty_rects,
+                0,
+                0,
+                DirtyRectConversionHints::default(),
+            )
+        }
+        .expect("baseline conversion failed");
+
+        // Deliberately inconsistent hints should fall back to runtime scanning
+        // instead of returning an incorrect converted count.
+        let mut hinted = vec![0u8; dst_len];
+        let hinted_converted = unsafe {
+            convert_dirty_rects_trusted_direct_unchecked(
+                converter,
+                src.as_ptr(),
+                src_pitch,
+                4,
+                hinted.as_mut_ptr(),
+                dst_pitch,
+                &dirty_rects,
+                0,
+                0,
+                DirtyRectConversionHints {
+                    trusted_bounds: true,
+                    non_empty_rects: Some(dirty_rects.len() + 1),
+                    total_dirty_pixels: Some(0),
+                },
+            )
+        }
+        .expect("hinted conversion failed");
+
+        assert_eq!(hinted_converted, baseline_converted);
+        assert_eq!(hinted, baseline);
+    }
+
+    fn row_major_rects(
+        start_x: u32,
+        start_y: u32,
+        cols: u32,
+        rows: u32,
+        rect_w: u32,
+        rect_h: u32,
+        gap_x: u32,
+        gap_y: u32,
+        limit: usize,
+    ) -> Vec<DirtyRect> {
+        let mut out = Vec::with_capacity(limit);
+        for row in 0..rows {
+            for col in 0..cols {
+                if out.len() == limit {
+                    return out;
+                }
+                let x = start_x + col * (rect_w + gap_x);
+                let y = start_y + row * (rect_h + gap_y);
+                out.push(DirtyRect {
+                    x,
+                    y,
+                    width: rect_w,
+                    height: rect_h,
+                });
+            }
+        }
+        out
+    }
+
+    fn dirty_rect_stats(rects: &[DirtyRect]) -> (usize, usize) {
+        let mut non_empty = 0usize;
+        let mut dirty_pixels = 0usize;
+        for rect in rects {
+            let width = rect.width as usize;
+            let height = rect.height as usize;
+            if width == 0 || height == 0 {
+                continue;
+            }
+            non_empty = non_empty.saturating_add(1);
+            dirty_pixels = dirty_pixels.saturating_add(width.saturating_mul(height));
+        }
+        (non_empty, dirty_pixels)
+    }
+
+    #[test]
+    #[ignore = "performance benchmark guard; run explicitly with --ignored --nocapture"]
+    fn bench_trusted_direct_hints_vs_runtime_scan() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const WIDTH: usize = 1920;
+        const HEIGHT: usize = 1080;
+        const ROUNDS: usize = 6;
+        const ITERATIONS: usize = 2200;
+        const MAX_REGRESSION: f64 = 5.0;
+
+        let workloads = vec![
+            (
+                "ui_sparse_tiles_32",
+                row_major_rects(24, 18, 8, 4, 32, 28, 24, 18, 32),
+            ),
+            (
+                "chatty_small_updates_96",
+                row_major_rects(8, 8, 16, 6, 10, 8, 8, 6, 96),
+            ),
+            (
+                "dense_micro_tiles_180",
+                row_major_rects(6, 6, 30, 6, 8, 6, 4, 3, 180),
+            ),
+        ];
+
+        let src_pitch = WIDTH * 4;
+        let dst_pitch = WIDTH * 4;
+        let buffer_len = src_pitch * HEIGHT;
+        let mut src = vec![0u8; buffer_len];
+        for (idx, byte) in src.iter_mut().enumerate() {
+            *byte = (idx as u8).wrapping_mul(37).wrapping_add(11);
+        }
+
+        let converter = convert::SurfaceRowConverter::new(
+            SurfacePixelFormat::Bgra8,
+            SurfaceConversionOptions { hdr_to_sdr: None },
+        );
+
+        let mut regressions = Vec::new();
+        println!(
+            "trusted-dirty benchmark: rounds={} iterations={} max_regression={:.2}%",
+            ROUNDS, ITERATIONS, MAX_REGRESSION
+        );
+        println!(
+            "{:<28} {:>12} {:>12} {:>9} {:>11}",
+            "workload", "scan_ms", "hinted_ms", "speedup", "regression"
+        );
+
+        for (name, rects) in &workloads {
+            let (non_empty_rects, dirty_pixels) = dirty_rect_stats(rects);
+            let scan_hints = DirtyRectConversionHints::default();
+            let hinted_hints = DirtyRectConversionHints {
+                trusted_bounds: true,
+                non_empty_rects: Some(non_empty_rects),
+                total_dirty_pixels: Some(dirty_pixels),
+            };
+
+            // Correctness parity check.
+            let mut scan_out = vec![0u8; buffer_len];
+            let mut hinted_out = vec![0u8; buffer_len];
+            let converted_scan = unsafe {
+                convert_dirty_rects_trusted_direct_unchecked(
+                    converter,
+                    src.as_ptr(),
+                    src_pitch,
+                    4,
+                    scan_out.as_mut_ptr(),
+                    dst_pitch,
+                    rects,
+                    0,
+                    0,
+                    scan_hints,
+                )
+            }
+            .expect("scan conversion failed");
+            let converted_hinted = unsafe {
+                convert_dirty_rects_trusted_direct_unchecked(
+                    converter,
+                    src.as_ptr(),
+                    src_pitch,
+                    4,
+                    hinted_out.as_mut_ptr(),
+                    dst_pitch,
+                    rects,
+                    0,
+                    0,
+                    hinted_hints,
+                )
+            }
+            .expect("hinted conversion failed");
+            assert_eq!(
+                converted_scan, converted_hinted,
+                "converted rect count mismatch for workload {name}",
+            );
+            assert_eq!(
+                scan_out, hinted_out,
+                "scan/hinted output mismatch for workload {name}",
+            );
+
+            let mut best_scan = std::time::Duration::MAX;
+            let mut best_hinted = std::time::Duration::MAX;
+
+            for _round in 0..ROUNDS {
+                let mut scan_checksum = 0u64;
+                let mut scan_dst = vec![0u8; buffer_len];
+                let scan_start = Instant::now();
+                for iter in 0..ITERATIONS {
+                    unsafe {
+                        let converted = convert_dirty_rects_trusted_direct_unchecked(
+                            converter,
+                            src.as_ptr(),
+                            src_pitch,
+                            4,
+                            scan_dst.as_mut_ptr(),
+                            dst_pitch,
+                            rects,
+                            0,
+                            0,
+                            scan_hints,
+                        )
+                        .expect("scan benchmark conversion failed");
+                        scan_checksum = scan_checksum.wrapping_add(
+                            scan_dst[(iter * 131 + converted) % scan_dst.len()] as u64,
+                        );
+                    }
+                }
+                black_box(scan_checksum);
+                best_scan = best_scan.min(scan_start.elapsed());
+
+                let mut hinted_checksum = 0u64;
+                let mut hinted_dst = vec![0u8; buffer_len];
+                let hinted_start = Instant::now();
+                for iter in 0..ITERATIONS {
+                    unsafe {
+                        let converted = convert_dirty_rects_trusted_direct_unchecked(
+                            converter,
+                            src.as_ptr(),
+                            src_pitch,
+                            4,
+                            hinted_dst.as_mut_ptr(),
+                            dst_pitch,
+                            rects,
+                            0,
+                            0,
+                            hinted_hints,
+                        )
+                        .expect("hinted benchmark conversion failed");
+                        hinted_checksum = hinted_checksum.wrapping_add(
+                            hinted_dst[(iter * 97 + converted) % hinted_dst.len()] as u64,
+                        );
+                    }
+                }
+                black_box(hinted_checksum);
+                best_hinted = best_hinted.min(hinted_start.elapsed());
+            }
+
+            let scan_ms = best_scan.as_secs_f64() * 1000.0;
+            let hinted_ms = best_hinted.as_secs_f64() * 1000.0;
+            let speedup = if hinted_ms > 0.0 {
+                scan_ms / hinted_ms
+            } else {
+                f64::INFINITY
+            };
+            let delta_pct = if scan_ms > 0.0 {
+                ((hinted_ms - scan_ms) / scan_ms) * 100.0
+            } else {
+                0.0
+            };
+            let regression = if delta_pct > MAX_REGRESSION {
+                "FAIL"
+            } else if delta_pct > 0.0 {
+                "warn"
+            } else {
+                "ok"
+            };
+            println!(
+                "{:<28} {:>12.3} {:>12.3} {:>8.2}x {:>11}",
+                name, scan_ms, hinted_ms, speedup, regression
+            );
+            if delta_pct > MAX_REGRESSION {
+                regressions.push(format!(
+                    "{} regressed by {:.2}% (scan {:.3} ms, hinted {:.3} ms)",
+                    name, delta_pct, scan_ms, hinted_ms
+                ));
+            }
+        }
+
+        assert!(
+            regressions.is_empty(),
+            "hinted trusted-direct path regressed:\n{}",
+            regressions.join("\n")
+        );
     }
 }

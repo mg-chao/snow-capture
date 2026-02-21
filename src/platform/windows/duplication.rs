@@ -211,6 +211,7 @@ struct RegionStagingSlot {
     dirty_mode_available: bool,
     dirty_cpu_copy_preferred: bool,
     dirty_gpu_copy_preferred: bool,
+    dirty_total_pixels: u64,
     dirty_rects: Vec<DirtyRect>,
     populated: bool,
 }
@@ -225,6 +226,7 @@ impl RegionStagingSlot {
         self.dirty_mode_available = false;
         self.dirty_cpu_copy_preferred = false;
         self.dirty_gpu_copy_preferred = false;
+        self.dirty_total_pixels = 0;
         self.dirty_rects.clear();
         self.populated = false;
     }
@@ -1056,6 +1058,7 @@ impl StagingRing {
         frame: &mut Frame,
         hdr_to_sdr: Option<HdrToSdrParams>,
         dirty_rects: &[DirtyRect],
+        dirty_total_pixels: u64,
         use_dirty_copy: bool,
         skip_readback: bool,
     ) -> CaptureResult<()> {
@@ -1107,6 +1110,11 @@ impl StagingRing {
         let staging = self.slots[slot].as_ref().unwrap();
         let staging_res = self.slot_resources[slot].as_ref();
         if use_dirty_copy {
+            let hints = surface::DirtyRectConversionHints {
+                trusted_bounds: true,
+                non_empty_rects: Some(dirty_rects.len()),
+                total_dirty_pixels: usize::try_from(dirty_total_pixels).ok(),
+            };
             match surface::map_staging_dirty_rects_to_frame(
                 context,
                 staging,
@@ -1115,6 +1123,7 @@ impl StagingRing {
                 frame,
                 dirty_rects,
                 true,
+                hints,
                 hdr_to_sdr,
                 "failed to map staging texture (dirty regions)",
             ) {
@@ -1261,6 +1270,7 @@ struct DirtyCopyStrategy {
     cpu: bool,
     gpu: bool,
     gpu_low_latency: bool,
+    dirty_pixels: u64,
 }
 
 fn evaluate_dirty_copy_strategy(rects: &[DirtyRect], width: u32, height: u32) -> DirtyCopyStrategy {
@@ -1296,6 +1306,7 @@ fn evaluate_dirty_copy_strategy(rects: &[DirtyRect], width: u32, height: u32) ->
             cpu: true,
             gpu: false,
             gpu_low_latency: false,
+            dirty_pixels,
         };
     }
 
@@ -1321,6 +1332,7 @@ fn evaluate_dirty_copy_strategy(rects: &[DirtyRect], width: u32, height: u32) ->
             cpu,
             gpu,
             gpu_low_latency: false,
+            dirty_pixels,
         };
     }
 
@@ -1351,6 +1363,7 @@ fn evaluate_dirty_copy_strategy(rects: &[DirtyRect], width: u32, height: u32) ->
         cpu,
         gpu,
         gpu_low_latency,
+        dirty_pixels,
     }
 }
 
@@ -1614,6 +1627,7 @@ struct OutputCapturer {
     pending_dirty_rects: Vec<DirtyRect>,
     /// Pre-computed dirty-copy strategy for `pending_dirty_rects`.
     pending_dirty_cpu_copy_preferred: bool,
+    pending_dirty_total_pixels: u64,
     /// Cached descriptor of the desktop texture from the duplication
     /// interface.  DXGI duplication textures don't change format/size
     /// mid-session, so we only need to query once (and re-query after
@@ -1675,6 +1689,7 @@ impl OutputCapturer {
             pending_is_duplicate: false,
             pending_dirty_rects: Vec::new(),
             pending_dirty_cpu_copy_preferred: false,
+            pending_dirty_total_pixels: 0,
             cached_src_desc: None,
             spare_frame: None,
             region_slots: std::array::from_fn(|_| RegionStagingSlot::default()),
@@ -1703,6 +1718,7 @@ impl OutputCapturer {
         self.pending_is_duplicate = false;
         self.pending_dirty_rects.clear();
         self.pending_dirty_cpu_copy_preferred = false;
+        self.pending_dirty_total_pixels = 0;
         self.cached_src_desc = None;
         self.invalidate_region_pipeline();
         self.dxgi_rect_buffer.clear();
@@ -1724,6 +1740,7 @@ impl OutputCapturer {
         self.pending_is_duplicate = false;
         self.pending_dirty_rects.clear();
         self.pending_dirty_cpu_copy_preferred = false;
+        self.pending_dirty_total_pixels = 0;
         self.staging_ring.reset_pipeline();
         self.reset_region_pipeline();
     }
@@ -2100,6 +2117,11 @@ impl OutputCapturer {
         };
 
         if use_dirty_copy {
+            let dirty_hints = surface::DirtyRectConversionHints {
+                trusted_bounds: true,
+                non_empty_rects: Some(slot.dirty_rects.len()),
+                total_dirty_pixels: usize::try_from(slot.dirty_total_pixels).ok(),
+            };
             let dirty_map_result = if write_full_slot_direct {
                 surface::map_staging_dirty_rects_to_frame(
                     &self.context,
@@ -2109,6 +2131,7 @@ impl OutputCapturer {
                     out,
                     &slot.dirty_rects,
                     true,
+                    dirty_hints,
                     slot.hdr_to_sdr,
                     "failed to map DXGI region staging texture (dirty regions)",
                 )
@@ -2123,6 +2146,7 @@ impl OutputCapturer {
                     blit.dst_x,
                     blit.dst_y,
                     true,
+                    dirty_hints,
                     slot.hdr_to_sdr,
                     "failed to map DXGI region staging texture (dirty regions)",
                 )
@@ -2162,6 +2186,7 @@ impl OutputCapturer {
         self.pending_is_duplicate = false;
         self.pending_dirty_rects.clear();
         self.pending_dirty_cpu_copy_preferred = false;
+        self.pending_dirty_total_pixels = 0;
         self.staging_ring.reset_pipeline();
 
         let mut destination_has_history = destination_has_history;
@@ -2335,6 +2360,7 @@ impl OutputCapturer {
                 slot.dirty_mode_available = region_dirty_available;
                 slot.dirty_cpu_copy_preferred = false;
                 slot.dirty_gpu_copy_preferred = false;
+                slot.dirty_total_pixels = 0;
                 slot.dirty_rects.clear();
                 slot.populated = true;
                 slot_idx
@@ -2361,6 +2387,7 @@ impl OutputCapturer {
                     slot.dirty_gpu_copy_preferred = can_use_dirty_gpu_copy
                         && region_dirty_available
                         && dirty_gpu_copy_preferred;
+                    slot.dirty_total_pixels = dirty_copy_strategy.dirty_pixels;
                     slot.populated = true;
                 }
 
@@ -2517,6 +2544,7 @@ impl OutputCapturer {
             let mut read_is_duplicate = frame_pixels_unchanged;
             let mut read_dirty_rects: &[DirtyRect] = &[];
             let mut read_dirty_cpu_copy_preferred = false;
+            let mut read_dirty_total_pixels = 0u64;
 
             if skip_submit_copy {
                 if let Some(prev_desc) = self.pending_desc.as_ref() {
@@ -2528,6 +2556,7 @@ impl OutputCapturer {
                     read_is_duplicate = self.pending_is_duplicate;
                     read_dirty_rects = &self.pending_dirty_rects;
                     read_dirty_cpu_copy_preferred = self.pending_dirty_cpu_copy_preferred;
+                    read_dirty_total_pixels = self.pending_dirty_total_pixels;
                 }
             } else {
                 let submitted_read_slot = self
@@ -2543,6 +2572,7 @@ impl OutputCapturer {
                     read_is_duplicate = self.pending_is_duplicate;
                     read_dirty_rects = &self.pending_dirty_rects;
                     read_dirty_cpu_copy_preferred = self.pending_dirty_cpu_copy_preferred;
+                    read_dirty_total_pixels = self.pending_dirty_total_pixels;
                 } else {
                     // Bootstrap/desync path: read the freshly submitted slot.
                     read_slot = self.staging_ring.latest_write_slot();
@@ -2567,6 +2597,7 @@ impl OutputCapturer {
                 &mut frame,
                 read_hdr,
                 read_dirty_rects,
+                read_dirty_total_pixels,
                 use_dirty_copy,
                 skip_readback,
             )?;
@@ -2577,12 +2608,14 @@ impl OutputCapturer {
                 self.pending_is_duplicate = true;
                 self.pending_dirty_rects.clear();
                 self.pending_dirty_cpu_copy_preferred = false;
+                self.pending_dirty_total_pixels = 0;
             } else {
                 self.pending_desc = Some(effective_desc);
                 self.pending_hdr = effective_hdr;
                 self.pending_is_duplicate = frame_pixels_unchanged;
                 self.pending_dirty_rects.clear();
                 self.pending_dirty_cpu_copy_preferred = false;
+                self.pending_dirty_total_pixels = 0;
                 if !frame_pixels_unchanged {
                     self.pending_dirty_rects
                         .extend_from_slice(&frame.metadata.dirty_rects);
@@ -2591,12 +2624,13 @@ impl OutputCapturer {
                         effective_desc.Width,
                         effective_desc.Height,
                     );
-                    self.pending_dirty_cpu_copy_preferred = evaluate_dirty_copy_strategy(
+                    let pending_dirty_strategy = evaluate_dirty_copy_strategy(
                         &self.pending_dirty_rects,
                         effective_desc.Width,
                         effective_desc.Height,
-                    )
-                    .cpu;
+                    );
+                    self.pending_dirty_cpu_copy_preferred = pending_dirty_strategy.cpu;
+                    self.pending_dirty_total_pixels = pending_dirty_strategy.dirty_pixels;
                 }
             }
         } else {
@@ -2608,6 +2642,7 @@ impl OutputCapturer {
             self.pending_is_duplicate = false;
             self.pending_dirty_rects.clear();
             self.pending_dirty_cpu_copy_preferred = false;
+            self.pending_dirty_total_pixels = 0;
             self.staging_ring.reset_pipeline();
             self.staging_ring.copy_and_read(
                 &self.context,

@@ -27,8 +27,9 @@ struct WorkItem {
 
 #[derive(Clone, Copy)]
 struct CaseTiming {
-    legacy: Duration,
-    optimized: Duration,
+    work_item: Duration,
+    direct_scan: Duration,
+    direct_hinted: Duration,
 }
 
 fn parse_args() -> Result<(usize, usize, f64)> {
@@ -189,6 +190,21 @@ fn dirty_rects_fit_bounds(
     true
 }
 
+fn dirty_rect_stats(rects: &[DirtyRect]) -> (usize, usize) {
+    let mut non_empty_rects = 0usize;
+    let mut dirty_pixels = 0usize;
+    for rect in rects {
+        let width = rect.width as usize;
+        let height = rect.height as usize;
+        if width == 0 || height == 0 {
+            continue;
+        }
+        non_empty_rects = non_empty_rects.saturating_add(1);
+        dirty_pixels = dirty_pixels.saturating_add(width.saturating_mul(height));
+    }
+    (non_empty_rects, dirty_pixels)
+}
+
 fn build_work_item_checked(
     rect: &DirtyRect,
     width: usize,
@@ -306,6 +322,79 @@ fn convert_rect_direct(
     true
 }
 
+fn convert_rects_direct_scan(
+    src: &[u8],
+    dst: &mut [u8],
+    src_pitch: usize,
+    dst_pitch: usize,
+    rects: &[DirtyRect],
+    dst_origin_x: usize,
+    dst_origin_y: usize,
+) -> usize {
+    let mut converted = 0usize;
+    let mut dirty_pixels = 0usize;
+    for rect in rects {
+        let width = rect.width as usize;
+        let height = rect.height as usize;
+        if width == 0 || height == 0 {
+            continue;
+        }
+        converted = converted.saturating_add(1);
+        dirty_pixels = dirty_pixels.saturating_add(width.saturating_mul(height));
+    }
+    if converted == 0 || dirty_pixels == 0 {
+        return 0;
+    }
+
+    let mut converted_out = 0usize;
+    for rect in rects {
+        if convert_rect_direct(
+            src,
+            dst,
+            src_pitch,
+            dst_pitch,
+            *rect,
+            dst_origin_x,
+            dst_origin_y,
+        ) {
+            converted_out = converted_out.saturating_add(1);
+        }
+    }
+    converted_out
+}
+
+fn convert_rects_direct_hinted(
+    src: &[u8],
+    dst: &mut [u8],
+    src_pitch: usize,
+    dst_pitch: usize,
+    rects: &[DirtyRect],
+    dst_origin_x: usize,
+    dst_origin_y: usize,
+    non_empty_rects: usize,
+    dirty_pixels: usize,
+) -> usize {
+    if non_empty_rects == 0 || dirty_pixels == 0 {
+        return 0;
+    }
+
+    let mut converted_out = 0usize;
+    for rect in rects {
+        if convert_rect_direct(
+            src,
+            dst,
+            src_pitch,
+            dst_pitch,
+            *rect,
+            dst_origin_x,
+            dst_origin_y,
+        ) {
+            converted_out = converted_out.saturating_add(1);
+        }
+    }
+    converted_out
+}
+
 fn benchmark_workload(workload: &Workload, rounds: usize, iterations: usize) -> CaseTiming {
     let width = WIDTH as usize;
     let height = HEIGHT as usize;
@@ -319,15 +408,17 @@ fn benchmark_workload(workload: &Workload, rounds: usize, iterations: usize) -> 
     }
 
     let trusted_rects = dirty_rects_fit_bounds(&workload.rects, WIDTH, HEIGHT, 0, 0, WIDTH, HEIGHT);
+    let (trusted_non_empty_rects, trusted_dirty_pixels) = dirty_rect_stats(&workload.rects);
 
-    let mut best_legacy = Duration::MAX;
-    let mut best_optimized = Duration::MAX;
+    let mut best_work_item = Duration::MAX;
+    let mut best_direct_scan = Duration::MAX;
+    let mut best_direct_hinted = Duration::MAX;
 
     for _ in 0..rounds {
-        let mut dst_legacy = vec![0u8; buffer_len];
-        let mut legacy_checksum = 0u64;
+        let mut dst_work_item = vec![0u8; buffer_len];
+        let mut work_item_checksum = 0u64;
         let mut work_items = Vec::with_capacity(workload.rects.len());
-        let legacy_start = Instant::now();
+        let work_item_start = Instant::now();
         for iter in 0..iterations {
             work_items.clear();
             for rect in &workload.rects {
@@ -343,55 +434,90 @@ fn benchmark_workload(workload: &Workload, rounds: usize, iterations: usize) -> 
                 }
             }
             for item in &work_items {
-                convert_item(&src, &mut dst_legacy, src_pitch, dst_pitch, *item);
+                convert_item(&src, &mut dst_work_item, src_pitch, dst_pitch, *item);
             }
-            legacy_checksum = legacy_checksum.wrapping_add(
-                dst_legacy[(iter * 131 + work_items.len()) % dst_legacy.len()] as u64,
+            work_item_checksum = work_item_checksum.wrapping_add(
+                dst_work_item[(iter * 131 + work_items.len()) % dst_work_item.len()] as u64,
             );
         }
-        black_box(legacy_checksum);
-        best_legacy = best_legacy.min(legacy_start.elapsed());
+        black_box(work_item_checksum);
+        best_work_item = best_work_item.min(work_item_start.elapsed());
 
-        let mut dst_optimized = vec![0u8; buffer_len];
-        let mut optimized_checksum = 0u64;
-        let optimized_start = Instant::now();
+        let mut dst_direct_scan = vec![0u8; buffer_len];
+        let mut direct_scan_checksum = 0u64;
+        let direct_scan_start = Instant::now();
         for iter in 0..iterations {
-            let mut converted = 0usize;
-            if trusted_rects {
-                for rect in &workload.rects {
-                    if convert_rect_direct(
-                        &src,
-                        &mut dst_optimized,
-                        src_pitch,
-                        dst_pitch,
-                        *rect,
-                        0,
-                        0,
-                    ) {
-                        converted = converted.saturating_add(1);
-                    }
-                }
+            let converted = if trusted_rects {
+                convert_rects_direct_scan(
+                    &src,
+                    &mut dst_direct_scan,
+                    src_pitch,
+                    dst_pitch,
+                    &workload.rects,
+                    0,
+                    0,
+                )
             } else {
+                let mut converted = 0usize;
                 for rect in &workload.rects {
                     let Some(item) = build_work_item_checked(
                         rect, width, height, 0, 0, width, height, src_pitch, dst_pitch,
                     ) else {
                         continue;
                     };
-                    convert_item(&src, &mut dst_optimized, src_pitch, dst_pitch, item);
+                    convert_item(&src, &mut dst_direct_scan, src_pitch, dst_pitch, item);
                     converted = converted.saturating_add(1);
                 }
-            }
-            optimized_checksum = optimized_checksum
-                .wrapping_add(dst_optimized[(iter * 97 + converted) % dst_optimized.len()] as u64);
+                converted
+            };
+            direct_scan_checksum = direct_scan_checksum.wrapping_add(
+                dst_direct_scan[(iter * 97 + converted) % dst_direct_scan.len()] as u64,
+            );
         }
-        black_box(optimized_checksum);
-        best_optimized = best_optimized.min(optimized_start.elapsed());
+        black_box(direct_scan_checksum);
+        best_direct_scan = best_direct_scan.min(direct_scan_start.elapsed());
+
+        let mut dst_direct_hinted = vec![0u8; buffer_len];
+        let mut direct_hinted_checksum = 0u64;
+        let direct_hinted_start = Instant::now();
+        for iter in 0..iterations {
+            let converted = if trusted_rects {
+                convert_rects_direct_hinted(
+                    &src,
+                    &mut dst_direct_hinted,
+                    src_pitch,
+                    dst_pitch,
+                    &workload.rects,
+                    0,
+                    0,
+                    trusted_non_empty_rects,
+                    trusted_dirty_pixels,
+                )
+            } else {
+                let mut converted = 0usize;
+                for rect in &workload.rects {
+                    let Some(item) = build_work_item_checked(
+                        rect, width, height, 0, 0, width, height, src_pitch, dst_pitch,
+                    ) else {
+                        continue;
+                    };
+                    convert_item(&src, &mut dst_direct_hinted, src_pitch, dst_pitch, item);
+                    converted = converted.saturating_add(1);
+                }
+                converted
+            };
+            direct_hinted_checksum = direct_hinted_checksum.wrapping_add(
+                dst_direct_hinted[(iter * 89 + converted) % dst_direct_hinted.len()] as u64,
+            );
+        }
+        black_box(direct_hinted_checksum);
+        best_direct_hinted = best_direct_hinted.min(direct_hinted_start.elapsed());
     }
 
     // Correctness parity check on a single pass.
-    let mut legacy_once = vec![0u8; buffer_len];
-    let mut optimized_once = vec![0u8; buffer_len];
+    let mut work_item_once = vec![0u8; buffer_len];
+    let mut direct_scan_once = vec![0u8; buffer_len];
+    let mut direct_hinted_once = vec![0u8; buffer_len];
     for rect in &workload.rects {
         let item = if trusted_rects {
             build_work_item_trusted(*rect, 0, 0, src_pitch, dst_pitch)
@@ -401,25 +527,47 @@ fn benchmark_workload(workload: &Workload, rounds: usize, iterations: usize) -> 
             )
         };
         if let Some(item) = item {
-            convert_item(&src, &mut legacy_once, src_pitch, dst_pitch, item);
+            convert_item(&src, &mut work_item_once, src_pitch, dst_pitch, item);
         }
         if trusted_rects {
-            let _ =
-                convert_rect_direct(&src, &mut optimized_once, src_pitch, dst_pitch, *rect, 0, 0);
+            let _ = convert_rect_direct(
+                &src,
+                &mut direct_scan_once,
+                src_pitch,
+                dst_pitch,
+                *rect,
+                0,
+                0,
+            );
+            let _ = convert_rect_direct(
+                &src,
+                &mut direct_hinted_once,
+                src_pitch,
+                dst_pitch,
+                *rect,
+                0,
+                0,
+            );
         } else if let Some(item) = build_work_item_checked(
             rect, width, height, 0, 0, width, height, src_pitch, dst_pitch,
         ) {
-            convert_item(&src, &mut optimized_once, src_pitch, dst_pitch, item);
+            convert_item(&src, &mut direct_scan_once, src_pitch, dst_pitch, item);
+            convert_item(&src, &mut direct_hinted_once, src_pitch, dst_pitch, item);
         }
     }
     assert_eq!(
-        legacy_once, optimized_once,
-        "legacy/optimized output mismatch"
+        work_item_once, direct_scan_once,
+        "work-item/direct-scan output mismatch"
+    );
+    assert_eq!(
+        work_item_once, direct_hinted_once,
+        "work-item/direct-hinted output mismatch"
     );
 
     CaseTiming {
-        legacy: best_legacy,
-        optimized: best_optimized,
+        work_item: best_work_item,
+        direct_scan: best_direct_scan,
+        direct_hinted: best_direct_hinted,
     }
 }
 
@@ -436,22 +584,23 @@ fn main() -> Result<()> {
         rounds, iterations, max_regression_pct
     );
     println!(
-        "{:<28} {:>12} {:>12} {:>10} {:>11}",
-        "workload", "work_item_ms", "direct_ms", "speedup", "regression"
+        "{:<28} {:>12} {:>12} {:>12} {:>10} {:>11}",
+        "workload", "work_item_ms", "scan_ms", "hinted_ms", "speedup", "regression"
     );
 
     let mut regressions = Vec::new();
     for workload in &workloads {
         let timing = benchmark_workload(workload, rounds, iterations);
-        let legacy_ms = duration_ms(timing.legacy);
-        let optimized_ms = duration_ms(timing.optimized);
-        let delta_pct = if legacy_ms > 0.0 {
-            ((optimized_ms - legacy_ms) / legacy_ms) * 100.0
+        let work_item_ms = duration_ms(timing.work_item);
+        let direct_scan_ms = duration_ms(timing.direct_scan);
+        let direct_hinted_ms = duration_ms(timing.direct_hinted);
+        let delta_pct = if direct_scan_ms > 0.0 {
+            ((direct_hinted_ms - direct_scan_ms) / direct_scan_ms) * 100.0
         } else {
             0.0
         };
-        let speedup = if optimized_ms > 0.0 {
-            legacy_ms / optimized_ms
+        let speedup = if direct_hinted_ms > 0.0 {
+            direct_scan_ms / direct_hinted_ms
         } else {
             0.0
         };
@@ -463,14 +612,14 @@ fn main() -> Result<()> {
             "ok"
         };
         println!(
-            "{:<28} {:>12.3} {:>12.3} {:>9.2}x {:>11}",
-            workload.name, legacy_ms, optimized_ms, speedup, regression_flag
+            "{:<28} {:>12.3} {:>12.3} {:>12.3} {:>9.2}x {:>11}",
+            workload.name, work_item_ms, direct_scan_ms, direct_hinted_ms, speedup, regression_flag
         );
 
         if delta_pct > max_regression_pct {
             regressions.push(format!(
-                "{} regressed by {:.2}% (work-item {:.3} ms, direct {:.3} ms)",
-                workload.name, delta_pct, legacy_ms, optimized_ms
+                "{} regressed by {:.2}% (direct-scan {:.3} ms, direct-hinted {:.3} ms, work-item {:.3} ms)",
+                workload.name, delta_pct, direct_scan_ms, direct_hinted_ms, work_item_ms
             ));
         }
     }

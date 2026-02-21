@@ -51,6 +51,10 @@ const WGC_FRAME_POOL_BUFFERS: i32 = 2;
 const WGC_STAGING_SLOTS: usize = 2;
 const WGC_DIRTY_COPY_MAX_RECTS: usize = 192;
 const WGC_DIRTY_COPY_MAX_AREA_PERCENT: u64 = 70;
+const WGC_DIRTY_GPU_COPY_MAX_RECTS: usize = 64;
+const WGC_DIRTY_GPU_COPY_MAX_AREA_PERCENT: u64 = 45;
+const WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS: usize = 8;
+const WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT: u64 = 18;
 const WGC_STALE_POLL_SPIN_MIN: u32 = 16;
 const WGC_STALE_POLL_SPIN_MAX: u32 = 256;
 const WGC_STALE_POLL_SPIN_INITIAL: u32 = 64;
@@ -102,6 +106,18 @@ fn region_duplicate_short_circuit_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED
         .get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_REGION_DUPLICATE_SHORTCIRCUIT"))
+}
+
+#[inline]
+fn region_low_latency_slot_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_var_truthy("SNOW_CAPTURE_WGC_ENABLE_REGION_LOW_LATENCY_SLOT"))
+}
+
+#[inline]
+fn region_full_slot_map_fastpath_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_REGION_FULL_SLOT_MAP"))
 }
 
 #[inline]
@@ -456,6 +472,54 @@ fn should_use_dirty_copy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
             dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
         if dirty_pixels.saturating_mul(100)
             > total_pixels.saturating_mul(WGC_DIRTY_COPY_MAX_AREA_PERCENT)
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn should_use_dirty_gpu_copy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
+    if rects.is_empty() || rects.len() > WGC_DIRTY_GPU_COPY_MAX_RECTS {
+        return false;
+    }
+
+    let total_pixels = (width as u64).saturating_mul(height as u64);
+    if total_pixels == 0 {
+        return false;
+    }
+
+    let mut dirty_pixels = 0u64;
+    for rect in rects {
+        dirty_pixels =
+            dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+        if dirty_pixels.saturating_mul(100)
+            > total_pixels.saturating_mul(WGC_DIRTY_GPU_COPY_MAX_AREA_PERCENT)
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn should_use_low_latency_dirty_gpu_copy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
+    if rects.is_empty() || rects.len() > WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS {
+        return false;
+    }
+
+    let total_pixels = (width as u64).saturating_mul(height as u64);
+    if total_pixels == 0 {
+        return false;
+    }
+
+    let mut dirty_pixels = 0u64;
+    for rect in rects {
+        dirty_pixels =
+            dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
+        if dirty_pixels.saturating_mul(100)
+            > total_pixels.saturating_mul(WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT)
         {
             return false;
         }
@@ -1710,23 +1774,24 @@ impl WindowsGraphicsCaptureCapturer {
             let use_dirty_copy = destination_has_history
                 && slot.dirty_copy_preferred
                 && !slot.dirty_rects.is_empty();
-
-            if use_dirty_copy {
-                match surface::map_staging_dirty_rects_to_frame_with_offset(
-                    &self.context,
-                    staging,
-                    Some(staging_resource),
-                    &source_desc,
-                    out,
-                    &slot.dirty_rects,
-                    blit.dst_x,
-                    blit.dst_y,
-                    true,
-                    slot.hdr_to_sdr,
-                    "failed to map WGC region staging texture (dirty regions)",
-                ) {
-                    Ok(converted) if converted > 0 => Ok(()),
-                    Ok(_) | Err(_) => surface::map_staging_rect_to_frame(
+            let write_full_slot_direct = region_full_slot_map_fastpath_enabled()
+                && blit.dst_x == 0
+                && blit.dst_y == 0
+                && out.width() == source_desc.Width
+                && out.height() == source_desc.Height;
+            let map_full_slot = |out: &mut Frame| -> CaptureResult<()> {
+                if write_full_slot_direct {
+                    surface::map_staging_to_frame(
+                        &self.context,
+                        staging,
+                        Some(staging_resource),
+                        &source_desc,
+                        out,
+                        slot.hdr_to_sdr,
+                        "failed to map WGC region staging texture",
+                    )?;
+                } else {
+                    surface::map_staging_rect_to_frame(
                         &self.context,
                         staging,
                         Some(staging_resource),
@@ -1742,26 +1807,46 @@ impl WindowsGraphicsCaptureCapturer {
                         },
                         slot.hdr_to_sdr,
                         "failed to map WGC region staging texture",
-                    ),
+                    )?;
+                }
+                Ok(())
+            };
+
+            if use_dirty_copy {
+                let dirty_map_result = if write_full_slot_direct {
+                    surface::map_staging_dirty_rects_to_frame(
+                        &self.context,
+                        staging,
+                        Some(staging_resource),
+                        &source_desc,
+                        out,
+                        &slot.dirty_rects,
+                        true,
+                        slot.hdr_to_sdr,
+                        "failed to map WGC region staging texture (dirty regions)",
+                    )
+                } else {
+                    surface::map_staging_dirty_rects_to_frame_with_offset(
+                        &self.context,
+                        staging,
+                        Some(staging_resource),
+                        &source_desc,
+                        out,
+                        &slot.dirty_rects,
+                        blit.dst_x,
+                        blit.dst_y,
+                        true,
+                        slot.hdr_to_sdr,
+                        "failed to map WGC region staging texture (dirty regions)",
+                    )
+                };
+
+                match dirty_map_result {
+                    Ok(converted) if converted > 0 => Ok(()),
+                    Ok(_) | Err(_) => map_full_slot(out),
                 }
             } else {
-                surface::map_staging_rect_to_frame(
-                    &self.context,
-                    staging,
-                    Some(staging_resource),
-                    &source_desc,
-                    out,
-                    CaptureBlitRegion {
-                        src_x: 0,
-                        src_y: 0,
-                        width: source_desc.Width,
-                        height: source_desc.Height,
-                        dst_x: blit.dst_x,
-                        dst_y: blit.dst_y,
-                    },
-                    slot.hdr_to_sdr,
-                    "failed to map WGC region staging texture",
-                )
+                map_full_slot(out)
             }
         })();
 
@@ -2140,18 +2225,32 @@ impl WindowsGraphicsCaptureCapturer {
             }
 
             let recording_mode = self.capture_mode == CaptureMode::ScreenRecording;
-            let write_slot = if recording_mode {
+            let low_latency_recording = recording_mode
+                && destination_has_history
+                && region_low_latency_slot_enabled()
+                && region_dirty_available
+                && should_use_low_latency_dirty_gpu_copy(
+                    &region_dirty_rects,
+                    region_desc.Width,
+                    region_desc.Height,
+                );
+            let write_slot = if low_latency_recording {
+                self.region_pending_slot.unwrap_or(0)
+            } else if recording_mode {
                 self.region_next_write_slot % WGC_STAGING_SLOTS
             } else {
                 0
             };
-            let read_slot = if recording_mode {
+            let read_slot = if low_latency_recording {
+                write_slot
+            } else if recording_mode {
                 self.region_pending_slot.unwrap_or(write_slot)
             } else {
                 write_slot
             };
 
             let skip_submit_copy = recording_mode
+                && destination_has_history
                 && self.region_pending_slot.is_some()
                 && (source_is_duplicate || region_unchanged);
 
@@ -2168,12 +2267,15 @@ impl WindowsGraphicsCaptureCapturer {
                 slot_idx
             } else {
                 self.ensure_region_slot(write_slot, &region_desc)?;
-                let can_use_dirty_gpu_copy = {
-                    let slot = &self.region_slots[write_slot];
-                    slot.populated
-                        && slot.present_time_ticks != 0
-                        && slot.present_time_ticks == previous_present_time
-                };
+                let can_use_dirty_gpu_copy = destination_has_history
+                    && if low_latency_recording {
+                        true
+                    } else {
+                        let slot = &self.region_slots[write_slot];
+                        slot.populated
+                            && slot.present_time_ticks != 0
+                            && slot.present_time_ticks == previous_present_time
+                    };
                 {
                     let slot = &mut self.region_slots[write_slot];
                     slot.capture_time = Some(capture_time);
@@ -2184,12 +2286,22 @@ impl WindowsGraphicsCaptureCapturer {
                     slot.dirty_mode_available = region_dirty_available;
                     slot.dirty_rects.clear();
                     slot.dirty_rects.extend_from_slice(&region_dirty_rects);
-                    slot.dirty_copy_preferred = region_dirty_available
-                        && should_use_dirty_copy(
+                    let dirty_gpu_copy_preferred = if low_latency_recording {
+                        should_use_low_latency_dirty_gpu_copy(
                             &slot.dirty_rects,
                             region_desc.Width,
                             region_desc.Height,
-                        );
+                        )
+                    } else {
+                        should_use_dirty_gpu_copy(
+                            &slot.dirty_rects,
+                            region_desc.Width,
+                            region_desc.Height,
+                        )
+                    };
+                    slot.dirty_copy_preferred = can_use_dirty_gpu_copy
+                        && region_dirty_available
+                        && dirty_gpu_copy_preferred;
                     slot.populated = true;
                 }
 
@@ -2215,7 +2327,11 @@ impl WindowsGraphicsCaptureCapturer {
             if recording_mode {
                 if !skip_submit_copy {
                     self.region_pending_slot = Some(write_slot);
-                    self.region_next_write_slot = (write_slot + 1) % WGC_STAGING_SLOTS;
+                    if low_latency_recording {
+                        self.region_next_write_slot = write_slot;
+                    } else {
+                        self.region_next_write_slot = (write_slot + 1) % WGC_STAGING_SLOTS;
+                    }
                 }
             } else {
                 self.region_pending_slot = None;
@@ -2656,6 +2772,50 @@ mod tests {
             WGC_DIRTY_COPY_MAX_RECTS + 1
         ];
         assert!(!should_use_dirty_copy(&rects, 1920, 1080));
+    }
+
+    #[test]
+    fn dirty_gpu_copy_heuristic_accepts_sparse_updates() {
+        let rects = vec![
+            DirtyRect {
+                x: 0,
+                y: 0,
+                width: 320,
+                height: 180,
+            },
+            DirtyRect {
+                x: 1280,
+                y: 720,
+                width: 200,
+                height: 120,
+            },
+        ];
+        assert!(should_use_dirty_gpu_copy(&rects, 1920, 1080));
+    }
+
+    #[test]
+    fn dirty_gpu_copy_heuristic_rejects_wide_damage() {
+        let rects = vec![DirtyRect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }];
+        assert!(!should_use_dirty_gpu_copy(&rects, 1920, 1080));
+    }
+
+    #[test]
+    fn low_latency_dirty_gpu_copy_heuristic_is_stricter() {
+        let rects = vec![
+            DirtyRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            };
+            WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS + 1
+        ];
+        assert!(!should_use_low_latency_dirty_gpu_copy(&rects, 1920, 1080));
     }
 
     #[test]

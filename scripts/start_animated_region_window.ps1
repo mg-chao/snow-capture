@@ -5,7 +5,8 @@ param(
     [int]$Width = 960,
     [int]$Height = 540,
     [int]$BoxSize = 112,
-    [int]$IntervalMs = 8
+    [int]$IntervalMs = 8,
+    [switch]$FullRedraw
 )
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -89,10 +90,14 @@ $timer.Add_Tick({
     $state.BoxY = $nextY
     $state.Tick += 1
 
-    $prevRect = New-Object System.Drawing.Rectangle($state.PrevBoxX, $state.PrevBoxY, $BoxSize, $BoxSize)
-    $nextRect = New-Object System.Drawing.Rectangle($state.BoxX, $state.BoxY, $BoxSize, $BoxSize)
-    $form.Invalidate($prevRect)
-    $form.Invalidate($nextRect)
+    if ($FullRedraw) {
+        $form.Invalidate()
+    } else {
+        $prevRect = New-Object System.Drawing.Rectangle($state.PrevBoxX, $state.PrevBoxY, $BoxSize, $BoxSize)
+        $nextRect = New-Object System.Drawing.Rectangle($state.BoxX, $state.BoxY, $BoxSize, $BoxSize)
+        $form.Invalidate($prevRect)
+        $form.Invalidate($nextRect)
+    }
 })
 
 $form.Add_Shown({

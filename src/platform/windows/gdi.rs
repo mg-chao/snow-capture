@@ -355,6 +355,7 @@ const GDI_INCREMENTAL_TOO_DIRTY_PROBE_DIRTY_DENOMINATOR: usize = 5;
 const GDI_PARALLEL_ROW_SCAN_MIN_PIXELS: usize = 2_000_000;
 const GDI_PARALLEL_ROW_SCAN_MIN_CHUNK_PIXELS: usize = 131_072;
 const GDI_PARALLEL_ROW_SCAN_MAX_WORKERS: usize = 9;
+const GDI_PARALLEL_SPAN_SINGLE_SCAN_PROBE_ROWS: usize = 8;
 const BGRA_BYTES_PER_PIXEL: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
@@ -381,6 +382,12 @@ struct DirtySpanRun {
 struct DirtyScanResult {
     dirty_rows: usize,
     used_spans: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParallelSpanScanMode {
+    CompareThenDiff,
+    SingleScanDiff,
 }
 
 fn build_dirty_row_runs_from_flags(flags: &[u8], runs: &mut Vec<DirtyRowRun>) {
@@ -500,6 +507,7 @@ fn scan_dirty_row_spans_parallel(
     compare_row: RowCompareKernel,
     row_diff_bounds: RowDiffBoundsKernel,
     copy_changed_rows_to_history: bool,
+    scan_mode: ParallelSpanScanMode,
 ) -> (usize, usize) {
     debug_assert!(width <= u32::MAX as usize);
     let src_addr = src_base as usize;
@@ -513,22 +521,41 @@ fn scan_dirty_row_spans_parallel(
             .map(|(row, span)| {
                 let src_row = (src_addr + row * src_stride) as *const u8;
                 let history_row = (history_addr + row * history_stride) as *mut u8;
-                let changed = unsafe { !compare_row(src_row, history_row.cast_const(), row_bytes) };
-                if !changed {
+
+                let dirty_span = match scan_mode {
+                    ParallelSpanScanMode::CompareThenDiff => {
+                        let changed =
+                            unsafe { !compare_row(src_row, history_row.cast_const(), row_bytes) };
+                        if !changed {
+                            None
+                        } else {
+                            unsafe {
+                                row_diff_span_pixels_with_kernel(
+                                    row_diff_bounds,
+                                    src_row,
+                                    history_row.cast_const(),
+                                    row_bytes,
+                                    width,
+                                )
+                            }
+                            .or(Some((0usize, width)))
+                        }
+                    }
+                    ParallelSpanScanMode::SingleScanDiff => unsafe {
+                        row_diff_span_pixels_with_kernel(
+                            row_diff_bounds,
+                            src_row,
+                            history_row.cast_const(),
+                            row_bytes,
+                            width,
+                        )
+                    },
+                };
+
+                let Some((start_col, end_col)) = dirty_span else {
                     *span = DirtyRowSpan::default();
                     return (0usize, 0usize);
-                }
-
-                let (start_col, end_col) = unsafe {
-                    row_diff_span_pixels_with_kernel(
-                        row_diff_bounds,
-                        src_row,
-                        history_row.cast_const(),
-                        row_bytes,
-                        width,
-                    )
-                }
-                .unwrap_or((0, width));
+                };
 
                 let span_width = end_col.saturating_sub(start_col);
                 *span = DirtyRowSpan {
@@ -671,6 +698,69 @@ fn parallel_span_scan_eligible(
         && !incremental_too_dirty_hint
         && parallel_row_scan_eligible(pixel_count, height)
         && incremental_span_convert_eligible(pixel_count, width, height)
+}
+
+unsafe fn parallel_span_single_scan_probe_detects_change(
+    src_base: *const u8,
+    src_stride: usize,
+    history_base: *const u8,
+    history_stride: usize,
+    row_bytes: usize,
+    height: usize,
+    compare_row: RowCompareKernel,
+) -> bool {
+    if height == 0 || row_bytes == 0 {
+        return false;
+    }
+
+    let sample_rows = height.clamp(1, GDI_PARALLEL_SPAN_SINGLE_SCAN_PROBE_ROWS);
+    if sample_rows == 1 {
+        return unsafe { !compare_row(src_base, history_base, row_bytes) };
+    }
+
+    let denom = sample_rows - 1;
+    for sample_idx in 0..sample_rows {
+        let row = sample_idx.saturating_mul(height - 1) / denom;
+        let src_row = unsafe { src_base.add(row * src_stride) };
+        let history_row = unsafe { history_base.add(row * history_stride) };
+        if unsafe { !compare_row(src_row, history_row, row_bytes) } {
+            return true;
+        }
+    }
+    false
+}
+
+fn select_parallel_span_scan_mode(
+    src_base: *const u8,
+    src_stride: usize,
+    history_base: *const u8,
+    history_stride: usize,
+    row_bytes: usize,
+    height: usize,
+    compare_row: RowCompareKernel,
+    duplicate_probe_hint: bool,
+) -> ParallelSpanScanMode {
+    if !gdi_incremental_span_single_scan_enabled() {
+        return ParallelSpanScanMode::CompareThenDiff;
+    }
+    if duplicate_probe_hint {
+        return ParallelSpanScanMode::SingleScanDiff;
+    }
+    if unsafe {
+        parallel_span_single_scan_probe_detects_change(
+            src_base,
+            src_stride,
+            history_base,
+            history_stride,
+            row_bytes,
+            height,
+            compare_row,
+        )
+    } {
+        ParallelSpanScanMode::SingleScanDiff
+    } else {
+        ParallelSpanScanMode::CompareThenDiff
+    }
 }
 
 unsafe fn incremental_too_dirty_probe(
@@ -1542,6 +1632,7 @@ impl GdiResources {
         history_stride: usize,
         copy_changed_rows_to_history: bool,
         compare_row: RowCompareKernel,
+        duplicate_probe_hint: bool,
         max_dirty_pixels: usize,
     ) -> CaptureResult<Option<DirtyScanResult>> {
         self.dirty_row_runs.clear();
@@ -1551,6 +1642,16 @@ impl GdiResources {
         }
         self.ensure_dirty_row_spans(height);
         self.dirty_row_spans[..height].fill(DirtyRowSpan::default());
+        let scan_mode = select_parallel_span_scan_mode(
+            self.bits.cast_const(),
+            self.stride,
+            history_base.cast_const(),
+            history_stride,
+            row_bytes,
+            height,
+            compare_row,
+            duplicate_probe_hint,
+        );
 
         let (dirty_rows, dirty_pixels) = scan_dirty_row_spans_parallel(
             &mut self.dirty_row_spans[..height],
@@ -1563,6 +1664,7 @@ impl GdiResources {
             compare_row,
             row_diff_bounds_kernel(),
             copy_changed_rows_to_history,
+            scan_mode,
         );
 
         if dirty_rows == 0 {
@@ -1674,6 +1776,7 @@ impl GdiResources {
                 history_stride,
                 copy_changed_rows_to_history,
                 compare_row,
+                duplicate_probe_hint,
                 max_dirty_pixels,
             );
         }
@@ -3511,7 +3614,7 @@ mod tests {
         dirty_pixels
     }
 
-    unsafe fn incremental_step_parallel_spans_single_pass(
+    unsafe fn incremental_step_parallel_spans_with_mode(
         src_base: *const u8,
         src_stride: usize,
         history_base: *mut u8,
@@ -3522,6 +3625,7 @@ mod tests {
         height: usize,
         row_spans: &mut [DirtyRowSpan],
         span_runs: &mut Vec<DirtySpanRun>,
+        scan_mode: ParallelSpanScanMode,
     ) -> usize {
         let row_bytes = width * BGRA_BYTES_PER_PIXEL;
         let spans = &mut row_spans[..height];
@@ -3537,6 +3641,7 @@ mod tests {
             row_compare_kernel(),
             row_diff_bounds_kernel(),
             true,
+            scan_mode,
         );
         if dirty_rows == 0 {
             span_runs.clear();
@@ -3564,6 +3669,105 @@ mod tests {
         }
 
         dirty_pixels
+    }
+
+    unsafe fn incremental_step_parallel_spans_compare_then_diff(
+        src_base: *const u8,
+        src_stride: usize,
+        history_base: *mut u8,
+        history_stride: usize,
+        dst_base: *mut u8,
+        dst_stride: usize,
+        width: usize,
+        height: usize,
+        row_spans: &mut [DirtyRowSpan],
+        span_runs: &mut Vec<DirtySpanRun>,
+    ) -> usize {
+        unsafe {
+            incremental_step_parallel_spans_with_mode(
+                src_base,
+                src_stride,
+                history_base,
+                history_stride,
+                dst_base,
+                dst_stride,
+                width,
+                height,
+                row_spans,
+                span_runs,
+                ParallelSpanScanMode::CompareThenDiff,
+            )
+        }
+    }
+
+    unsafe fn incremental_step_parallel_spans_single_pass(
+        src_base: *const u8,
+        src_stride: usize,
+        history_base: *mut u8,
+        history_stride: usize,
+        dst_base: *mut u8,
+        dst_stride: usize,
+        width: usize,
+        height: usize,
+        row_spans: &mut [DirtyRowSpan],
+        span_runs: &mut Vec<DirtySpanRun>,
+    ) -> usize {
+        unsafe {
+            incremental_step_parallel_spans_with_mode(
+                src_base,
+                src_stride,
+                history_base,
+                history_stride,
+                dst_base,
+                dst_stride,
+                width,
+                height,
+                row_spans,
+                span_runs,
+                ParallelSpanScanMode::SingleScanDiff,
+            )
+        }
+    }
+
+    unsafe fn incremental_step_parallel_spans_auto(
+        src_base: *const u8,
+        src_stride: usize,
+        history_base: *mut u8,
+        history_stride: usize,
+        dst_base: *mut u8,
+        dst_stride: usize,
+        width: usize,
+        height: usize,
+        duplicate_probe_hint: bool,
+        row_spans: &mut [DirtyRowSpan],
+        span_runs: &mut Vec<DirtySpanRun>,
+    ) -> usize {
+        let row_bytes = width * BGRA_BYTES_PER_PIXEL;
+        let scan_mode = select_parallel_span_scan_mode(
+            src_base,
+            src_stride,
+            history_base.cast_const(),
+            history_stride,
+            row_bytes,
+            height,
+            row_compare_kernel(),
+            duplicate_probe_hint,
+        );
+        unsafe {
+            incremental_step_parallel_spans_with_mode(
+                src_base,
+                src_stride,
+                history_base,
+                history_stride,
+                dst_base,
+                dst_stride,
+                width,
+                height,
+                row_spans,
+                span_runs,
+                scan_mode,
+            )
+        }
     }
 
     #[test]
@@ -3643,6 +3847,379 @@ mod tests {
             assert_eq!(dst_span, expected);
             phase ^= 1;
         }
+    }
+
+    #[test]
+    fn parallel_span_single_scan_matches_compare_then_diff_sparse_damage() {
+        let width = 1280usize;
+        let height = 720usize;
+        let row_bytes = width * BGRA_BYTES_PER_PIXEL;
+        let total_bytes = row_bytes * height;
+        let pixel_count = width * height;
+
+        let mut baseline = vec![0u8; total_bytes];
+        for (idx, value) in baseline.iter_mut().enumerate() {
+            *value = (idx as u8).wrapping_mul(11).wrapping_add(41);
+        }
+        let frame_a = build_sparse_damage_variant(&baseline, width, height, 2);
+        let frame_b = build_sparse_damage_variant(&baseline, width, height, 8);
+        let frames = [&frame_a[..], &frame_b[..]];
+
+        let mut history_compare = frame_a.clone();
+        let mut history_single = frame_a.clone();
+        let mut dst_compare = vec![0u8; total_bytes];
+        let mut dst_single = vec![0u8; total_bytes];
+        let mut expected = vec![0u8; total_bytes];
+        unsafe {
+            convert::convert_bgra_to_rgba_unchecked(
+                frame_a.as_ptr(),
+                dst_compare.as_mut_ptr(),
+                pixel_count,
+            );
+            convert::convert_bgra_to_rgba_unchecked(
+                frame_a.as_ptr(),
+                dst_single.as_mut_ptr(),
+                pixel_count,
+            );
+        }
+
+        let mut spans_compare = vec![DirtyRowSpan::default(); height];
+        let mut spans_single = vec![DirtyRowSpan::default(); height];
+        let mut runs_compare = Vec::new();
+        let mut runs_single = Vec::new();
+
+        let mut phase = 1usize;
+        for _ in 0..12usize {
+            let src = frames[phase];
+            let compare_dirty_pixels = unsafe {
+                incremental_step_parallel_spans_compare_then_diff(
+                    src.as_ptr(),
+                    row_bytes,
+                    history_compare.as_mut_ptr(),
+                    row_bytes,
+                    dst_compare.as_mut_ptr(),
+                    row_bytes,
+                    width,
+                    height,
+                    &mut spans_compare,
+                    &mut runs_compare,
+                )
+            };
+            let single_dirty_pixels = unsafe {
+                incremental_step_parallel_spans_single_pass(
+                    src.as_ptr(),
+                    row_bytes,
+                    history_single.as_mut_ptr(),
+                    row_bytes,
+                    dst_single.as_mut_ptr(),
+                    row_bytes,
+                    width,
+                    height,
+                    &mut spans_single,
+                    &mut runs_single,
+                )
+            };
+
+            unsafe {
+                convert::convert_bgra_to_rgba_unchecked(
+                    src.as_ptr(),
+                    expected.as_mut_ptr(),
+                    pixel_count,
+                );
+            }
+
+            assert_eq!(compare_dirty_pixels, single_dirty_pixels);
+            assert_eq!(dst_compare, dst_single);
+            assert_eq!(dst_single, expected);
+            assert_eq!(history_compare, history_single);
+            phase ^= 1;
+        }
+    }
+
+    #[test]
+    #[ignore = "performance benchmark guard; run explicitly with --ignored --nocapture"]
+    fn bench_parallel_span_auto_vs_compare_then_diff_sparse_damage() {
+        use std::hint::black_box;
+
+        let width = 2560usize;
+        let height = 1440usize;
+        let row_bytes = width * BGRA_BYTES_PER_PIXEL;
+        let total_bytes = row_bytes * height;
+        let pixel_count = width * height;
+
+        let mut baseline = vec![0u8; total_bytes];
+        for (idx, value) in baseline.iter_mut().enumerate() {
+            *value = (idx as u8).wrapping_mul(37).wrapping_add(13);
+        }
+        let frame_a = build_sparse_damage_variant(&baseline, width, height, 4);
+        let frame_b = build_sparse_damage_variant(&baseline, width, height, 11);
+        let frames = [&frame_a[..], &frame_b[..]];
+
+        let warmup_iters = 20usize;
+        let measure_iters = 140usize;
+
+        let mut compare_history = frame_a.clone();
+        let mut compare_dst = vec![0u8; total_bytes];
+        unsafe {
+            convert::convert_bgra_to_rgba_unchecked(
+                frame_a.as_ptr(),
+                compare_dst.as_mut_ptr(),
+                pixel_count,
+            );
+        }
+        let mut compare_spans = vec![DirtyRowSpan::default(); height];
+        let mut compare_runs = Vec::new();
+
+        let mut sink = 0usize;
+        let mut phase = 1usize;
+        for _ in 0..warmup_iters {
+            let src = frames[phase];
+            sink ^= unsafe {
+                incremental_step_parallel_spans_compare_then_diff(
+                    src.as_ptr(),
+                    row_bytes,
+                    compare_history.as_mut_ptr(),
+                    row_bytes,
+                    compare_dst.as_mut_ptr(),
+                    row_bytes,
+                    width,
+                    height,
+                    &mut compare_spans,
+                    &mut compare_runs,
+                )
+            };
+            phase ^= 1;
+        }
+
+        phase = 1usize;
+        let compare_start = Instant::now();
+        for _ in 0..measure_iters {
+            let src = frames[phase];
+            sink ^= unsafe {
+                incremental_step_parallel_spans_compare_then_diff(
+                    src.as_ptr(),
+                    row_bytes,
+                    compare_history.as_mut_ptr(),
+                    row_bytes,
+                    compare_dst.as_mut_ptr(),
+                    row_bytes,
+                    width,
+                    height,
+                    &mut compare_spans,
+                    &mut compare_runs,
+                )
+            };
+            phase ^= 1;
+        }
+        let compare_elapsed = compare_start.elapsed();
+
+        let mut auto_history = frame_a.clone();
+        let mut auto_dst = vec![0u8; total_bytes];
+        unsafe {
+            convert::convert_bgra_to_rgba_unchecked(
+                frame_a.as_ptr(),
+                auto_dst.as_mut_ptr(),
+                pixel_count,
+            );
+        }
+        let mut auto_spans = vec![DirtyRowSpan::default(); height];
+        let mut auto_runs = Vec::new();
+        phase = 1usize;
+        for _ in 0..warmup_iters {
+            let src = frames[phase];
+            sink ^= unsafe {
+                incremental_step_parallel_spans_auto(
+                    src.as_ptr(),
+                    row_bytes,
+                    auto_history.as_mut_ptr(),
+                    row_bytes,
+                    auto_dst.as_mut_ptr(),
+                    row_bytes,
+                    width,
+                    height,
+                    false,
+                    &mut auto_spans,
+                    &mut auto_runs,
+                )
+            };
+            phase ^= 1;
+        }
+
+        phase = 1usize;
+        let auto_start = Instant::now();
+        for _ in 0..measure_iters {
+            let src = frames[phase];
+            sink ^= unsafe {
+                incremental_step_parallel_spans_auto(
+                    src.as_ptr(),
+                    row_bytes,
+                    auto_history.as_mut_ptr(),
+                    row_bytes,
+                    auto_dst.as_mut_ptr(),
+                    row_bytes,
+                    width,
+                    height,
+                    false,
+                    &mut auto_spans,
+                    &mut auto_runs,
+                )
+            };
+            phase ^= 1;
+        }
+        let auto_elapsed = auto_start.elapsed();
+        black_box(sink);
+
+        let compare_ms = compare_elapsed.as_secs_f64() * 1000.0;
+        let auto_ms = auto_elapsed.as_secs_f64() * 1000.0;
+        let improvement_pct = if compare_ms > 0.0 {
+            ((compare_ms - auto_ms) / compare_ms) * 100.0
+        } else {
+            0.0
+        };
+
+        println!(
+            "gdi parallel span auto benchmark: compare_then_diff={compare_ms:.3} ms auto={auto_ms:.3} ms improvement={improvement_pct:.2}%"
+        );
+
+        assert!(
+            auto_ms <= compare_ms * 1.20,
+            "parallel auto span path regressed: compare_then_diff={compare_ms:.3}ms auto={auto_ms:.3}ms ({improvement_pct:.2}% improvement)"
+        );
+    }
+
+    #[test]
+    #[ignore = "performance benchmark guard; run explicitly with --ignored --nocapture"]
+    fn bench_parallel_span_auto_vs_compare_then_diff_duplicate_surface() {
+        use std::hint::black_box;
+
+        let width = 2560usize;
+        let height = 1440usize;
+        let row_bytes = width * BGRA_BYTES_PER_PIXEL;
+        let total_bytes = row_bytes * height;
+        let pixel_count = width * height;
+
+        let mut frame = vec![0u8; total_bytes];
+        for (idx, value) in frame.iter_mut().enumerate() {
+            *value = (idx as u8).wrapping_mul(17).wrapping_add(61);
+        }
+
+        let warmup_iters = 20usize;
+        let measure_iters = 180usize;
+
+        let mut compare_history = frame.clone();
+        let mut compare_dst = vec![0u8; total_bytes];
+        unsafe {
+            convert::convert_bgra_to_rgba_unchecked(
+                frame.as_ptr(),
+                compare_dst.as_mut_ptr(),
+                pixel_count,
+            );
+        }
+        let mut compare_spans = vec![DirtyRowSpan::default(); height];
+        let mut compare_runs = Vec::new();
+        let mut sink = 0usize;
+        for _ in 0..warmup_iters {
+            sink ^= unsafe {
+                incremental_step_parallel_spans_compare_then_diff(
+                    frame.as_ptr(),
+                    row_bytes,
+                    compare_history.as_mut_ptr(),
+                    row_bytes,
+                    compare_dst.as_mut_ptr(),
+                    row_bytes,
+                    width,
+                    height,
+                    &mut compare_spans,
+                    &mut compare_runs,
+                )
+            };
+        }
+
+        let compare_start = Instant::now();
+        for _ in 0..measure_iters {
+            sink ^= unsafe {
+                incremental_step_parallel_spans_compare_then_diff(
+                    frame.as_ptr(),
+                    row_bytes,
+                    compare_history.as_mut_ptr(),
+                    row_bytes,
+                    compare_dst.as_mut_ptr(),
+                    row_bytes,
+                    width,
+                    height,
+                    &mut compare_spans,
+                    &mut compare_runs,
+                )
+            };
+        }
+        let compare_elapsed = compare_start.elapsed();
+
+        let mut auto_history = frame.clone();
+        let mut auto_dst = vec![0u8; total_bytes];
+        unsafe {
+            convert::convert_bgra_to_rgba_unchecked(
+                frame.as_ptr(),
+                auto_dst.as_mut_ptr(),
+                pixel_count,
+            );
+        }
+        let mut auto_spans = vec![DirtyRowSpan::default(); height];
+        let mut auto_runs = Vec::new();
+        for _ in 0..warmup_iters {
+            sink ^= unsafe {
+                incremental_step_parallel_spans_auto(
+                    frame.as_ptr(),
+                    row_bytes,
+                    auto_history.as_mut_ptr(),
+                    row_bytes,
+                    auto_dst.as_mut_ptr(),
+                    row_bytes,
+                    width,
+                    height,
+                    false,
+                    &mut auto_spans,
+                    &mut auto_runs,
+                )
+            };
+        }
+
+        let auto_start = Instant::now();
+        for _ in 0..measure_iters {
+            sink ^= unsafe {
+                incremental_step_parallel_spans_auto(
+                    frame.as_ptr(),
+                    row_bytes,
+                    auto_history.as_mut_ptr(),
+                    row_bytes,
+                    auto_dst.as_mut_ptr(),
+                    row_bytes,
+                    width,
+                    height,
+                    false,
+                    &mut auto_spans,
+                    &mut auto_runs,
+                )
+            };
+        }
+        let auto_elapsed = auto_start.elapsed();
+        black_box(sink);
+
+        let compare_ms = compare_elapsed.as_secs_f64() * 1000.0;
+        let auto_ms = auto_elapsed.as_secs_f64() * 1000.0;
+        let delta_pct = if compare_ms > 0.0 {
+            ((auto_ms - compare_ms) / compare_ms) * 100.0
+        } else {
+            0.0
+        };
+
+        println!(
+            "gdi parallel span duplicate benchmark: compare_then_diff={compare_ms:.3} ms auto={auto_ms:.3} ms delta={delta_pct:.2}%"
+        );
+
+        assert!(
+            auto_ms <= compare_ms * 1.80,
+            "parallel auto span duplicate path regressed: compare_then_diff={compare_ms:.3}ms auto={auto_ms:.3}ms ({delta_pct:.2}% delta)"
+        );
     }
 
     #[test]

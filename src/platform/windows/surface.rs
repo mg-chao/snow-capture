@@ -1,4 +1,5 @@
 use anyhow::Context;
+use std::cell::Cell;
 use std::sync::OnceLock;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
@@ -8,6 +9,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
     DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
 };
+use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
 use windows::core::Interface;
 
 use crate::backend::CaptureBlitRegion;
@@ -51,6 +53,110 @@ const DIRTY_RECT_PARALLEL_MIN_PIXELS: usize = 131_072;
 const DIRTY_RECT_PARALLEL_MIN_CHUNK_PIXELS: usize = 32_768;
 const DIRTY_RECT_PARALLEL_MAX_WORKERS: usize = 9;
 const DIRTY_RECT_PARALLEL_MIN_RECTS: usize = 4;
+const D3D11_MAP_FLAG_DO_NOT_WAIT: u32 = 0x100000;
+const D3D11_MAP_SPIN_POLLS_DEFAULT: usize = 6;
+const D3D11_MAP_SPIN_POLLS_MIN: usize = 1;
+const D3D11_MAP_SPIN_POLLS_MAX: usize = 64;
+
+thread_local! {
+    static MAP_SPIN_POLLS_ADAPTIVE: Cell<usize> = const { Cell::new(D3D11_MAP_SPIN_POLLS_DEFAULT) };
+}
+
+#[inline(always)]
+fn adaptive_map_spin_polls(max_polls: usize) -> usize {
+    MAP_SPIN_POLLS_ADAPTIVE.with(|state| {
+        let current = state.get().clamp(
+            D3D11_MAP_SPIN_POLLS_MIN,
+            max_polls.max(D3D11_MAP_SPIN_POLLS_MIN),
+        );
+        if current != state.get() {
+            state.set(current);
+        }
+        current
+    })
+}
+
+#[inline(always)]
+fn update_adaptive_map_spin_polls(max_polls: usize, success_attempt: Option<usize>) {
+    MAP_SPIN_POLLS_ADAPTIVE.with(|state| {
+        let current = state.get().clamp(
+            D3D11_MAP_SPIN_POLLS_MIN,
+            max_polls.max(D3D11_MAP_SPIN_POLLS_MIN),
+        );
+        let next = match success_attempt {
+            Some(0) => current.saturating_sub(1).max(D3D11_MAP_SPIN_POLLS_MIN),
+            Some(attempt) => attempt.saturating_add(2).clamp(
+                D3D11_MAP_SPIN_POLLS_MIN,
+                max_polls.max(D3D11_MAP_SPIN_POLLS_MIN),
+            ),
+            None => current.saturating_sub(2).max(D3D11_MAP_SPIN_POLLS_MIN),
+        };
+        state.set(next);
+    });
+}
+
+#[inline(always)]
+fn map_resource_read_with_spin(
+    context: &ID3D11DeviceContext,
+    resource: &ID3D11Resource,
+    map_context: &'static str,
+) -> CaptureResult<D3D11_MAPPED_SUBRESOURCE> {
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+
+    if map_spin_wait_enabled() {
+        let max_polls = map_spin_poll_count();
+        let polls = adaptive_map_spin_polls(max_polls);
+        let mut exhausted_spin = true;
+        for attempt in 0..polls {
+            let map_result = unsafe {
+                context.Map(
+                    resource,
+                    0,
+                    D3D11_MAP_READ,
+                    D3D11_MAP_FLAG_DO_NOT_WAIT,
+                    Some(&mut mapped),
+                )
+            };
+            match map_result {
+                Ok(()) => {
+                    update_adaptive_map_spin_polls(max_polls, Some(attempt));
+                    return Ok(mapped);
+                }
+                Err(error) if error.code() == DXGI_ERROR_WAS_STILL_DRAWING => {
+                    if attempt + 1 < polls {
+                        std::hint::spin_loop();
+                    }
+                }
+                Err(_) => {
+                    exhausted_spin = false;
+                    break;
+                }
+            }
+        }
+        if exhausted_spin {
+            update_adaptive_map_spin_polls(max_polls, None);
+        }
+    } else {
+        let hr = unsafe {
+            context.Map(
+                resource,
+                0,
+                D3D11_MAP_READ,
+                D3D11_MAP_FLAG_DO_NOT_WAIT,
+                Some(&mut mapped),
+            )
+        };
+        if hr.is_ok() {
+            return Ok(mapped);
+        }
+    }
+
+    mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    unsafe { context.Map(resource, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
+        .context(map_context)
+        .map_err(CaptureError::Platform)?;
+    Ok(mapped)
+}
 
 #[derive(Clone, Copy)]
 struct DirtyRectWorkItem {
@@ -109,6 +215,23 @@ fn dirty_rect_fastpath_enabled() -> bool {
 fn dirty_rect_non_overlap_shortcut_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_DIRTY_RECT_NON_OVERLAP_SHORTCUT"))
+}
+
+fn map_spin_wait_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_D3D11_MAP_SPIN_WAIT"))
+}
+
+fn map_spin_poll_count() -> usize {
+    static POLLS: OnceLock<usize> = OnceLock::new();
+    *POLLS.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_D3D11_MAP_SPIN_POLLS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(D3D11_MAP_SPIN_POLLS_DEFAULT)
+            .clamp(D3D11_MAP_SPIN_POLLS_MIN, D3D11_MAP_SPIN_POLLS_MAX)
+    })
 }
 
 #[inline(always)]
@@ -318,19 +441,7 @@ pub(crate) fn map_staging_to_frame(
         }
     };
 
-    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-    // Try a non-blocking map first to catch the common case where the GPU
-    // finishes right before mapping.
-    // D3D11_MAP_FLAG_DO_NOT_WAIT = 0x100000
-    const DO_NOT_WAIT: u32 = 0x100000;
-    let non_blocking =
-        unsafe { context.Map(resource, 0, D3D11_MAP_READ, DO_NOT_WAIT, Some(&mut mapped)) };
-    if non_blocking.is_err() {
-        mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe { context.Map(resource, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
-            .context(map_context)
-            .map_err(CaptureError::Platform)?;
-    }
+    let mapped = map_resource_read_with_spin(context, resource, map_context)?;
 
     let result = copy_mapped_surface_to_frame(frame, desc, &mapped, hdr_to_sdr);
     unsafe {
@@ -399,17 +510,7 @@ pub(crate) fn map_staging_rect_to_frame(
         }
     };
 
-    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-    // D3D11_MAP_FLAG_DO_NOT_WAIT = 0x100000
-    const DO_NOT_WAIT: u32 = 0x100000;
-    let non_blocking =
-        unsafe { context.Map(resource, 0, D3D11_MAP_READ, DO_NOT_WAIT, Some(&mut mapped)) };
-    if non_blocking.is_err() {
-        mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe { context.Map(resource, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
-            .context(map_context)
-            .map_err(CaptureError::Platform)?;
-    }
+    let mapped = map_resource_read_with_spin(context, resource, map_context)?;
 
     let convert_result = (|| -> CaptureResult<()> {
         let src_pitch = mapped.RowPitch as usize;
@@ -557,17 +658,7 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
         }
     };
 
-    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-    // D3D11_MAP_FLAG_DO_NOT_WAIT = 0x100000
-    const DO_NOT_WAIT: u32 = 0x100000;
-    let non_blocking =
-        unsafe { context.Map(resource, 0, D3D11_MAP_READ, DO_NOT_WAIT, Some(&mut mapped)) };
-    if non_blocking.is_err() {
-        mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe { context.Map(resource, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
-            .context(map_context)
-            .map_err(CaptureError::Platform)?;
-    }
+    let mapped = map_resource_read_with_spin(context, resource, map_context)?;
 
     let convert_result = (|| -> CaptureResult<usize> {
         let src_pitch = mapped.RowPitch as usize;
@@ -589,6 +680,7 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
         let converter = convert::SurfaceRowConverter::new(format, options);
 
         if dirty_rect_fastpath_enabled() && dirty_rects.len() < DIRTY_RECT_PARALLEL_MIN_RECTS {
+            let allow_inner_parallel = dirty_rects.len() == 1;
             let mut converted = 0usize;
             for rect in dirty_rects {
                 let Some(item) = build_dirty_rect_work_item(
@@ -607,14 +699,25 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
                     continue;
                 };
                 unsafe {
-                    converter.convert_rows_maybe_parallel_unchecked(
-                        src_base.add(item.src_offset),
-                        src_pitch,
-                        dst_base.add(item.dst_offset),
-                        dst_pitch,
-                        item.width,
-                        item.height,
-                    );
+                    if allow_inner_parallel {
+                        converter.convert_rows_maybe_parallel_unchecked(
+                            src_base.add(item.src_offset),
+                            src_pitch,
+                            dst_base.add(item.dst_offset),
+                            dst_pitch,
+                            item.width,
+                            item.height,
+                        );
+                    } else {
+                        converter.convert_rows_unchecked(
+                            src_base.add(item.src_offset),
+                            src_pitch,
+                            dst_base.add(item.dst_offset),
+                            dst_pitch,
+                            item.width,
+                            item.height,
+                        );
+                    }
                 }
                 converted = converted.saturating_add(1);
             }
@@ -691,16 +794,28 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
                 });
             });
         } else {
+            let allow_inner_parallel = work_items.len() == 1;
             for item in &work_items {
                 unsafe {
-                    converter.convert_rows_maybe_parallel_unchecked(
-                        src_base.add(item.src_offset),
-                        src_pitch,
-                        dst_base.add(item.dst_offset),
-                        dst_pitch,
-                        item.width,
-                        item.height,
-                    );
+                    if allow_inner_parallel {
+                        converter.convert_rows_maybe_parallel_unchecked(
+                            src_base.add(item.src_offset),
+                            src_pitch,
+                            dst_base.add(item.dst_offset),
+                            dst_pitch,
+                            item.width,
+                            item.height,
+                        );
+                    } else {
+                        converter.convert_rows_unchecked(
+                            src_base.add(item.src_offset),
+                            src_pitch,
+                            dst_base.add(item.dst_offset),
+                            dst_pitch,
+                            item.width,
+                            item.height,
+                        );
+                    }
                 }
             }
         }

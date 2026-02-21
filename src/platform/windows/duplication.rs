@@ -52,6 +52,7 @@ const DXGI_DIRTY_GPU_COPY_MAX_AREA_PERCENT: u64 = 45;
 const DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS: usize = 8;
 const DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT: u64 = 18;
 const DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS_DEFAULT: u64 = 1_048_576;
+const DXGI_REGION_LOW_LATENCY_MAX_PIXELS_DEFAULT: u64 = 1_048_576;
 const DXGI_REGION_STAGING_SLOTS: usize = 3;
 const DXGI_REGION_DIRTY_TRACK_MAX_RECTS: usize = DXGI_DIRTY_COPY_MAX_RECTS + 1;
 
@@ -116,6 +117,27 @@ fn window_low_latency_max_pixels() -> u64 {
     *MAX_PIXELS.get_or_init(|| {
         env_var_positive_u64("SNOW_CAPTURE_DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS")
             .unwrap_or(DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS_DEFAULT)
+    })
+}
+
+#[inline]
+fn region_low_latency_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_var_truthy("SNOW_CAPTURE_DXGI_ENABLE_REGION_LOW_LATENCY"))
+}
+
+#[inline]
+fn region_low_latency_force_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_var_truthy("SNOW_CAPTURE_DXGI_FORCE_REGION_LOW_LATENCY"))
+}
+
+#[inline]
+fn region_low_latency_max_pixels() -> u64 {
+    static MAX_PIXELS: OnceLock<u64> = OnceLock::new();
+    *MAX_PIXELS.get_or_init(|| {
+        env_var_positive_u64("SNOW_CAPTURE_DXGI_REGION_LOW_LATENCY_MAX_PIXELS")
+            .unwrap_or(DXGI_REGION_LOW_LATENCY_MAX_PIXELS_DEFAULT)
     })
 }
 
@@ -1114,6 +1136,40 @@ fn should_use_window_low_latency_region_path(
 }
 
 #[inline(always)]
+fn choose_monitor_region_low_latency_mode(
+    capture_mode: CaptureMode,
+    low_latency_enabled: bool,
+    force_low_latency: bool,
+    max_low_latency_pixels: u64,
+    blit: CaptureBlitRegion,
+) -> bool {
+    if capture_mode != CaptureMode::ScreenRecording || !low_latency_enabled {
+        return false;
+    }
+
+    if force_low_latency {
+        return true;
+    }
+
+    let region_pixels = u64::from(blit.width).saturating_mul(u64::from(blit.height));
+    region_pixels > 0 && region_pixels <= max_low_latency_pixels
+}
+
+#[inline(always)]
+fn should_prefer_monitor_region_low_latency(
+    capture_mode: CaptureMode,
+    blit: CaptureBlitRegion,
+) -> bool {
+    choose_monitor_region_low_latency_mode(
+        capture_mode,
+        region_low_latency_enabled(),
+        region_low_latency_force_enabled(),
+        region_low_latency_max_pixels(),
+        blit,
+    )
+}
+
+#[inline(always)]
 fn should_skip_screenrecord_submit_copy(
     fastpath_enabled: bool,
     has_pending_submission: bool,
@@ -1948,8 +2004,7 @@ impl OutputCapturer {
                     slot.hdr_to_sdr = effective_hdr;
                     slot.source_desc = Some(region_desc);
                     slot.dirty_mode_available = region_dirty_available;
-                    slot.dirty_rects.clear();
-                    slot.dirty_rects.extend_from_slice(&region_dirty_rects);
+                    std::mem::swap(&mut slot.dirty_rects, &mut region_dirty_rects);
                     let dirty_gpu_copy_preferred = if low_latency_recording {
                         low_latency_dirty_gpu_preferred
                     } else {
@@ -2270,9 +2325,13 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
         destination: &mut Frame,
         destination_has_history: bool,
     ) -> CaptureResult<Option<CaptureSampleMetadata>> {
-        let result =
-            self.output
-                .capture_region_into(blit, destination, destination_has_history, false);
+        let prefer_low_latency = should_prefer_monitor_region_low_latency(self.capture_mode, blit);
+        let result = self.output.capture_region_into(
+            blit,
+            destination,
+            destination_has_history,
+            prefer_low_latency,
+        );
         match result {
             Ok(sample) => Ok(Some(sample)),
             Err(CaptureError::MonitorLost) | Err(CaptureError::AccessLost) => {
@@ -2284,8 +2343,15 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
                 )?;
                 self.output.cursor_config = self.cursor_config;
                 self.output.set_capture_mode(self.capture_mode);
+                let retry_prefer_low_latency =
+                    should_prefer_monitor_region_low_latency(self.capture_mode, blit);
                 self.output
-                    .capture_region_into(blit, destination, destination_has_history, false)
+                    .capture_region_into(
+                        blit,
+                        destination,
+                        destination_has_history,
+                        retry_prefer_low_latency,
+                    )
                     .map(Some)
             }
             Err(e) => Err(e),
@@ -2846,6 +2912,57 @@ mod tests {
             1,
             test_blit(3840, 2160),
             false
+        ));
+    }
+
+    #[test]
+    fn monitor_low_latency_mode_prefers_small_regions() {
+        assert!(choose_monitor_region_low_latency_mode(
+            CaptureMode::ScreenRecording,
+            true,
+            false,
+            1_048_576,
+            test_blit(1280, 720),
+        ));
+    }
+
+    #[test]
+    fn monitor_low_latency_mode_requires_recording_and_enablement() {
+        assert!(!choose_monitor_region_low_latency_mode(
+            CaptureMode::Screenshot,
+            true,
+            true,
+            DXGI_REGION_LOW_LATENCY_MAX_PIXELS_DEFAULT,
+            test_blit(1280, 720),
+        ));
+        assert!(!choose_monitor_region_low_latency_mode(
+            CaptureMode::ScreenRecording,
+            false,
+            true,
+            DXGI_REGION_LOW_LATENCY_MAX_PIXELS_DEFAULT,
+            test_blit(1280, 720),
+        ));
+    }
+
+    #[test]
+    fn monitor_low_latency_mode_rejects_zero_sized_regions_without_force() {
+        assert!(!choose_monitor_region_low_latency_mode(
+            CaptureMode::ScreenRecording,
+            true,
+            false,
+            DXGI_REGION_LOW_LATENCY_MAX_PIXELS_DEFAULT,
+            test_blit(0, 720),
+        ));
+    }
+
+    #[test]
+    fn monitor_low_latency_mode_force_flag_overrides_thresholds() {
+        assert!(choose_monitor_region_low_latency_mode(
+            CaptureMode::ScreenRecording,
+            true,
+            true,
+            1,
+            test_blit(3840, 2160),
         ));
     }
 

@@ -482,7 +482,13 @@ fn parse_args() -> Result<Config> {
   --max-regression-pct <f>   Allowed metric increase vs baseline (default: {DEFAULT_MAX_REGRESSION_PCT})
   --regression-metric <m>    Metric for regression checks: avg | p50 | p95 | p99 (default: p50)
   --regression-metrics <csv> Metrics for regression checks, e.g. avg,p50,p95
-  --max-duplicate-pct <f>    Fail if duplicate-frame percentage exceeds this threshold"
+  --max-duplicate-pct <f>    Fail if duplicate-frame percentage exceeds this threshold
+
+Tip: compare the GDI duplicate-frame fast path with legacy behavior:
+  optimized: cargo run --release --example benchmark -- --backends gdi --region-center 1920x1080
+  legacy (PowerShell): $env:SNOW_CAPTURE_DISABLE_GDI_DUPLICATE_PROBE=1; cargo run --release --example benchmark -- --backends gdi --region-center 1920x1080; Remove-Item Env:SNOW_CAPTURE_DISABLE_GDI_DUPLICATE_PROBE
+  legacy (cmd.exe):    setlocal && set SNOW_CAPTURE_DISABLE_GDI_DUPLICATE_PROBE=1 && cargo run --release --example benchmark -- --backends gdi --region-center 1920x1080 && endlocal
+  legacy (bash):       SNOW_CAPTURE_DISABLE_GDI_DUPLICATE_PROBE=1 cargo run --release --example benchmark -- --backends gdi --region-center 1920x1080"
                 );
                 std::process::exit(0);
             }

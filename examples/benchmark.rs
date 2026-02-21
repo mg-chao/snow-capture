@@ -810,7 +810,7 @@ fn check_duplicate_budget(current: &[BenchResult], max_duplicate_pct: f64) -> Re
 
 fn print_results(results: &[BenchResult]) {
     println!(
-        "{:<32} {:<6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "{:<32} {:<6} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>10} {:>10} {:>10}",
         "target",
         "backend",
         "avg_ms",
@@ -826,7 +826,7 @@ fn print_results(results: &[BenchResult]) {
     );
     for r in results {
         println!(
-            "{:<32} {:<6} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.2} {:>10.2} {:>10.2}",
+            "{:<32} {:<6} {:>12.6} {:>12.6} {:>12.6} {:>12.6} {:>12.6} {:>12.6} {:>12.6} {:>10.2} {:>10.2} {:>10.2}",
             r.target_label,
             backend_name(r.backend),
             r.avg_ms,

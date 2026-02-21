@@ -26,7 +26,8 @@ struct PreparedRegionPlan {
     region: CaptureRegion,
     output_width: u32,
     output_height: u32,
-    entries: Vec<RegionPlanEntry>,
+    region_fully_covered: bool,
+    entries: Arc<[RegionPlanEntry]>,
 }
 
 fn copy_region_rgba(src: &Frame, blit: CaptureBlitRegion, dst: &mut Frame) -> CaptureResult<()> {
@@ -209,6 +210,7 @@ impl CaptureSessionBuilder {
             sequence: 0,
             layout: None,
             prepared_region_plan: None,
+            region_desktop_direct_support: FxHashMap::default(),
             region_fallback_frames: FxHashMap::default(),
             region_output_history_valid: false,
         })
@@ -235,6 +237,7 @@ pub struct CaptureSession {
     /// Lazily-initialized monitor layout for region capture.
     layout: Option<MonitorLayout>,
     prepared_region_plan: Option<PreparedRegionPlan>,
+    region_desktop_direct_support: FxHashMap<MonitorKey, bool>,
     region_fallback_frames: FxHashMap<MonitorKey, Frame>,
     region_output_history_valid: bool,
 }
@@ -313,6 +316,7 @@ impl CaptureSession {
             self.monitor_output_history.clear();
             self.window_output_history.clear();
             self.region_output_history_valid = false;
+            self.region_desktop_direct_support.clear();
             self.region_fallback_frames.clear();
         }
         self.config.mode = mode;
@@ -529,7 +533,7 @@ impl CaptureSession {
     fn prepare_region_plan(
         &mut self,
         region: &CaptureRegion,
-    ) -> CaptureResult<(PreparedRegionPlan, bool)> {
+    ) -> CaptureResult<(&PreparedRegionPlan, bool)> {
         // Lazily snapshot the monitor layout on first region capture.
         if self.layout.is_none() {
             let monitors = self.backend.enumerate_monitors()?;
@@ -565,18 +569,21 @@ impl CaptureSession {
                 });
             }
 
+            let full_region_area = u64::from(region.width) * u64::from(region.height);
+            let covered_region_area = entries.iter().fold(0u64, |area, entry| {
+                area.saturating_add(u64::from(entry.blit.width) * u64::from(entry.blit.height))
+            });
+
             self.prepared_region_plan = Some(PreparedRegionPlan {
                 region: *region,
                 output_width: region.width,
                 output_height: region.height,
-                entries,
+                region_fully_covered: covered_region_area == full_region_area,
+                entries: entries.into(),
             });
         }
 
-        Ok((
-            self.prepared_region_plan.as_ref().unwrap().clone(),
-            needs_rebuild,
-        ))
+        Ok((self.prepared_region_plan.as_ref().unwrap(), needs_rebuild))
     }
 
     fn do_capture_region(
@@ -584,13 +591,19 @@ impl CaptureSession {
         region: &CaptureRegion,
         reuse: Option<Frame>,
     ) -> CaptureResult<Frame> {
-        let (plan, plan_changed) = self.prepare_region_plan(region)?;
+        let (entries, out_w, out_h, region_fully_covered, plan_changed) = {
+            let (plan, plan_changed) = self.prepare_region_plan(region)?;
+            (
+                Arc::clone(&plan.entries),
+                plan.output_width,
+                plan.output_height,
+                plan.region_fully_covered,
+                plan_changed,
+            )
+        };
 
         self.sequence = self.sequence.wrapping_add(1);
         let seq = self.sequence;
-
-        let out_w = plan.output_width;
-        let out_h = plan.output_height;
 
         // Prepare output frame.
         let mut out_frame = reuse.unwrap_or_else(Frame::empty);
@@ -608,31 +621,46 @@ impl CaptureSession {
             out_frame.as_mut_rgba_bytes().fill(0);
         }
 
-        let full_region_area = u64::from(out_w) * u64::from(out_h);
-        let covered_region_area = plan.entries.iter().fold(0u64, |area, entry| {
-            area.saturating_add(u64::from(entry.blit.width) * u64::from(entry.blit.height))
-        });
-        let region_fully_covered = covered_region_area == full_region_area;
-
-        if region_fully_covered && let Some(first_entry) = plan.entries.first() {
-            let direct_sample = {
-                let capturer = self.get_or_create_capturer(&first_entry.monitor)?;
-                capturer.capture_desktop_region_into(
-                    region.x,
-                    region.y,
-                    out_w,
-                    out_h,
-                    &mut out_frame,
-                    destination_has_history,
-                )
-            };
-            if let Ok(Some(sample)) = direct_sample {
-                out_frame.metadata.sequence = seq;
-                out_frame.metadata.capture_time = sample.capture_time;
-                out_frame.metadata.present_time_qpc = sample.present_time_qpc;
-                out_frame.metadata.is_duplicate = destination_has_history && sample.is_duplicate;
-                self.region_output_history_valid = true;
-                return Ok(out_frame);
+        if region_fully_covered
+            && entries.len() == 1
+            && let Some(first_entry) = entries.first()
+        {
+            let first_entry = first_entry.clone();
+            let should_try_desktop_direct = self
+                .region_desktop_direct_support
+                .get(&first_entry.monitor_key)
+                .copied()
+                .unwrap_or(true);
+            if should_try_desktop_direct {
+                let direct_sample = {
+                    let capturer = self.get_or_create_capturer(&first_entry.monitor)?;
+                    capturer.capture_desktop_region_into(
+                        region.x,
+                        region.y,
+                        out_w,
+                        out_h,
+                        &mut out_frame,
+                        destination_has_history,
+                    )
+                };
+                match direct_sample {
+                    Ok(Some(sample)) => {
+                        self.region_desktop_direct_support
+                            .insert(first_entry.monitor_key, true);
+                        out_frame.metadata.sequence = seq;
+                        out_frame.metadata.capture_time = sample.capture_time;
+                        out_frame.metadata.present_time_qpc = sample.present_time_qpc;
+                        out_frame.metadata.is_duplicate =
+                            destination_has_history && sample.is_duplicate;
+                        self.region_output_history_valid = true;
+                        return Ok(out_frame);
+                    }
+                    Ok(None) => {
+                        self.region_desktop_direct_support
+                            .insert(first_entry.monitor_key, false);
+                    }
+                    Err(_) => {}
+                }
             }
         }
 
@@ -640,7 +668,7 @@ impl CaptureSession {
         let mut latest_present_qpc = None;
         let mut all_duplicate = destination_has_history;
 
-        for entry in &plan.entries {
+        for entry in entries.iter() {
             let sample = {
                 let capturer = self.get_or_create_capturer(&entry.monitor)?;
                 capturer.capture_region_into(entry.blit, &mut out_frame, destination_has_history)?
@@ -931,6 +959,100 @@ mod tests {
 
         assert_eq!(*desktop_calls.lock().unwrap(), 1);
         assert_eq!(*region_calls.lock().unwrap(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn region_capture_caches_unavailable_desktop_direct_path() -> CaptureResult<()> {
+        let desktop_calls = Arc::new(Mutex::new(0usize));
+        let region_calls = Arc::new(Mutex::new(0usize));
+        let monitor = MonitorId::from_parts(1, 2, 0, "mock-monitor", true);
+        let backend: Arc<dyn CaptureBackend> = Arc::new(DirectRegionBackend {
+            monitor: monitor.clone(),
+            desktop_calls: Arc::clone(&desktop_calls),
+            region_calls: Arc::clone(&region_calls),
+            supports_desktop_direct: false,
+            desktop_should_error: false,
+        });
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        session.layout = Some(mock_layout(&monitor, 0, 0, 1920, 1080));
+
+        let target = CaptureTarget::Region(CaptureRegion::new(100, 50, 640, 360)?);
+        let frame = session.capture_frame(&target)?;
+        let _frame = session.capture_frame_reuse(&target, frame)?;
+
+        assert_eq!(*desktop_calls.lock().unwrap(), 1);
+        assert_eq!(*region_calls.lock().unwrap(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn region_capture_retries_desktop_direct_path_after_mode_change() -> CaptureResult<()> {
+        let desktop_calls = Arc::new(Mutex::new(0usize));
+        let region_calls = Arc::new(Mutex::new(0usize));
+        let monitor = MonitorId::from_parts(1, 2, 0, "mock-monitor", true);
+        let backend: Arc<dyn CaptureBackend> = Arc::new(DirectRegionBackend {
+            monitor: monitor.clone(),
+            desktop_calls: Arc::clone(&desktop_calls),
+            region_calls: Arc::clone(&region_calls),
+            supports_desktop_direct: false,
+            desktop_should_error: false,
+        });
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        session.layout = Some(mock_layout(&monitor, 0, 0, 1920, 1080));
+
+        let target = CaptureTarget::Region(CaptureRegion::new(100, 50, 640, 360)?);
+        let _first = session.capture_frame(&target)?;
+        session.set_capture_mode(CaptureMode::ScreenRecording);
+        let _second = session.capture_frame(&target)?;
+
+        assert_eq!(*desktop_calls.lock().unwrap(), 2);
+        assert_eq!(*region_calls.lock().unwrap(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn region_capture_skips_desktop_direct_path_for_multi_monitor_regions() -> CaptureResult<()> {
+        let desktop_calls = Arc::new(Mutex::new(0usize));
+        let region_calls = Arc::new(Mutex::new(0usize));
+        let first_monitor = MonitorId::from_parts(1, 2, 0, "mock-monitor-a", true);
+        let second_monitor = MonitorId::from_parts(1, 2, 1, "mock-monitor-b", false);
+        let backend: Arc<dyn CaptureBackend> = Arc::new(DirectRegionBackend {
+            monitor: first_monitor.clone(),
+            desktop_calls: Arc::clone(&desktop_calls),
+            region_calls: Arc::clone(&region_calls),
+            supports_desktop_direct: true,
+            desktop_should_error: false,
+        });
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        session.layout = Some(MonitorLayout {
+            monitors: vec![
+                crate::region::MonitorGeometry {
+                    monitor: first_monitor,
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 480,
+                },
+                crate::region::MonitorGeometry {
+                    monitor: second_monitor,
+                    x: 640,
+                    y: 0,
+                    width: 640,
+                    height: 480,
+                },
+            ],
+            virtual_left: 0,
+            virtual_top: 0,
+            virtual_width: 1280,
+            virtual_height: 480,
+        });
+
+        let target = CaptureTarget::Region(CaptureRegion::new(0, 0, 1280, 480)?);
+        let _frame = session.capture_frame(&target)?;
+
+        assert_eq!(*desktop_calls.lock().unwrap(), 0);
+        assert_eq!(*region_calls.lock().unwrap(), 2);
         Ok(())
     }
 

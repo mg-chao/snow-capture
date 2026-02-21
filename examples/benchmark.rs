@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use snow_capture::backend::CaptureBackendKind;
@@ -81,6 +81,7 @@ struct Config {
     warmup_frames: usize,
     measure_frames: usize,
     rounds: usize,
+    sample_interval: Option<Duration>,
     backends: Vec<CaptureBackendKind>,
     target: BenchTarget,
     target_label_override: Option<String>,
@@ -324,6 +325,7 @@ fn parse_args() -> Result<Config> {
     let mut warmup_frames = DEFAULT_WARMUP_FRAMES;
     let mut measure_frames = DEFAULT_MEASURE_FRAMES;
     let mut rounds = DEFAULT_ROUNDS;
+    let mut sample_interval = None;
     let mut backends = vec![
         CaptureBackendKind::DxgiDuplication,
         CaptureBackendKind::WindowsGraphicsCapture,
@@ -351,6 +353,26 @@ fn parse_args() -> Result<Config> {
             }
             "--rounds" => {
                 rounds = parse_usize_arg("--rounds", args.get(i + 1).map(String::as_str))?;
+                i += 2;
+            }
+            "--sample-interval-ms" => {
+                let raw_value =
+                    parse_f64_arg("--sample-interval-ms", args.get(i + 1).map(String::as_str))?;
+                if !raw_value.is_finite() {
+                    bail!("--sample-interval-ms must be a finite number");
+                }
+                if raw_value < 0.0 {
+                    bail!("--sample-interval-ms must be >= 0");
+                }
+                if raw_value > 0.0 {
+                    sample_interval = Some(
+                        Duration::try_from_secs_f64(raw_value / 1000.0).with_context(|| {
+                            format!("--sample-interval-ms is out of range: {raw_value}")
+                        })?,
+                    );
+                } else {
+                    sample_interval = None;
+                }
                 i += 2;
             }
             "--backends" => {
@@ -448,6 +470,7 @@ fn parse_args() -> Result<Config> {
   --warmup <n>               Warmup frames per backend (default: {DEFAULT_WARMUP_FRAMES})
   --frames <n>               Measured frames per backend (default: {DEFAULT_MEASURE_FRAMES})
   --rounds <n>               Benchmark rounds per backend (default: {DEFAULT_ROUNDS})
+  --sample-interval-ms <f>   Sleep this long after each capture sample (default: 0)
   --backends <csv>           Backends list, e.g. dxgi,wgc,gdi
   --window-under-cursor      Benchmark window capture for the window under the cursor
   --window-handle <value>    Benchmark window capture for an HWND (decimal or 0xHEX)
@@ -486,6 +509,7 @@ fn parse_args() -> Result<Config> {
         warmup_frames,
         measure_frames,
         rounds,
+        sample_interval,
         backends,
         target,
         target_label_override,
@@ -520,6 +544,7 @@ fn run_backend(
     warmup_frames: usize,
     measure_frames: usize,
     rounds: usize,
+    sample_interval: Option<Duration>,
     bench_target: &BenchTarget,
     target_label_override: Option<&str>,
 ) -> Result<BenchResult> {
@@ -548,6 +573,9 @@ fn run_backend(
             session
                 .capture_frame_into(&target, &mut frame)
                 .with_context(|| format!("warmup capture failed for {}", backend_name(kind)))?;
+            if let Some(interval) = sample_interval {
+                std::thread::sleep(interval);
+            }
         }
 
         for _ in 0..measure_frames {
@@ -558,6 +586,9 @@ fn run_backend(
             samples_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
             if frame.metadata.is_duplicate {
                 duplicate_samples = duplicate_samples.saturating_add(1);
+            }
+            if let Some(interval) = sample_interval {
+                std::thread::sleep(interval);
             }
         }
     }
@@ -815,11 +846,15 @@ fn print_results(results: &[BenchResult]) {
 fn main() -> Result<()> {
     let config = parse_args()?;
     println!(
-        "Running benchmark: target={} warmup={} frames={} rounds={} backends={} regression_metrics={} max_duplicate_pct={}",
+        "Running benchmark: target={} warmup={} frames={} rounds={} sample_interval_ms={} backends={} regression_metrics={} max_duplicate_pct={}",
         target_label(&config.target, config.target_label_override.as_deref()),
         config.warmup_frames,
         config.measure_frames,
         config.rounds,
+        config
+            .sample_interval
+            .map(|d| format!("{:.3}", d.as_secs_f64() * 1000.0))
+            .unwrap_or_else(|| "0".to_string()),
         config
             .backends
             .iter()
@@ -846,6 +881,7 @@ fn main() -> Result<()> {
             config.warmup_frames,
             config.measure_frames,
             config.rounds,
+            config.sample_interval,
             &config.target,
             config.target_label_override.as_deref(),
         )?;

@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -55,6 +55,28 @@ const WGC_QUERY_SPIN_MIN_POLLS: u32 = 2;
 const WGC_QUERY_SPIN_MAX_POLLS: u32 = 64;
 const WGC_QUERY_SPIN_INITIAL_POLLS: u32 = 4;
 const WGC_QUERY_SPIN_INCREASE_STEP: u32 = 4;
+
+#[inline]
+fn env_var_truthy(var_name: &'static str) -> bool {
+    std::env::var(var_name)
+        .map(|raw| {
+            let normalized = raw.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
+        })
+        .unwrap_or(false)
+}
+
+#[inline]
+fn region_dirty_gpu_copy_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_REGION_DIRTY_GPU_COPY"))
+}
+
+#[inline]
+fn duplicate_dirty_fastpath_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_DUPLICATE_DIRTY_FASTPATH"))
+}
 
 #[inline(always)]
 fn duration_saturating_add_clamped(base: Duration, delta: Duration, max: Duration) -> Duration {
@@ -1035,6 +1057,7 @@ impl WindowsGraphicsCaptureCapturer {
         slot_idx: usize,
         source_resource: &ID3D11Resource,
         blit: CaptureBlitRegion,
+        can_use_dirty_gpu_copy: bool,
     ) -> CaptureResult<()> {
         let staging_resource = self.region_slots[slot_idx]
             .staging_resource
@@ -1048,39 +1071,92 @@ impl WindowsGraphicsCaptureCapturer {
             .clone();
         let query = self.region_slots[slot_idx].query.clone();
 
-        let src_right = blit
-            .src_x
-            .checked_add(blit.width)
-            .ok_or(CaptureError::BufferOverflow)?;
-        let src_bottom = blit
-            .src_y
-            .checked_add(blit.height)
-            .ok_or(CaptureError::BufferOverflow)?;
-        let source_box = D3D11_BOX {
-            left: blit.src_x,
-            top: blit.src_y,
-            front: 0,
-            right: src_right,
-            bottom: src_bottom,
-            back: 1,
-        };
+        let mut used_dirty_copy = false;
+        if can_use_dirty_gpu_copy && region_dirty_gpu_copy_enabled() {
+            let use_dirty_copy = {
+                let slot = &self.region_slots[slot_idx];
+                slot.dirty_copy_preferred
+            };
 
-        unsafe {
-            self.context.CopySubresourceRegion(
-                &staging_resource,
-                0,
-                0,
-                0,
-                0,
-                source_resource,
-                0,
-                Some(&source_box),
-            );
-            if let Some(query) = query.as_ref() {
-                self.context.End(query);
+            if use_dirty_copy {
+                let slot = &self.region_slots[slot_idx];
+                for rect in &slot.dirty_rects {
+                    let source_left = blit
+                        .src_x
+                        .checked_add(rect.x)
+                        .ok_or(CaptureError::BufferOverflow)?;
+                    let source_top = blit
+                        .src_y
+                        .checked_add(rect.y)
+                        .ok_or(CaptureError::BufferOverflow)?;
+                    let source_right = source_left
+                        .checked_add(rect.width)
+                        .ok_or(CaptureError::BufferOverflow)?;
+                    let source_bottom = source_top
+                        .checked_add(rect.height)
+                        .ok_or(CaptureError::BufferOverflow)?;
+                    let source_box = D3D11_BOX {
+                        left: source_left,
+                        top: source_top,
+                        front: 0,
+                        right: source_right,
+                        bottom: source_bottom,
+                        back: 1,
+                    };
+                    unsafe {
+                        self.context.CopySubresourceRegion(
+                            &staging_resource,
+                            0,
+                            rect.x,
+                            rect.y,
+                            0,
+                            source_resource,
+                            0,
+                            Some(&source_box),
+                        );
+                    }
+                }
+                used_dirty_copy = true;
             }
         }
 
+        if !used_dirty_copy {
+            let src_right = blit
+                .src_x
+                .checked_add(blit.width)
+                .ok_or(CaptureError::BufferOverflow)?;
+            let src_bottom = blit
+                .src_y
+                .checked_add(blit.height)
+                .ok_or(CaptureError::BufferOverflow)?;
+            let source_box = D3D11_BOX {
+                left: blit.src_x,
+                top: blit.src_y,
+                front: 0,
+                right: src_right,
+                bottom: src_bottom,
+                back: 1,
+            };
+
+            unsafe {
+                self.context.CopySubresourceRegion(
+                    &staging_resource,
+                    0,
+                    0,
+                    0,
+                    0,
+                    source_resource,
+                    0,
+                    Some(&source_box),
+                );
+            }
+        }
+
+        if let Some(query) = query.as_ref() {
+            unsafe {
+                self.context.End(query);
+            }
+        }
         self.region_slots[slot_idx].populated = true;
         Ok(())
     }
@@ -1615,17 +1691,23 @@ impl WindowsGraphicsCaptureCapturer {
             }
 
             let region_desc = Self::region_desc_for_blit(&effective_desc, blit);
-            let region_dirty_available = extract_region_dirty_rects(
-                &capture_frame,
-                effective_desc.Width,
-                effective_desc.Height,
-                blit,
-                &mut region_dirty_rects,
-            );
-            if !region_dirty_available {
-                region_dirty_rects.clear();
-            }
-            let region_unchanged = region_dirty_available && region_dirty_rects.is_empty();
+            let (region_dirty_available, region_unchanged) =
+                if source_is_duplicate && duplicate_dirty_fastpath_enabled() {
+                    region_dirty_rects.clear();
+                    (true, true)
+                } else {
+                    let available = extract_region_dirty_rects(
+                        &capture_frame,
+                        effective_desc.Width,
+                        effective_desc.Height,
+                        blit,
+                        &mut region_dirty_rects,
+                    );
+                    if !available {
+                        region_dirty_rects.clear();
+                    }
+                    (available, available && region_dirty_rects.is_empty())
+                };
 
             if self.capture_mode != CaptureMode::ScreenRecording
                 && self.has_frame_history
@@ -1671,6 +1753,12 @@ impl WindowsGraphicsCaptureCapturer {
                 slot_idx
             } else {
                 self.ensure_region_slot(write_slot, &region_desc)?;
+                let can_use_dirty_gpu_copy = {
+                    let slot = &self.region_slots[write_slot];
+                    slot.populated
+                        && slot.present_time_ticks != 0
+                        && slot.present_time_ticks == previous_present_time
+                };
                 {
                     let slot = &mut self.region_slots[write_slot];
                     slot.capture_time = Some(capture_time);
@@ -1694,7 +1782,12 @@ impl WindowsGraphicsCaptureCapturer {
                     .cast()
                     .context("failed to cast WGC region source texture to ID3D11Resource")
                     .map_err(CaptureError::Platform)?;
-                self.copy_region_source_to_slot(write_slot, &source_resource, blit)?;
+                self.copy_region_source_to_slot(
+                    write_slot,
+                    &source_resource,
+                    blit,
+                    can_use_dirty_gpu_copy,
+                )?;
                 self.maybe_flush_region_after_submit(write_slot, read_slot);
                 read_slot
             };
@@ -1838,17 +1931,26 @@ impl WindowsGraphicsCaptureCapturer {
                     (frame_texture.clone(), src_desc, self.hdr_to_sdr)
                 };
 
-            let source_dirty_mode = extract_dirty_rects(
-                &capture_frame,
-                effective_desc.Width,
-                effective_desc.Height,
-                &mut source_dirty_rects,
-            );
-            let source_dirty_available = source_dirty_mode.is_some();
-            if !source_dirty_available {
-                source_dirty_rects.clear();
-            }
-            let source_unchanged = source_dirty_available && source_dirty_rects.is_empty();
+            let (source_dirty_available, source_unchanged) =
+                if source_is_duplicate && duplicate_dirty_fastpath_enabled() {
+                    source_dirty_rects.clear();
+                    (true, true)
+                } else {
+                    let source_dirty_mode = extract_dirty_rects(
+                        &capture_frame,
+                        effective_desc.Width,
+                        effective_desc.Height,
+                        &mut source_dirty_rects,
+                    );
+                    let source_dirty_available = source_dirty_mode.is_some();
+                    if !source_dirty_available {
+                        source_dirty_rects.clear();
+                    }
+                    (
+                        source_dirty_available,
+                        source_dirty_available && source_dirty_rects.is_empty(),
+                    )
+                };
 
             let emitted_duplicate = time_ticks != 0 && time_ticks == self.last_emitted_present_time;
             if self.capture_mode != CaptureMode::ScreenRecording

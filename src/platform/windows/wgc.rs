@@ -78,6 +78,12 @@ fn duplicate_dirty_fastpath_enabled() -> bool {
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_DUPLICATE_DIRTY_FASTPATH"))
 }
 
+#[inline]
+fn immediate_stale_return_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_IMMEDIATE_STALE_RETURN"))
+}
+
 #[inline(always)]
 fn duration_saturating_add_clamped(base: Duration, delta: Duration, max: Duration) -> Duration {
     base.checked_add(delta).unwrap_or(max).min(max)
@@ -807,6 +813,19 @@ impl WindowsGraphicsCaptureCapturer {
         allow_stale_return: bool,
     ) -> CaptureResult<Option<(Direct3D11CaptureFrame, i64)>> {
         if allow_stale_return {
+            // Low-latency polling path: when we already have a staged frame to
+            // reuse, avoid spending the stale timeout budget on every capture
+            // call. A single atomic/mutex check is enough; if a new frame lands
+            // right after this check we'll pick it up on the next call.
+            if immediate_stale_return_enabled() && self.pending_slot.is_some() {
+                if let Some(fresh) = self.try_take_latest_frame()? {
+                    self.relax_stale_timeout();
+                    return Ok(Some(fresh));
+                }
+                self.tighten_stale_timeout();
+                return Ok(None);
+            }
+
             if let Some(fresh) = self.poll_for_next_frame_stale(self.stale_frame_timeout)? {
                 self.relax_stale_timeout();
                 return Ok(Some(fresh));
@@ -829,6 +848,16 @@ impl WindowsGraphicsCaptureCapturer {
         allow_stale_return: bool,
     ) -> CaptureResult<Option<(Direct3D11CaptureFrame, i64)>> {
         if allow_stale_return {
+            // Mirror the full-frame low-latency path for region capture.
+            if immediate_stale_return_enabled() && self.region_pending_slot.is_some() {
+                if let Some(fresh) = self.try_take_latest_frame()? {
+                    self.relax_stale_timeout();
+                    return Ok(Some(fresh));
+                }
+                self.tighten_stale_timeout();
+                return Ok(None);
+            }
+
             let polled = self.poll_for_next_frame_stale(self.stale_frame_timeout)?;
             if polled.is_some() {
                 self.relax_stale_timeout();
@@ -1600,12 +1629,23 @@ impl WindowsGraphicsCaptureCapturer {
         let (capture_frame, time_ticks) = if let Some(capture) = maybe_capture {
             capture
         } else if let Some(slot_idx) = self.region_pending_slot {
-            let mut sample =
-                self.read_region_slot_into_output(slot_idx, out, destination_has_history, blit)?;
-            sample.capture_time = Some(capture_time);
-            sample.is_duplicate = true;
-            self.has_frame_history = true;
-            return Ok(sample);
+            match self.read_region_slot_into_output(slot_idx, out, destination_has_history, blit) {
+                Ok(mut sample) => {
+                    sample.capture_time = Some(capture_time);
+                    sample.is_duplicate = true;
+                    self.has_frame_history = true;
+                    return Ok(sample);
+                }
+                Err(_) => {
+                    self.reset_region_pipeline();
+                    self.has_frame_history = false;
+                    return Ok(CaptureSampleMetadata {
+                        capture_time: Some(capture_time),
+                        present_time_qpc: None,
+                        is_duplicate: true,
+                    });
+                }
+            }
         } else {
             return Ok(CaptureSampleMetadata {
                 capture_time: Some(capture_time),
@@ -1853,7 +1893,7 @@ impl WindowsGraphicsCaptureCapturer {
                 self.has_frame_history = true;
                 return Ok(out);
             }
-            self.has_frame_history = false;
+            self.reset_staging_pipeline();
             out.metadata.capture_time = Some(capture_time);
             out.metadata.is_duplicate = true;
             return Ok(out);

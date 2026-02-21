@@ -190,6 +190,23 @@ fn gdi_swap_history_surfaces_enabled() -> bool {
     })
 }
 
+#[inline]
+fn gdi_row_compare_unroll_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SNOW_CAPTURE_DISABLE_GDI_ROW_COMPARE_UNROLL")
+            .map(|raw| {
+                let normalized = raw.trim().to_ascii_lowercase();
+                !(normalized == "1"
+                    || normalized == "true"
+                    || normalized == "yes"
+                    || normalized == "on")
+            })
+            .unwrap_or(true)
+    })
+}
+
 const GDI_INCREMENTAL_MIN_PIXELS: usize = 160_000;
 const GDI_INCREMENTAL_MAX_DIRTY_ROW_NUMERATOR: usize = 3;
 const GDI_INCREMENTAL_MAX_DIRTY_ROW_DENOMINATOR: usize = 4;
@@ -198,6 +215,19 @@ const GDI_INCREMENTAL_MAX_DIRTY_ROW_DENOMINATOR: usize = 4;
 struct DirtyRowRun {
     start_row: usize,
     row_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IncrementalConvertStatus {
+    /// No usable history available yet (first frame or surface resize).
+    NotAvailable,
+    /// Incremental scan completed and found no changed rows.
+    Duplicate,
+    /// Incremental conversion completed with `dirty_rows` updated rows.
+    Updated(usize),
+    /// Incremental scan exceeded the dirty threshold; caller should fall
+    /// back to a full-frame conversion.
+    TooDirty,
 }
 
 type RowCompareKernel = unsafe fn(*const u8, *const u8, usize) -> bool;
@@ -212,11 +242,20 @@ fn row_compare_kernel() -> RowCompareKernel {
 fn select_row_compare_kernel() -> RowCompareKernel {
     #[cfg(target_arch = "x86_64")]
     {
+        let use_unrolled = gdi_row_compare_unroll_enabled();
         if std::arch::is_x86_feature_detected!("avx2") {
-            return row_equal_avx2;
+            return if use_unrolled {
+                row_equal_avx2_unrolled
+            } else {
+                row_equal_avx2_legacy
+            };
         }
         if std::arch::is_x86_feature_detected!("sse2") {
-            return row_equal_sse2;
+            return if use_unrolled {
+                row_equal_sse2_unrolled
+            } else {
+                row_equal_sse2_legacy
+            };
         }
     }
     row_equal_scalar
@@ -256,7 +295,7 @@ unsafe fn row_equal_scalar(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn row_equal_sse2(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
+unsafe fn row_equal_sse2_legacy(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
     use std::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
 
     let mut offset = 0usize;
@@ -274,8 +313,55 @@ unsafe fn row_equal_sse2(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn row_equal_sse2_unrolled(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
+    use std::arch::x86_64::{
+        __m128i, _mm_and_si128, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8,
+    };
+
+    let mut offset = 0usize;
+    while offset + 64 <= len {
+        let left0 = unsafe { _mm_loadu_si128(lhs.add(offset).cast::<__m128i>()) };
+        let right0 = unsafe { _mm_loadu_si128(rhs.add(offset).cast::<__m128i>()) };
+        let eq0 = _mm_cmpeq_epi8(left0, right0);
+        if _mm_movemask_epi8(eq0) != 0xFFFF_i32 {
+            return false;
+        }
+
+        let left1 = unsafe { _mm_loadu_si128(lhs.add(offset + 16).cast::<__m128i>()) };
+        let right1 = unsafe { _mm_loadu_si128(rhs.add(offset + 16).cast::<__m128i>()) };
+        let left2 = unsafe { _mm_loadu_si128(lhs.add(offset + 32).cast::<__m128i>()) };
+        let right2 = unsafe { _mm_loadu_si128(rhs.add(offset + 32).cast::<__m128i>()) };
+        let left3 = unsafe { _mm_loadu_si128(lhs.add(offset + 48).cast::<__m128i>()) };
+        let right3 = unsafe { _mm_loadu_si128(rhs.add(offset + 48).cast::<__m128i>()) };
+
+        let eq1 = _mm_cmpeq_epi8(left1, right1);
+        let eq2 = _mm_cmpeq_epi8(left2, right2);
+        let eq3 = _mm_cmpeq_epi8(left3, right3);
+        let eq12 = _mm_and_si128(eq1, eq2);
+        let eq123 = _mm_and_si128(eq12, eq3);
+        if _mm_movemask_epi8(eq123) != 0xFFFF_i32 {
+            return false;
+        }
+        offset += 64;
+    }
+
+    while offset + 16 <= len {
+        let left = unsafe { _mm_loadu_si128(lhs.add(offset).cast::<__m128i>()) };
+        let right = unsafe { _mm_loadu_si128(rhs.add(offset).cast::<__m128i>()) };
+        let equals = _mm_cmpeq_epi8(left, right);
+        if _mm_movemask_epi8(equals) != 0xFFFF_i32 {
+            return false;
+        }
+        offset += 16;
+    }
+
+    unsafe { row_equal_scalar(lhs.add(offset), rhs.add(offset), len - offset) }
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn row_equal_avx2(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
+unsafe fn row_equal_avx2_legacy(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
     use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
 
     let mut offset = 0usize;
@@ -284,6 +370,53 @@ unsafe fn row_equal_avx2(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
         let right = unsafe { _mm256_loadu_si256(rhs.add(offset).cast::<__m256i>()) };
         let equals = _mm256_cmpeq_epi8(left, right);
         if _mm256_movemask_epi8(equals) != -1 {
+            return false;
+        }
+        offset += 32;
+    }
+
+    unsafe { row_equal_scalar(lhs.add(offset), rhs.add(offset), len - offset) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn row_equal_avx2_unrolled(lhs: *const u8, rhs: *const u8, len: usize) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm256_loadu_si256, _mm256_or_si256, _mm256_testz_si256, _mm256_xor_si256,
+    };
+
+    let mut offset = 0usize;
+    while offset + 128 <= len {
+        let left0 = unsafe { _mm256_loadu_si256(lhs.add(offset).cast::<__m256i>()) };
+        let right0 = unsafe { _mm256_loadu_si256(rhs.add(offset).cast::<__m256i>()) };
+        let diff0 = _mm256_xor_si256(left0, right0);
+        if _mm256_testz_si256(diff0, diff0) == 0 {
+            return false;
+        }
+
+        let left1 = unsafe { _mm256_loadu_si256(lhs.add(offset + 32).cast::<__m256i>()) };
+        let right1 = unsafe { _mm256_loadu_si256(rhs.add(offset + 32).cast::<__m256i>()) };
+        let left2 = unsafe { _mm256_loadu_si256(lhs.add(offset + 64).cast::<__m256i>()) };
+        let right2 = unsafe { _mm256_loadu_si256(rhs.add(offset + 64).cast::<__m256i>()) };
+        let left3 = unsafe { _mm256_loadu_si256(lhs.add(offset + 96).cast::<__m256i>()) };
+        let right3 = unsafe { _mm256_loadu_si256(rhs.add(offset + 96).cast::<__m256i>()) };
+
+        let diff1 = _mm256_xor_si256(left1, right1);
+        let diff2 = _mm256_xor_si256(left2, right2);
+        let diff3 = _mm256_xor_si256(left3, right3);
+        let diff23 = _mm256_or_si256(diff2, diff3);
+        let diff_all = _mm256_or_si256(diff1, diff23);
+        if _mm256_testz_si256(diff_all, diff_all) == 0 {
+            return false;
+        }
+        offset += 128;
+    }
+
+    while offset + 32 <= len {
+        let left = unsafe { _mm256_loadu_si256(lhs.add(offset).cast::<__m256i>()) };
+        let right = unsafe { _mm256_loadu_si256(rhs.add(offset).cast::<__m256i>()) };
+        let diff = _mm256_xor_si256(left, right);
+        if _mm256_testz_si256(diff, diff) == 0 {
             return false;
         }
         offset += 32;
@@ -715,7 +848,7 @@ impl GdiResources {
         dst_pitch: usize,
         width: usize,
         height: usize,
-    ) -> CaptureResult<Option<bool>> {
+    ) -> CaptureResult<IncrementalConvertStatus> {
         let row_bytes = width.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
         if dst_pitch < row_bytes {
             return Err(CaptureError::BufferOverflow);
@@ -724,7 +857,7 @@ impl GdiResources {
             .checked_mul(height)
             .ok_or(CaptureError::BufferOverflow)?;
         if !self.ensure_bgra_history(total_bytes) {
-            return Ok(None);
+            return Ok(IncrementalConvertStatus::NotAvailable);
         }
 
         let history_ptr = self.bgra_history.as_mut_ptr();
@@ -738,14 +871,14 @@ impl GdiResources {
             },
         )?;
         let Some(dirty_rows) = dirty_rows else {
-            return Ok(None);
+            return Ok(IncrementalConvertStatus::TooDirty);
         };
         if dirty_rows == 0 {
-            return Ok(Some(true));
+            return Ok(IncrementalConvertStatus::Duplicate);
         }
 
         self.convert_dirty_row_runs_into(dst_ptr, dst_pitch, width)?;
-        Ok(Some(false))
+        Ok(IncrementalConvertStatus::Updated(dirty_rows))
     }
 
     fn try_convert_incremental_rows_with_surface_history_into(
@@ -754,13 +887,13 @@ impl GdiResources {
         dst_pitch: usize,
         width: usize,
         height: usize,
-    ) -> CaptureResult<Option<bool>> {
+    ) -> CaptureResult<IncrementalConvertStatus> {
         let row_bytes = width.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
         if dst_pitch < row_bytes {
             return Err(CaptureError::BufferOverflow);
         }
         if !self.history_surface_valid || self.history_bits.is_null() {
-            return Ok(None);
+            return Ok(IncrementalConvertStatus::NotAvailable);
         }
 
         let dirty_rows = self.scan_dirty_row_runs(
@@ -771,14 +904,14 @@ impl GdiResources {
             |_src_row, _history_row, _row_len| {},
         )?;
         let Some(dirty_rows) = dirty_rows else {
-            return Ok(None);
+            return Ok(IncrementalConvertStatus::TooDirty);
         };
         if dirty_rows == 0 {
-            return Ok(Some(true));
+            return Ok(IncrementalConvertStatus::Duplicate);
         }
 
         self.convert_dirty_row_runs_into(dst_ptr, dst_pitch, width)?;
-        Ok(Some(false))
+        Ok(IncrementalConvertStatus::Updated(dirty_rows))
     }
 
     fn commit_incremental_history(&mut self, total_bytes: usize) -> CaptureResult<()> {
@@ -836,7 +969,7 @@ impl GdiResources {
         let incremental_enabled = track_incremental_history && destination_has_history;
         let use_surface_history = track_incremental_history && gdi_swap_history_surfaces_enabled();
         if incremental_enabled {
-            let incremental_result = if use_surface_history {
+            let incremental_status = if use_surface_history {
                 self.try_convert_incremental_rows_with_surface_history_into(
                     frame.as_mut_rgba_ptr(),
                     dst_pitch,
@@ -851,15 +984,19 @@ impl GdiResources {
                     height,
                 )
             }?;
-            if let Some(is_duplicate) = incremental_result {
-                frame.metadata.is_duplicate = is_duplicate;
-                if use_surface_history
-                    && !is_duplicate
-                    && let Some(total_bytes) = total_bytes
-                {
-                    self.commit_incremental_history(total_bytes)?;
+
+            match incremental_status {
+                IncrementalConvertStatus::Duplicate => {
+                    frame.metadata.is_duplicate = true;
+                    return Ok(frame);
                 }
-                return Ok(frame);
+                IncrementalConvertStatus::Updated(_) => {
+                    if use_surface_history && let Some(total_bytes) = total_bytes {
+                        self.commit_incremental_history(total_bytes)?;
+                    }
+                    return Ok(frame);
+                }
+                IncrementalConvertStatus::NotAvailable | IncrementalConvertStatus::TooDirty => {}
             }
         }
 
@@ -1015,7 +1152,7 @@ impl GdiResources {
         let incremental_enabled = track_incremental_history && destination_has_history;
         let use_surface_history = track_incremental_history && gdi_swap_history_surfaces_enabled();
         if incremental_enabled {
-            let incremental_result = if use_surface_history {
+            let incremental_status = if use_surface_history {
                 self.try_convert_incremental_rows_with_surface_history_into(
                     dst_ptr, dst_pitch, copy_w, copy_h,
                 )
@@ -1024,14 +1161,16 @@ impl GdiResources {
                     dst_ptr, dst_pitch, copy_w, copy_h,
                 )
             }?;
-            if let Some(is_duplicate) = incremental_result {
-                if use_surface_history
-                    && !is_duplicate
-                    && let Some(total_bytes) = total_bytes
-                {
-                    self.commit_incremental_history(total_bytes)?;
+
+            match incremental_status {
+                IncrementalConvertStatus::Duplicate => return Ok(true),
+                IncrementalConvertStatus::Updated(_) => {
+                    if use_surface_history && let Some(total_bytes) = total_bytes {
+                        self.commit_incremental_history(total_bytes)?;
+                    }
+                    return Ok(false);
                 }
-                return Ok(is_duplicate);
+                IncrementalConvertStatus::NotAvailable | IncrementalConvertStatus::TooDirty => {}
             }
         }
 
@@ -1701,5 +1840,49 @@ mod tests {
         let scalar_diff = unsafe { row_equal_scalar(lhs.as_ptr(), rhs.as_ptr(), lhs.len()) };
         let kernel_diff = unsafe { kernel(lhs.as_ptr(), rhs.as_ptr(), lhs.len()) };
         assert_eq!(kernel_diff, scalar_diff);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn unrolled_simd_row_compare_matches_legacy_kernels() {
+        let mut lhs = vec![0u8; 8192];
+        for (idx, value) in lhs.iter_mut().enumerate() {
+            *value = (idx as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        let mut rhs = lhs.clone();
+
+        let test_lengths = [31usize, 64, 127, 255, 512, 1023, 4097, lhs.len()];
+        for &len in &test_lengths {
+            assert_eq!(
+                unsafe { row_equal_sse2_unrolled(lhs.as_ptr(), rhs.as_ptr(), len) },
+                unsafe { row_equal_sse2_legacy(lhs.as_ptr(), rhs.as_ptr(), len) }
+            );
+        }
+
+        rhs[2027] ^= 0x5A;
+        for &len in &test_lengths {
+            assert_eq!(
+                unsafe { row_equal_sse2_unrolled(lhs.as_ptr(), rhs.as_ptr(), len) },
+                unsafe { row_equal_sse2_legacy(lhs.as_ptr(), rhs.as_ptr(), len) }
+            );
+        }
+
+        if std::arch::is_x86_feature_detected!("avx2") {
+            rhs.copy_from_slice(&lhs);
+            for &len in &test_lengths {
+                assert_eq!(
+                    unsafe { row_equal_avx2_unrolled(lhs.as_ptr(), rhs.as_ptr(), len) },
+                    unsafe { row_equal_avx2_legacy(lhs.as_ptr(), rhs.as_ptr(), len) }
+                );
+            }
+
+            rhs[6015] ^= 0x31;
+            for &len in &test_lengths {
+                assert_eq!(
+                    unsafe { row_equal_avx2_unrolled(lhs.as_ptr(), rhs.as_ptr(), len) },
+                    unsafe { row_equal_avx2_legacy(lhs.as_ptr(), rhs.as_ptr(), len) }
+                );
+            }
+        }
     }
 }

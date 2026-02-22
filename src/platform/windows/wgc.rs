@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -86,6 +87,32 @@ struct RegionDirtyRectExtraction {
     available: bool,
     unchanged: bool,
     force_full_copy: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RegionClipBounds {
+    source_width: u32,
+    source_height: u32,
+    region_left: u32,
+    region_top: u32,
+    region_right: u32,
+    region_bottom: u32,
+}
+
+impl RegionClipBounds {
+    #[inline(always)]
+    fn new(source_width: u32, source_height: u32, region_bounds: DirtyRect) -> Option<Self> {
+        let region_right = region_bounds.x.checked_add(region_bounds.width)?;
+        let region_bottom = region_bounds.y.checked_add(region_bounds.height)?;
+        Some(Self {
+            source_width,
+            source_height,
+            region_left: region_bounds.x,
+            region_top: region_bounds.y,
+            region_right,
+            region_bottom,
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -304,26 +331,24 @@ fn clamp_dirty_region_rect(raw: RectInt32, width: u32, height: u32) -> Option<Di
 }
 
 #[inline(always)]
-fn clip_dirty_region_rect_to_region(
+fn clip_dirty_region_rect_to_region_fallback(
     raw: RectInt32,
-    source_width: u32,
-    source_height: u32,
-    region_bounds: DirtyRect,
+    bounds: RegionClipBounds,
 ) -> Option<DirtyRect> {
     if raw.Width <= 0 || raw.Height <= 0 {
         return None;
     }
 
-    let region_left = i64::from(region_bounds.x);
-    let region_top = i64::from(region_bounds.y);
-    let region_right = i64::from(region_bounds.x.saturating_add(region_bounds.width));
-    let region_bottom = i64::from(region_bounds.y.saturating_add(region_bounds.height));
+    let region_left = i64::from(bounds.region_left);
+    let region_top = i64::from(bounds.region_top);
+    let region_right = i64::from(bounds.region_right);
+    let region_bottom = i64::from(bounds.region_bottom);
     if region_left >= region_right || region_top >= region_bottom {
         return None;
     }
 
-    let source_right = i64::from(source_width);
-    let source_bottom = i64::from(source_height);
+    let source_right = i64::from(bounds.source_width);
+    let source_bottom = i64::from(bounds.source_height);
     if source_right <= 0 || source_bottom <= 0 {
         return None;
     }
@@ -354,6 +379,45 @@ fn clip_dirty_region_rect_to_region(
         y,
         width,
         height,
+    })
+}
+
+#[inline(always)]
+fn clip_dirty_region_rect_to_region_with_bounds(
+    raw: RectInt32,
+    bounds: RegionClipBounds,
+) -> Option<DirtyRect> {
+    if raw.Width <= 0 || raw.Height <= 0 {
+        return None;
+    }
+
+    if raw.X < 0 || raw.Y < 0 {
+        return clip_dirty_region_rect_to_region_fallback(raw, bounds);
+    }
+
+    let raw_x = raw.X as u32;
+    let raw_y = raw.Y as u32;
+    if raw_x >= bounds.source_width || raw_y >= bounds.source_height {
+        return None;
+    }
+
+    let raw_right = raw_x.saturating_add(raw.Width as u32);
+    let raw_bottom = raw_y.saturating_add(raw.Height as u32);
+    let clipped_left = raw_x.max(bounds.region_left);
+    let clipped_top = raw_y.max(bounds.region_top);
+    let clipped_right = raw_right.min(bounds.region_right).min(bounds.source_width);
+    let clipped_bottom = raw_bottom
+        .min(bounds.region_bottom)
+        .min(bounds.source_height);
+    if clipped_right <= clipped_left || clipped_bottom <= clipped_top {
+        return None;
+    }
+
+    Some(DirtyRect {
+        x: clipped_left.saturating_sub(bounds.region_left),
+        y: clipped_top.saturating_sub(bounds.region_top),
+        width: clipped_right.saturating_sub(clipped_left),
+        height: clipped_bottom.saturating_sub(clipped_top),
     })
 }
 
@@ -417,14 +481,17 @@ fn extract_dirty_rects(
     out.clear();
     let dense_fallback_enabled = full_dirty_dense_fallback_enabled();
     if !dense_fallback_enabled {
+        let mut sorted_hint = true;
+        let mut previous_rect = None;
         let mode = for_each_dirty_region(frame, |raw| {
             if let Some(clamped) = clamp_dirty_region_rect(raw, width, height) {
+                update_dirty_rect_sort_hint(&mut sorted_hint, &mut previous_rect, clamped);
                 out.push(clamped);
             }
             true
         })?;
 
-        normalize_dirty_rects_in_place(out, width, height);
+        normalize_dirty_rects_preclamped_in_place(out, width, height, sorted_hint);
         return Some(mode);
     }
 
@@ -471,7 +538,7 @@ fn extract_dirty_rects(
         return Some(mode);
     }
 
-    normalize_dirty_rects_in_place(out, width, height);
+    normalize_dirty_rects_preclamped_in_place(out, width, height, false);
     Some(mode)
 }
 
@@ -576,6 +643,30 @@ impl DirtyRectMergeCandidate {
     }
 }
 
+thread_local! {
+    static DIRTY_RECT_MERGE_SCRATCH: RefCell<Vec<DirtyRectMergeCandidate>> = const { RefCell::new(Vec::new()) };
+}
+
+#[inline(always)]
+fn dirty_rect_order_non_decreasing(previous: DirtyRect, current: DirtyRect) -> bool {
+    current.y > previous.y || (current.y == previous.y && current.x >= previous.x)
+}
+
+#[inline(always)]
+fn update_dirty_rect_sort_hint(
+    sorted: &mut bool,
+    previous: &mut Option<DirtyRect>,
+    current: DirtyRect,
+) {
+    if *sorted
+        && let Some(prev) = previous.as_ref().copied()
+        && !dirty_rect_order_non_decreasing(prev, current)
+    {
+        *sorted = false;
+    }
+    *previous = Some(current);
+}
+
 fn dirty_rects_can_merge(a: DirtyRect, b: DirtyRect) -> bool {
     DirtyRectMergeCandidate::new(a).can_merge(DirtyRectMergeCandidate::new(b))
 }
@@ -642,6 +733,109 @@ fn should_use_legacy_dense_merge(rects: &[DirtyRect]) -> bool {
     max_y.saturating_sub(min_y) <= WGC_DIRTY_RECT_DENSE_MERGE_LEGACY_MAX_VERTICAL_SPAN
 }
 
+fn normalize_dirty_rects_after_prepare_in_place(
+    pending: &mut Vec<DirtyRect>,
+    already_sorted_hint: bool,
+) {
+    if pending.len() <= 1 {
+        return;
+    }
+
+    if should_use_legacy_dense_merge(pending) {
+        normalize_dirty_rects_legacy_after_clamp(pending);
+        return;
+    }
+
+    debug_assert!(!already_sorted_hint || dirty_rects_sorted_by_y_then_x(pending));
+    if !already_sorted_hint && !dirty_rects_sorted_by_y_then_x(pending) {
+        pending.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
+    }
+
+    DIRTY_RECT_MERGE_SCRATCH.with(|scratch| {
+        let mut merged = scratch.borrow_mut();
+        merged.clear();
+        merged.reserve(pending.len());
+
+        for rect in pending.iter().copied() {
+            let mut candidate = DirtyRectMergeCandidate::new(rect);
+            loop {
+                let mut merged_any = false;
+                let mut candidate_bottom = candidate.bottom;
+                let mut idx = 0usize;
+                while idx < merged.len() {
+                    let existing = merged[idx];
+                    if existing.bottom < candidate.rect.y {
+                        idx += 1;
+                        continue;
+                    }
+                    if existing.rect.y > candidate_bottom {
+                        break;
+                    }
+
+                    if candidate.can_merge(existing) {
+                        candidate.merge_in_place(existing);
+                        candidate_bottom = candidate.bottom;
+                        // SAFETY: `idx` is bounded by the loop condition (`idx < merged.len()`).
+                        unsafe { remove_dirty_rect_candidate_at_unchecked(&mut merged, idx) };
+                        merged_any = true;
+                    } else {
+                        idx += 1;
+                    }
+                }
+
+                if !merged_any {
+                    break;
+                }
+            }
+
+            let insert_at = merged
+                .binary_search_by(|probe| {
+                    probe
+                        .rect
+                        .y
+                        .cmp(&candidate.rect.y)
+                        .then_with(|| probe.rect.x.cmp(&candidate.rect.x))
+                })
+                .unwrap_or_else(|pos| pos);
+            merged.insert(insert_at, candidate);
+        }
+
+        pending.clear();
+        pending.extend(merged.iter().map(|candidate| candidate.rect));
+        merged.clear();
+    });
+}
+
+#[inline(always)]
+fn normalize_dirty_rects_preclamped_in_place(
+    rects: &mut Vec<DirtyRect>,
+    width: u32,
+    height: u32,
+    already_sorted_hint: bool,
+) {
+    if rects.is_empty() {
+        return;
+    }
+
+    debug_assert!(rects.iter().all(|rect| {
+        rect.width > 0
+            && rect.height > 0
+            && rect
+                .x
+                .checked_add(rect.width)
+                .is_some_and(|right| right <= width)
+            && rect
+                .y
+                .checked_add(rect.height)
+                .is_some_and(|bottom| bottom <= height)
+    }));
+
+    let mut pending = std::mem::take(rects);
+    normalize_dirty_rects_after_prepare_in_place(&mut pending, already_sorted_hint);
+    *rects = pending;
+}
+
+#[cfg(test)]
 fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height: u32) {
     if rects.is_empty() {
         return;
@@ -656,67 +850,7 @@ fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height
         }
     }
     pending.truncate(write);
-    if pending.len() <= 1 {
-        *rects = pending;
-        return;
-    }
-
-    if should_use_legacy_dense_merge(&pending) {
-        *rects = pending;
-        normalize_dirty_rects_legacy_after_clamp(rects);
-        return;
-    }
-
-    if !dirty_rects_sorted_by_y_then_x(&pending) {
-        pending.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
-    }
-    let mut merged: Vec<DirtyRectMergeCandidate> = Vec::with_capacity(pending.len());
-    for rect in pending.iter().copied() {
-        let mut candidate = DirtyRectMergeCandidate::new(rect);
-        loop {
-            let mut merged_any = false;
-            let mut candidate_bottom = candidate.bottom;
-            let mut idx = 0usize;
-            while idx < merged.len() {
-                let existing = merged[idx];
-                if existing.bottom < candidate.rect.y {
-                    idx += 1;
-                    continue;
-                }
-                if existing.rect.y > candidate_bottom {
-                    break;
-                }
-
-                if candidate.can_merge(existing) {
-                    candidate.merge_in_place(existing);
-                    candidate_bottom = candidate.bottom;
-                    // SAFETY: `idx` is bounded by the loop condition (`idx < merged.len()`).
-                    unsafe { remove_dirty_rect_candidate_at_unchecked(&mut merged, idx) };
-                    merged_any = true;
-                } else {
-                    idx += 1;
-                }
-            }
-
-            if !merged_any {
-                break;
-            }
-        }
-
-        let insert_at = merged
-            .binary_search_by(|probe| {
-                probe
-                    .rect
-                    .y
-                    .cmp(&candidate.rect.y)
-                    .then_with(|| probe.rect.x.cmp(&candidate.rect.x))
-            })
-            .unwrap_or_else(|pos| pos);
-        merged.insert(insert_at, candidate);
-    }
-
-    pending.clear();
-    pending.extend(merged.into_iter().map(|candidate| candidate.rect));
+    normalize_dirty_rects_after_prepare_in_place(&mut pending, false);
     *rects = pending;
 }
 
@@ -813,6 +947,10 @@ fn extract_region_dirty_rects(
     ) else {
         return RegionDirtyRectExtraction::default();
     };
+    let Some(clip_bounds) = RegionClipBounds::new(source_width, source_height, region_bounds)
+    else {
+        return RegionDirtyRectExtraction::default();
+    };
 
     let dense_fallback_enabled = region_dirty_dense_fallback_enabled();
     let total_region_pixels =
@@ -820,15 +958,16 @@ fn extract_region_dirty_rects(
     let mut dense_fallback = false;
     let mut dirty_pixels = 0u64;
     let mut non_empty_rects = 0usize;
+    let track_sorted_hint = !dense_fallback_enabled;
+    let mut sorted_hint = track_sorted_hint;
+    let mut previous_rect = None;
 
     if for_each_dirty_region(frame, |raw| {
         if dense_fallback {
             return false;
         }
 
-        if let Some(clipped) =
-            clip_dirty_region_rect_to_region(raw, source_width, source_height, region_bounds)
-        {
+        if let Some(clipped) = clip_dirty_region_rect_to_region_with_bounds(raw, clip_bounds) {
             non_empty_rects = non_empty_rects.saturating_add(1);
             dirty_pixels = dirty_pixels
                 .saturating_add((clipped.width as u64).saturating_mul(clipped.height as u64));
@@ -847,6 +986,9 @@ fn extract_region_dirty_rects(
                 return false;
             }
 
+            if track_sorted_hint {
+                update_dirty_rect_sort_hint(&mut sorted_hint, &mut previous_rect, clipped);
+            }
             out.push(clipped);
         }
         true
@@ -872,7 +1014,12 @@ fn extract_region_dirty_rects(
         };
     }
 
-    normalize_dirty_rects_in_place(out, region_bounds.width, region_bounds.height);
+    normalize_dirty_rects_preclamped_in_place(
+        out,
+        region_bounds.width,
+        region_bounds.height,
+        track_sorted_hint && sorted_hint,
+    );
     RegionDirtyRectExtraction {
         available: true,
         unchanged: out.is_empty(),
@@ -3825,12 +3972,15 @@ mod tests {
     ) {
         out.clear();
         out.reserve(raw_rects.len());
+        let mut sorted_hint = true;
+        let mut previous_rect = None;
         for raw in raw_rects {
             if let Some(clamped) = clamp_dirty_region_rect(*raw, width, height) {
+                update_dirty_rect_sort_hint(&mut sorted_hint, &mut previous_rect, clamped);
                 out.push(clamped);
             }
         }
-        normalize_dirty_rects_in_place(out, width, height);
+        normalize_dirty_rects_preclamped_in_place(out, width, height, sorted_hint);
     }
 
     fn extract_region_raw_dirty_rects_legacy(
@@ -3900,20 +4050,26 @@ mod tests {
         ) else {
             return RegionDirtyRectExtraction::default();
         };
+        let Some(clip_bounds) = RegionClipBounds::new(source_width, source_height, region_bounds)
+        else {
+            return RegionDirtyRectExtraction::default();
+        };
 
         let total_region_pixels =
             (region_bounds.width as u64).saturating_mul(region_bounds.height as u64);
         let mut dense_fallback = false;
         let mut dirty_pixels = 0u64;
         let mut non_empty_rects = 0usize;
+        let track_sorted_hint = !dense_fallback_enabled;
+        let mut sorted_hint = track_sorted_hint;
+        let mut previous_rect = None;
         out.reserve(raw_rects.len());
 
         for raw in raw_rects {
             if dense_fallback {
                 break;
             }
-            let Some(clipped) =
-                clip_dirty_region_rect_to_region(*raw, source_width, source_height, region_bounds)
+            let Some(clipped) = clip_dirty_region_rect_to_region_with_bounds(*raw, clip_bounds)
             else {
                 continue;
             };
@@ -3932,6 +4088,9 @@ mod tests {
                 dense_fallback = true;
                 out.clear();
                 break;
+            }
+            if track_sorted_hint {
+                update_dirty_rect_sort_hint(&mut sorted_hint, &mut previous_rect, clipped);
             }
             out.push(clipped);
         }
@@ -3952,7 +4111,12 @@ mod tests {
             };
         }
 
-        normalize_dirty_rects_in_place(out, region_bounds.width, region_bounds.height);
+        normalize_dirty_rects_preclamped_in_place(
+            out,
+            region_bounds.width,
+            region_bounds.height,
+            track_sorted_hint && sorted_hint,
+        );
         RegionDirtyRectExtraction {
             available: true,
             unchanged: out.is_empty(),
@@ -3993,6 +4157,9 @@ mod tests {
         let mut dense_fallback = false;
         let mut dirty_pixels = 0u64;
         let mut non_empty_rects = 0usize;
+        let track_sorted_hint = !dense_fallback_enabled;
+        let mut sorted_hint = track_sorted_hint;
+        let mut previous_rect = None;
         out.reserve(raw_rects.len());
 
         for raw in raw_rects {
@@ -4027,6 +4194,9 @@ mod tests {
                 break;
             }
 
+            if track_sorted_hint {
+                update_dirty_rect_sort_hint(&mut sorted_hint, &mut previous_rect, clamped);
+            }
             out.push(clamped);
         }
 
@@ -4038,7 +4208,12 @@ mod tests {
             };
         }
 
-        normalize_dirty_rects_in_place(out, width, height);
+        normalize_dirty_rects_preclamped_in_place(
+            out,
+            width,
+            height,
+            track_sorted_hint && sorted_hint,
+        );
         RegionDirtyRectExtraction {
             available: true,
             unchanged: out.is_empty(),
@@ -4381,6 +4556,148 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn region_clip_fastpath_matches_fallback() {
+        let bounds = RegionClipBounds::new(
+            3840,
+            2160,
+            DirtyRect {
+                x: 320,
+                y: 180,
+                width: 1920,
+                height: 1080,
+            },
+        )
+        .expect("clip bounds must be valid");
+
+        let mut state = 0x243f_6a88_85a3_08d3_u64;
+        for case_idx in 0..4096 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let x = (((state >> 9) as i32) % 5200) - 900;
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let y = (((state >> 21) as i32) % 3200) - 500;
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let width = (((state >> 31) as i32) % 1800) - 120;
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let height = (((state >> 41) as i32) % 1400) - 120;
+            let raw = RectInt32 {
+                X: x,
+                Y: y,
+                Width: width,
+                Height: height,
+            };
+            let fallback = clip_dirty_region_rect_to_region_fallback(raw, bounds);
+            let optimized = clip_dirty_region_rect_to_region_with_bounds(raw, bounds);
+            assert_eq!(
+                optimized, fallback,
+                "clip mismatch in randomized case {case_idx}",
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "performance benchmark guard; run explicitly with --ignored --nocapture"]
+    fn bench_region_clip_fastpath_vs_fallback() {
+        use std::hint::black_box;
+
+        let bounds = RegionClipBounds::new(
+            3840,
+            2160,
+            DirtyRect {
+                x: 320,
+                y: 180,
+                width: 1920,
+                height: 1080,
+            },
+        )
+        .expect("clip bounds must be valid");
+
+        let mut predominantly_positive = row_major_raw_rects(0, 0, 48, 18, 24, 20, 12, 10, 640);
+        predominantly_positive.extend(row_major_raw_rects(1400, 620, 20, 10, 36, 24, 20, 12, 220));
+        let mut mixed_edges = row_major_raw_rects(-120, -80, 38, 16, 26, 18, 10, 12, 560);
+        mixed_edges.extend(row_major_raw_rects(3000, 1500, 16, 8, 64, 48, 28, 20, 220));
+
+        let mut random_workload = Vec::with_capacity(980);
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..980 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let x = (((state >> 7) as i32) % 5600) - 1000;
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let y = (((state >> 19) as i32) % 3400) - 700;
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let width = (((state >> 29) as i32) % 2100) - 160;
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let height = (((state >> 39) as i32) % 1500) - 140;
+            random_workload.push(RectInt32 {
+                X: x,
+                Y: y,
+                Width: width,
+                Height: height,
+            });
+        }
+
+        let workloads = vec![predominantly_positive, mixed_edges, random_workload];
+        for rects in &workloads {
+            for raw in rects {
+                let fallback = clip_dirty_region_rect_to_region_fallback(*raw, bounds);
+                let optimized = clip_dirty_region_rect_to_region_with_bounds(*raw, bounds);
+                assert_eq!(optimized, fallback);
+            }
+        }
+
+        let warmup_iters = 12_000usize;
+        let measure_iters = 120_000usize;
+        let mut sink = 0usize;
+
+        for iter in 0..warmup_iters {
+            let rects = black_box(&workloads[iter % workloads.len()]);
+            for raw in rects {
+                let fallback = clip_dirty_region_rect_to_region_fallback(*raw, bounds);
+                sink ^= fallback.map(|rect| rect.width as usize).unwrap_or(0);
+                let optimized = clip_dirty_region_rect_to_region_with_bounds(*raw, bounds);
+                sink ^= optimized.map(|rect| rect.height as usize).unwrap_or(0);
+            }
+        }
+
+        let fallback_start = std::time::Instant::now();
+        for iter in 0..measure_iters {
+            let rects = black_box(&workloads[iter % workloads.len()]);
+            for raw in rects {
+                let rect = clip_dirty_region_rect_to_region_fallback(*raw, bounds);
+                sink ^= rect.map(|r| r.width as usize).unwrap_or(0);
+            }
+        }
+        let fallback_elapsed = fallback_start.elapsed();
+
+        let optimized_start = std::time::Instant::now();
+        for iter in 0..measure_iters {
+            let rects = black_box(&workloads[iter % workloads.len()]);
+            for raw in rects {
+                let rect = clip_dirty_region_rect_to_region_with_bounds(*raw, bounds);
+                sink ^= rect.map(|r| r.height as usize).unwrap_or(0);
+            }
+        }
+        let optimized_elapsed = optimized_start.elapsed();
+
+        black_box(sink);
+
+        let fallback_ms = fallback_elapsed.as_secs_f64() * 1000.0;
+        let optimized_ms = optimized_elapsed.as_secs_f64() * 1000.0;
+        let speedup = if optimized_ms > 0.0 {
+            fallback_ms / optimized_ms
+        } else {
+            f64::INFINITY
+        };
+        println!(
+            "wgc region clip benchmark: fallback={fallback_ms:.3} ms optimized={optimized_ms:.3} ms speedup={speedup:.2}x"
+        );
+
+        assert!(
+            optimized_ms <= fallback_ms * 0.92,
+            "region clip fast path did not improve enough: fallback={fallback_ms:.3}ms optimized={optimized_ms:.3}ms ({speedup:.2}x)"
+        );
     }
 
     #[test]

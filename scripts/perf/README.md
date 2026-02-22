@@ -1,6 +1,6 @@
 # Capture perf guardrails
 
-This folder contains scripts and benchmark entry points used to validate backend-specific capture performance changes (GDI + WGC).
+This folder contains scripts and benchmark entry points used to validate backend-specific capture performance changes (GDI + WGC + DXGI).
 
 ## 1) Deterministic micro-benchmarks (CI-friendly)
 
@@ -23,6 +23,8 @@ cargo test --release platform::windows::gdi::tests::bench_parallel_span_auto_vs_
 cargo test --release platform::windows::gdi::tests::bench_parallel_span_auto_vs_compare_then_diff_duplicate_surface -- --ignored --nocapture
 cargo test --release platform::windows::wgc::tests::bench_dirty_region_rect_clamp_and_normalize_vs_legacy -- --ignored --nocapture
 cargo test --release platform::windows::wgc::tests::bench_region_dirty_dense_fallback_vs_legacy -- --ignored --nocapture
+cargo test --release platform::windows::surface::tests::bench_trusted_direct_hints_vs_runtime_scan -- --ignored --nocapture
+cargo test --release platform::windows::surface::tests::bench_trusted_direct_bgra_batch_kernel_vs_legacy_dispatch -- --ignored --nocapture
 ```
 
 The test prints timing and fails if the optimized path regresses materially versus legacy.
@@ -45,8 +47,6 @@ Useful options:
 - `-GuardBaselinePath <csv>`: enforce regression check against a saved baseline
 - `-MinImprovementPct <value>`: required p50 improvement vs legacy
 - `-MaxDuplicatePct <value>`: duplicate-frame budget guard for workload validity
-- Legacy toggle for dense region fallback: `SNOW_CAPTURE_WGC_DISABLE_REGION_DIRTY_DENSE_FALLBACK=1`
-- Legacy toggle for A/B: `SNOW_CAPTURE_DISABLE_GDI_SPAN_SINGLE_SCAN=1`
 
 ## 3) End-to-end display benchmark: WGC dirty-region batch fetch
 
@@ -66,3 +66,29 @@ Useful options:
 - `-GuardBaselinePath <csv>`: enforce regression check against a saved baseline
 - `-MinImprovementPct <value>`: required p50 improvement vs legacy
 - `-MaxDuplicatePct <value>`: duplicate-frame budget guard for workload validity
+
+## 4) End-to-end benchmark: DXGI window capture A/B
+
+Use the cross-backend benchmark example in DXGI window mode and compare optimized vs legacy toggles:
+
+```powershell
+# optimized
+cargo run --release --example benchmark -- --backends dxgi --window-under-cursor
+
+# legacy A/B (batch row-kernel dispatch)
+$env:SNOW_CAPTURE_DISABLE_DIRTY_RECT_BGRA_BATCH_KERNEL=1
+cargo run --release --example benchmark -- --backends dxgi --window-under-cursor
+Remove-Item Env:SNOW_CAPTURE_DISABLE_DIRTY_RECT_BGRA_BATCH_KERNEL
+```
+
+Optional regression guard with a saved baseline:
+
+```powershell
+cargo run --release --example benchmark -- --backends dxgi --window-under-cursor --save-baseline target/perf/dxgi-window-baseline.csv
+cargo run --release --example benchmark -- --backends dxgi --window-under-cursor --baseline target/perf/dxgi-window-baseline.csv --max-regression-pct 5 --regression-metrics p50,p95
+```
+
+Useful toggles for focused A/B:
+
+- `SNOW_CAPTURE_DISABLE_DIRTY_RECT_TRUSTED_DIRECT=1`: force the pre-batch trusted direct path
+- `SNOW_CAPTURE_DISABLE_DIRTY_RECT_BGRA_BATCH_KERNEL=1`: disable BGRA batch row-kernel dispatch

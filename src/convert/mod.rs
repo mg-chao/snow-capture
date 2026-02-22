@@ -960,6 +960,86 @@ fn bgra_nt_kernel_for_rows_nofence(dst: *const u8, dst_pitch: usize) -> Option<P
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct BgraDirtyRectKernel {
+    kernel: PixelKernel,
+    needs_post_fence: bool,
+}
+
+impl BgraDirtyRectKernel {
+    #[inline(always)]
+    fn run(self, src: *const u8, dst: *mut u8, pixel_count: usize) {
+        unsafe {
+            (self.kernel)(src, dst, pixel_count);
+        }
+    }
+
+    #[inline(always)]
+    fn needs_post_fence(self) -> bool {
+        self.needs_post_fence
+    }
+}
+
+#[inline]
+pub(crate) fn select_bgra_dirty_rect_kernel(
+    dst: *const u8,
+    dst_pitch: usize,
+    total_pixels: usize,
+    defer_nt_fence: bool,
+) -> BgraDirtyRectKernel {
+    if total_pixels >= NT_STORE_MIN_PIXELS {
+        let nt_kernel = bgra_nt_kernel_for_rows(dst, dst_pitch);
+        if let Some(kernel) = nt_kernel {
+            if defer_nt_fence
+                && batched_row_nt_fence_enabled()
+                && let Some(nofence_kernel) = bgra_nt_kernel_for_rows_nofence(dst, dst_pitch)
+            {
+                return BgraDirtyRectKernel {
+                    kernel: nofence_kernel,
+                    needs_post_fence: true,
+                };
+            }
+            return BgraDirtyRectKernel {
+                kernel,
+                needs_post_fence: false,
+            };
+        }
+    }
+
+    BgraDirtyRectKernel {
+        kernel: bgra_kernel(),
+        needs_post_fence: false,
+    }
+}
+
+#[inline(always)]
+pub(crate) unsafe fn convert_bgra_rows_with_kernel_unchecked(
+    kernel: BgraDirtyRectKernel,
+    src: *const u8,
+    src_pitch: usize,
+    dst: *mut u8,
+    dst_pitch: usize,
+    width: usize,
+    height: usize,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    for row in 0..height {
+        let row_src = unsafe { src.add(row * src_pitch) };
+        let row_dst = unsafe { dst.add(row * dst_pitch) };
+        kernel.run(row_src, row_dst, width);
+    }
+}
+
+#[inline(always)]
+pub(crate) fn finalize_bgra_dirty_rect_kernel(kernel: BgraDirtyRectKernel) {
+    if kernel.needs_post_fence() {
+        nt_store_sfence();
+    }
+}
+
 pub(crate) unsafe fn convert_surface_to_rgba_unchecked(
     format: SurfacePixelFormat,
     layout: SurfaceLayout,

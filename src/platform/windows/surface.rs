@@ -53,6 +53,7 @@ const DIRTY_RECT_PARALLEL_MIN_PIXELS: usize = 131_072;
 const DIRTY_RECT_PARALLEL_MIN_CHUNK_PIXELS: usize = 32_768;
 const DIRTY_RECT_PARALLEL_MAX_WORKERS: usize = 9;
 const DIRTY_RECT_PARALLEL_MIN_RECTS: usize = 4;
+const DIRTY_RECT_BATCH_FORCE_TEMPORAL_PIXELS: usize = 0;
 const D3D11_MAP_FLAG_DO_NOT_WAIT: u32 = 0x100000;
 const D3D11_MAP_SPIN_POLLS_DEFAULT: usize = 6;
 const D3D11_MAP_SPIN_POLLS_MIN: usize = 1;
@@ -276,6 +277,11 @@ fn dirty_rect_trusted_direct_enabled() -> bool {
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_DIRTY_RECT_TRUSTED_DIRECT"))
 }
 
+fn dirty_rect_bgra_batch_kernel_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_DIRTY_RECT_BGRA_BATCH_KERNEL"))
+}
+
 fn map_spin_wait_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_D3D11_MAP_SPIN_WAIT"))
@@ -461,6 +467,7 @@ unsafe fn build_dirty_rect_work_item_trusted(
 
 #[inline(always)]
 unsafe fn convert_dirty_rects_trusted_direct_unchecked(
+    format: SurfacePixelFormat,
     converter: convert::SurfaceRowConverter,
     src_base: *const u8,
     src_pitch: usize,
@@ -516,6 +523,8 @@ unsafe fn convert_dirty_rects_trusted_direct_unchecked(
         DIRTY_RECT_PARALLEL_MIN_CHUNK_PIXELS,
         DIRTY_RECT_PARALLEL_MAX_WORKERS,
     );
+    let use_bgra_batch_kernel =
+        format == SurfacePixelFormat::Bgra8 && dirty_rect_bgra_batch_kernel_enabled();
     let can_parallel = dirty_rect_parallel_enabled()
         && converted >= DIRTY_RECT_PARALLEL_MIN_RECTS
         && should_parallelize
@@ -527,6 +536,19 @@ unsafe fn convert_dirty_rects_trusted_direct_unchecked(
 
         let src_addr = src_base as usize;
         let dst_addr = dst_base as usize;
+        let bgra_kernel = if use_bgra_batch_kernel {
+            // Dirty-rect destinations can start at arbitrary x offsets, so we
+            // force the temporal kernel here and avoid NT alignment/fence
+            // assumptions that only hold for per-rect kernel selection.
+            Some(convert::select_bgra_dirty_rect_kernel(
+                dst_base as *const u8,
+                dst_pitch,
+                DIRTY_RECT_BATCH_FORCE_TEMPORAL_PIXELS,
+                false,
+            ))
+        } else {
+            None
+        };
         convert::with_conversion_pool(DIRTY_RECT_PARALLEL_MAX_WORKERS, || {
             dirty_rects.par_iter().for_each(|rect| {
                 let width = rect.width as usize;
@@ -540,14 +562,26 @@ unsafe fn convert_dirty_rects_trusted_direct_unchecked(
                 let src_offset = y * src_pitch + x * src_bytes_per_pixel;
                 let dst_offset = (dst_origin_y + y) * dst_pitch + (dst_origin_x + x) * 4;
                 unsafe {
-                    converter.convert_rows_unchecked(
-                        (src_addr + src_offset) as *const u8,
-                        src_pitch,
-                        (dst_addr + dst_offset) as *mut u8,
-                        dst_pitch,
-                        width,
-                        height,
-                    );
+                    if let Some(kernel) = bgra_kernel {
+                        convert::convert_bgra_rows_with_kernel_unchecked(
+                            kernel,
+                            (src_addr + src_offset) as *const u8,
+                            src_pitch,
+                            (dst_addr + dst_offset) as *mut u8,
+                            dst_pitch,
+                            width,
+                            height,
+                        );
+                    } else {
+                        converter.convert_rows_unchecked(
+                            (src_addr + src_offset) as *const u8,
+                            src_pitch,
+                            (dst_addr + dst_offset) as *mut u8,
+                            dst_pitch,
+                            width,
+                            height,
+                        );
+                    }
                 }
             });
         });
@@ -555,6 +589,18 @@ unsafe fn convert_dirty_rects_trusted_direct_unchecked(
     }
 
     let allow_inner_parallel = converted == 1;
+    let serial_bgra_kernel = if use_bgra_batch_kernel && !allow_inner_parallel {
+        // See `bgra_kernel` above: batch dispatch intentionally sticks to the
+        // temporal kernel because each dirty rect can have a distinct x offset.
+        Some(convert::select_bgra_dirty_rect_kernel(
+            dst_base as *const u8,
+            dst_pitch,
+            DIRTY_RECT_BATCH_FORCE_TEMPORAL_PIXELS,
+            true,
+        ))
+    } else {
+        None
+    };
     for rect in dirty_rects {
         let width = rect.width as usize;
         let height = rect.height as usize;
@@ -567,7 +613,17 @@ unsafe fn convert_dirty_rects_trusted_direct_unchecked(
         let src_offset = y * src_pitch + x * src_bytes_per_pixel;
         let dst_offset = (dst_origin_y + y) * dst_pitch + (dst_origin_x + x) * 4;
         unsafe {
-            if allow_inner_parallel {
+            if let Some(kernel) = serial_bgra_kernel {
+                convert::convert_bgra_rows_with_kernel_unchecked(
+                    kernel,
+                    src_base.add(src_offset),
+                    src_pitch,
+                    dst_base.add(dst_offset),
+                    dst_pitch,
+                    width,
+                    height,
+                );
+            } else if allow_inner_parallel {
                 converter.convert_rows_maybe_parallel_unchecked(
                     src_base.add(src_offset),
                     src_pitch,
@@ -587,6 +643,10 @@ unsafe fn convert_dirty_rects_trusted_direct_unchecked(
                 );
             }
         }
+    }
+
+    if let Some(kernel) = serial_bgra_kernel {
+        convert::finalize_bgra_dirty_rect_kernel(kernel);
     }
 
     Ok(converted)
@@ -968,6 +1028,7 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
             // in-bounds for both source and destination surfaces.
             return unsafe {
                 convert_dirty_rects_trusted_direct_unchecked(
+                    format,
                     converter,
                     src_base,
                     src_pitch,
@@ -1452,6 +1513,7 @@ mod tests {
         let mut direct = vec![0u8; dst_len];
         let converted = unsafe {
             convert_dirty_rects_trusted_direct_unchecked(
+                SurfacePixelFormat::Bgra8,
                 converter,
                 src.as_ptr(),
                 src_pitch,
@@ -1506,6 +1568,7 @@ mod tests {
         let mut baseline = vec![0u8; dst_len];
         let baseline_converted = unsafe {
             convert_dirty_rects_trusted_direct_unchecked(
+                SurfacePixelFormat::Bgra8,
                 converter,
                 src.as_ptr(),
                 src_pitch,
@@ -1525,6 +1588,7 @@ mod tests {
         let mut hinted = vec![0u8; dst_len];
         let hinted_converted = unsafe {
             convert_dirty_rects_trusted_direct_unchecked(
+                SurfacePixelFormat::Bgra8,
                 converter,
                 src.as_ptr(),
                 src_pitch,
@@ -1592,6 +1656,138 @@ mod tests {
         (non_empty, dirty_pixels)
     }
 
+    unsafe fn convert_dirty_rects_trusted_direct_legacy_unchecked(
+        converter: convert::SurfaceRowConverter,
+        src_base: *const u8,
+        src_pitch: usize,
+        src_bytes_per_pixel: usize,
+        dst_base: *mut u8,
+        dst_pitch: usize,
+        dirty_rects: &[DirtyRect],
+        dst_origin_x: usize,
+        dst_origin_y: usize,
+        hints: DirtyRectConversionHints,
+    ) -> CaptureResult<usize> {
+        let consistent_hints = match (hints.non_empty_rects, hints.total_dirty_pixels) {
+            (Some(non_empty_rects), Some(total_dirty_pixels))
+                if non_empty_rects <= dirty_rects.len()
+                    && ((non_empty_rects == 0 && total_dirty_pixels == 0)
+                        || (non_empty_rects > 0 && total_dirty_pixels > 0)) =>
+            {
+                Some((non_empty_rects, total_dirty_pixels))
+            }
+            _ => None,
+        };
+
+        let (converted, total_dirty_pixels) = if let Some(pair) = consistent_hints {
+            pair
+        } else {
+            let mut converted = 0usize;
+            let mut total_dirty_pixels = 0usize;
+            for rect in dirty_rects {
+                let width = rect.width as usize;
+                let height = rect.height as usize;
+                if width == 0 || height == 0 {
+                    continue;
+                }
+                let dirty_pixels = width
+                    .checked_mul(height)
+                    .ok_or(CaptureError::BufferOverflow)?;
+                total_dirty_pixels = total_dirty_pixels
+                    .checked_add(dirty_pixels)
+                    .ok_or(CaptureError::BufferOverflow)?;
+                converted = converted
+                    .checked_add(1)
+                    .ok_or(CaptureError::BufferOverflow)?;
+            }
+            (converted, total_dirty_pixels)
+        };
+        if converted == 0 || total_dirty_pixels == 0 {
+            return Ok(0);
+        }
+
+        let should_parallelize = convert::should_parallelize_work(
+            total_dirty_pixels,
+            DIRTY_RECT_PARALLEL_MIN_PIXELS,
+            DIRTY_RECT_PARALLEL_MIN_CHUNK_PIXELS,
+            DIRTY_RECT_PARALLEL_MAX_WORKERS,
+        );
+        let can_parallel = dirty_rect_parallel_enabled()
+            && converted >= DIRTY_RECT_PARALLEL_MIN_RECTS
+            && should_parallelize
+            && (dirty_rect_non_overlap_shortcut_enabled()
+                || dirty_rects_non_overlapping_checked(dirty_rects));
+
+        if can_parallel {
+            use rayon::prelude::*;
+
+            let src_addr = src_base as usize;
+            let dst_addr = dst_base as usize;
+            convert::with_conversion_pool(DIRTY_RECT_PARALLEL_MAX_WORKERS, || {
+                dirty_rects.par_iter().for_each(|rect| {
+                    let width = rect.width as usize;
+                    let height = rect.height as usize;
+                    if width == 0 || height == 0 {
+                        return;
+                    }
+
+                    let x = rect.x as usize;
+                    let y = rect.y as usize;
+                    let src_offset = y * src_pitch + x * src_bytes_per_pixel;
+                    let dst_offset = (dst_origin_y + y) * dst_pitch + (dst_origin_x + x) * 4;
+                    unsafe {
+                        converter.convert_rows_unchecked(
+                            (src_addr + src_offset) as *const u8,
+                            src_pitch,
+                            (dst_addr + dst_offset) as *mut u8,
+                            dst_pitch,
+                            width,
+                            height,
+                        );
+                    }
+                });
+            });
+            return Ok(converted);
+        }
+
+        let allow_inner_parallel = converted == 1;
+        for rect in dirty_rects {
+            let width = rect.width as usize;
+            let height = rect.height as usize;
+            if width == 0 || height == 0 {
+                continue;
+            }
+
+            let x = rect.x as usize;
+            let y = rect.y as usize;
+            let src_offset = y * src_pitch + x * src_bytes_per_pixel;
+            let dst_offset = (dst_origin_y + y) * dst_pitch + (dst_origin_x + x) * 4;
+            unsafe {
+                if allow_inner_parallel {
+                    converter.convert_rows_maybe_parallel_unchecked(
+                        src_base.add(src_offset),
+                        src_pitch,
+                        dst_base.add(dst_offset),
+                        dst_pitch,
+                        width,
+                        height,
+                    );
+                } else {
+                    converter.convert_rows_unchecked(
+                        src_base.add(src_offset),
+                        src_pitch,
+                        dst_base.add(dst_offset),
+                        dst_pitch,
+                        width,
+                        height,
+                    );
+                }
+            }
+        }
+
+        Ok(converted)
+    }
+
     #[test]
     #[ignore = "performance benchmark guard; run explicitly with --ignored --nocapture"]
     fn bench_trusted_direct_hints_vs_runtime_scan() {
@@ -1656,6 +1852,7 @@ mod tests {
             let mut hinted_out = vec![0u8; buffer_len];
             let converted_scan = unsafe {
                 convert_dirty_rects_trusted_direct_unchecked(
+                    SurfacePixelFormat::Bgra8,
                     converter,
                     src.as_ptr(),
                     src_pitch,
@@ -1671,6 +1868,7 @@ mod tests {
             .expect("scan conversion failed");
             let converted_hinted = unsafe {
                 convert_dirty_rects_trusted_direct_unchecked(
+                    SurfacePixelFormat::Bgra8,
                     converter,
                     src.as_ptr(),
                     src_pitch,
@@ -1703,6 +1901,7 @@ mod tests {
                 for iter in 0..ITERATIONS {
                     unsafe {
                         let converted = convert_dirty_rects_trusted_direct_unchecked(
+                            SurfacePixelFormat::Bgra8,
                             converter,
                             src.as_ptr(),
                             src_pitch,
@@ -1729,6 +1928,7 @@ mod tests {
                 for iter in 0..ITERATIONS {
                     unsafe {
                         let converted = convert_dirty_rects_trusted_direct_unchecked(
+                            SurfacePixelFormat::Bgra8,
                             converter,
                             src.as_ptr(),
                             src_pitch,
@@ -1784,6 +1984,206 @@ mod tests {
         assert!(
             regressions.is_empty(),
             "hinted trusted-direct path regressed:\n{}",
+            regressions.join("\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "performance benchmark guard; run explicitly with --ignored --nocapture"]
+    fn bench_trusted_direct_bgra_batch_kernel_vs_legacy_dispatch() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const WIDTH: usize = 1920;
+        const HEIGHT: usize = 1080;
+        const ROUNDS: usize = 6;
+        const ITERATIONS: usize = 2200;
+        const MAX_REGRESSION: f64 = 5.0;
+
+        let workloads = vec![
+            (
+                "ui_sparse_tiles_32",
+                row_major_rects(24, 18, 8, 4, 32, 28, 24, 18, 32),
+            ),
+            (
+                "chatty_small_updates_96",
+                row_major_rects(8, 8, 16, 6, 10, 8, 8, 6, 96),
+            ),
+            (
+                "wide_strip_updates_20",
+                row_major_rects(32, 24, 2, 10, 640, 18, 96, 10, 20),
+            ),
+            (
+                "dense_micro_tiles_180",
+                row_major_rects(6, 6, 30, 6, 8, 6, 4, 3, 180),
+            ),
+        ];
+
+        let src_pitch = WIDTH * 4;
+        let dst_pitch = WIDTH * 4;
+        let buffer_len = src_pitch * HEIGHT;
+        let mut src = vec![0u8; buffer_len];
+        for (idx, byte) in src.iter_mut().enumerate() {
+            *byte = (idx as u8).wrapping_mul(37).wrapping_add(11);
+        }
+
+        let converter = convert::SurfaceRowConverter::new(
+            SurfacePixelFormat::Bgra8,
+            SurfaceConversionOptions { hdr_to_sdr: None },
+        );
+
+        let mut regressions = Vec::new();
+        println!(
+            "trusted-dirty BGRA batch benchmark: rounds={} iterations={} max_regression={:.2}%",
+            ROUNDS, ITERATIONS, MAX_REGRESSION
+        );
+        println!(
+            "{:<28} {:>12} {:>12} {:>9} {:>11}",
+            "workload", "legacy_ms", "batch_ms", "speedup", "regression"
+        );
+
+        for (name, rects) in &workloads {
+            let (non_empty_rects, dirty_pixels) = dirty_rect_stats(rects);
+            let hints = DirtyRectConversionHints {
+                trusted_bounds: true,
+                non_empty_rects: Some(non_empty_rects),
+                total_dirty_pixels: Some(dirty_pixels),
+            };
+
+            let mut legacy_out = vec![0u8; buffer_len];
+            let mut optimized_out = vec![0u8; buffer_len];
+            let legacy_converted = unsafe {
+                convert_dirty_rects_trusted_direct_legacy_unchecked(
+                    converter,
+                    src.as_ptr(),
+                    src_pitch,
+                    4,
+                    legacy_out.as_mut_ptr(),
+                    dst_pitch,
+                    rects,
+                    0,
+                    0,
+                    hints,
+                )
+            }
+            .expect("legacy conversion failed");
+            let optimized_converted = unsafe {
+                convert_dirty_rects_trusted_direct_unchecked(
+                    SurfacePixelFormat::Bgra8,
+                    converter,
+                    src.as_ptr(),
+                    src_pitch,
+                    4,
+                    optimized_out.as_mut_ptr(),
+                    dst_pitch,
+                    rects,
+                    0,
+                    0,
+                    hints,
+                )
+            }
+            .expect("optimized conversion failed");
+            assert_eq!(
+                legacy_converted, optimized_converted,
+                "converted rect count mismatch for workload {name}",
+            );
+            assert_eq!(
+                legacy_out, optimized_out,
+                "legacy/optimized output mismatch for workload {name}",
+            );
+
+            let mut best_legacy = std::time::Duration::MAX;
+            let mut best_optimized = std::time::Duration::MAX;
+
+            for _round in 0..ROUNDS {
+                let mut legacy_checksum = 0u64;
+                let mut legacy_dst = vec![0u8; buffer_len];
+                let legacy_start = Instant::now();
+                for iter in 0..ITERATIONS {
+                    unsafe {
+                        let converted = convert_dirty_rects_trusted_direct_legacy_unchecked(
+                            converter,
+                            src.as_ptr(),
+                            src_pitch,
+                            4,
+                            legacy_dst.as_mut_ptr(),
+                            dst_pitch,
+                            rects,
+                            0,
+                            0,
+                            hints,
+                        )
+                        .expect("legacy benchmark conversion failed");
+                        legacy_checksum = legacy_checksum.wrapping_add(
+                            legacy_dst[(iter * 131 + converted) % legacy_dst.len()] as u64,
+                        );
+                    }
+                }
+                black_box(legacy_checksum);
+                best_legacy = best_legacy.min(legacy_start.elapsed());
+
+                let mut optimized_checksum = 0u64;
+                let mut optimized_dst = vec![0u8; buffer_len];
+                let optimized_start = Instant::now();
+                for iter in 0..ITERATIONS {
+                    unsafe {
+                        let converted = convert_dirty_rects_trusted_direct_unchecked(
+                            SurfacePixelFormat::Bgra8,
+                            converter,
+                            src.as_ptr(),
+                            src_pitch,
+                            4,
+                            optimized_dst.as_mut_ptr(),
+                            dst_pitch,
+                            rects,
+                            0,
+                            0,
+                            hints,
+                        )
+                        .expect("optimized benchmark conversion failed");
+                        optimized_checksum = optimized_checksum.wrapping_add(
+                            optimized_dst[(iter * 97 + converted) % optimized_dst.len()] as u64,
+                        );
+                    }
+                }
+                black_box(optimized_checksum);
+                best_optimized = best_optimized.min(optimized_start.elapsed());
+            }
+
+            let legacy_ms = best_legacy.as_secs_f64() * 1000.0;
+            let optimized_ms = best_optimized.as_secs_f64() * 1000.0;
+            let speedup = if optimized_ms > 0.0 {
+                legacy_ms / optimized_ms
+            } else {
+                f64::INFINITY
+            };
+            let delta_pct = if legacy_ms > 0.0 {
+                ((optimized_ms - legacy_ms) / legacy_ms) * 100.0
+            } else {
+                0.0
+            };
+            let regression = if delta_pct > MAX_REGRESSION {
+                "FAIL"
+            } else if delta_pct > 0.0 {
+                "warn"
+            } else {
+                "ok"
+            };
+            println!(
+                "{:<28} {:>12.3} {:>12.3} {:>8.2}x {:>11}",
+                name, legacy_ms, optimized_ms, speedup, regression
+            );
+            if delta_pct > MAX_REGRESSION {
+                regressions.push(format!(
+                    "{} regressed by {:.2}% (legacy {:.3} ms, optimized {:.3} ms)",
+                    name, delta_pct, legacy_ms, optimized_ms
+                ));
+            }
+        }
+
+        assert!(
+            regressions.is_empty(),
+            "BGRA dirty-rect batch kernel regressed:\n{}",
             regressions.join("\n")
         );
     }

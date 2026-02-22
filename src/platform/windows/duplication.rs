@@ -84,6 +84,18 @@ fn region_dirty_gpu_copy_enabled() -> bool {
 }
 
 #[inline]
+fn monitor_dirty_gpu_copy_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_MONITOR_DIRTY_GPU_COPY"))
+}
+
+#[inline]
+fn monitor_dirty_gpu_copy_force_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_var_truthy("SNOW_CAPTURE_DXGI_FORCE_MONITOR_DIRTY_GPU_COPY"))
+}
+
+#[inline]
 fn duplicate_dirty_fastpath_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_DUPLICATE_DIRTY_FASTPATH"))
@@ -1371,6 +1383,68 @@ impl StagingRing {
         Ok(())
     }
 
+    fn copy_source_to_slot(
+        &self,
+        context: &ID3D11DeviceContext,
+        source: &ID3D11Texture2D,
+        slot: usize,
+        dirty_rects: &[DirtyRect],
+        use_dirty_gpu_copy: bool,
+    ) -> CaptureResult<()> {
+        let staging_res = self.slot_resources[slot].as_ref().unwrap();
+        with_texture_resource(
+            source,
+            "failed to cast DXGI source texture to ID3D11Resource",
+            |source_res| {
+                if use_dirty_gpu_copy {
+                    for rect in dirty_rects {
+                        if rect.width == 0 || rect.height == 0 {
+                            continue;
+                        }
+                        let source_right = rect
+                            .x
+                            .checked_add(rect.width)
+                            .ok_or(CaptureError::BufferOverflow)?;
+                        let source_bottom = rect
+                            .y
+                            .checked_add(rect.height)
+                            .ok_or(CaptureError::BufferOverflow)?;
+                        let source_box = D3D11_BOX {
+                            left: rect.x,
+                            top: rect.y,
+                            front: 0,
+                            right: source_right,
+                            bottom: source_bottom,
+                            back: 1,
+                        };
+                        unsafe {
+                            context.CopySubresourceRegion(
+                                staging_res,
+                                0,
+                                rect.x,
+                                rect.y,
+                                0,
+                                source_res,
+                                0,
+                                Some(&source_box),
+                            );
+                        }
+                    }
+                } else {
+                    unsafe {
+                        context.CopyResource(staging_res, source_res);
+                    }
+                }
+                Ok(())
+            },
+        )?;
+
+        if let Some(ref query) = self.queries[slot] {
+            unsafe { context.End(query) };
+        }
+        Ok(())
+    }
+
     /// Submit a GPU copy from `source` into the current write slot.
     /// Returns the *read* slot index if there was a previous pending
     /// copy that can now be consumed.
@@ -1392,22 +1466,7 @@ impl StagingRing {
             self.write_idx
         };
 
-        let staging_res = self.slot_resources[write_idx].as_ref().unwrap();
-        with_texture_resource(
-            source,
-            "failed to cast DXGI source texture to ID3D11Resource",
-            |source_res| {
-                unsafe {
-                    context.CopyResource(staging_res, source_res);
-                }
-                Ok(())
-            },
-        )?;
-
-        // Signal the event query so we can poll for completion.
-        if let Some(ref query) = self.queries[write_idx] {
-            unsafe { context.End(query) };
-        }
+        self.copy_source_to_slot(context, source, write_idx, &[], false)?;
 
         // Only flush when there is a pending read slot whose query
         // hasn't completed yet.  This lets the driver batch the copy
@@ -1560,10 +1619,47 @@ impl StagingRing {
         }
     }
 
-    /// Synchronous single-shot: copy + flush + spin-wait + map + convert.
-    /// Used for the first frame or when we can't pipeline.  We still do
-    /// a short spin-wait after flushing to give the GPU a chance to
-    /// finish the copy before the blocking `Map()` call.
+    /// Synchronous single-shot capture.
+    ///
+    /// The call submits a GPU copy to the current slot, flushes the
+    /// command stream, then maps and converts into `frame`.
+    ///
+    /// `use_dirty_gpu_copy` controls whether the source upload uses
+    /// per-rect `CopySubresourceRegion` updates instead of `CopyResource`.
+    /// `use_dirty_cpu_copy` controls whether the CPU conversion path maps
+    /// only the provided dirty rectangles.
+    fn copy_and_read_with_strategy(
+        &mut self,
+        context: &ID3D11DeviceContext,
+        source: &ID3D11Texture2D,
+        desc: &D3D11_TEXTURE2D_DESC,
+        frame: &mut Frame,
+        hdr_to_sdr: Option<HdrToSdrParams>,
+        dirty_rects: &[DirtyRect],
+        dirty_total_pixels: u64,
+        use_dirty_cpu_copy: bool,
+        use_dirty_gpu_copy: bool,
+    ) -> CaptureResult<()> {
+        let slot = self.write_idx;
+        self.copy_source_to_slot(context, source, slot, dirty_rects, use_dirty_gpu_copy)?;
+        unsafe { context.Flush() };
+        self.read_slot_with_strategy(
+            context,
+            slot,
+            desc,
+            frame,
+            hdr_to_sdr,
+            dirty_rects,
+            dirty_total_pixels,
+            use_dirty_cpu_copy,
+            false,
+        )?;
+        self.pending = false;
+        self.read_idx = None;
+        Ok(())
+    }
+
+    /// Synchronous single-shot: full copy + map + convert.
     fn copy_and_read(
         &mut self,
         context: &ID3D11DeviceContext,
@@ -1572,57 +1668,17 @@ impl StagingRing {
         frame: &mut Frame,
         hdr_to_sdr: Option<HdrToSdrParams>,
     ) -> CaptureResult<()> {
-        let staging_res = self.slot_resources[self.write_idx].as_ref().unwrap();
-        with_texture_resource(
-            source,
-            "failed to cast DXGI source texture to ID3D11Resource",
-            |source_res| {
-                unsafe {
-                    context.CopyResource(staging_res, source_res);
-                }
-                Ok(())
-            },
-        )?;
-
-        // Signal the event query and flush to kick off the copy.
-        if let Some(ref query) = self.queries[self.write_idx] {
-            unsafe { context.End(query) };
-        }
-        unsafe { context.Flush() };
-
-        // Short spin-wait to avoid going straight into the blocking Map.
-        const FIRST_FRAME_SPIN: u32 = 8;
-        if let Some(ref query) = self.queries[self.write_idx] {
-            let mut data: u32 = 0;
-            for _ in 0..FIRST_FRAME_SPIN {
-                let hr = unsafe {
-                    context.GetData(
-                        query,
-                        Some(&mut data as *mut u32 as *mut _),
-                        std::mem::size_of::<u32>() as u32,
-                        0x1, // DO_NOT_FLUSH
-                    )
-                };
-                if hr.is_ok() {
-                    break;
-                }
-                std::hint::spin_loop();
-            }
-        }
-
-        let staging = self.slots[self.write_idx].as_ref().unwrap();
-        let staging_res = self.slot_resources[self.write_idx].as_ref();
-        surface::map_staging_to_frame(
+        self.copy_and_read_with_strategy(
             context,
-            staging,
-            staging_res,
+            source,
             desc,
             frame,
             hdr_to_sdr,
-            "failed to map staging texture",
-        )?;
-        self.pending = false;
-        Ok(())
+            &[],
+            0,
+            false,
+            false,
+        )
     }
 }
 
@@ -1789,6 +1845,52 @@ fn should_use_dirty_gpu_copy(rects: &[DirtyRect], width: u32, height: u32) -> bo
 #[cfg(test)]
 fn should_use_low_latency_dirty_gpu_copy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
     evaluate_dirty_copy_strategy(rects, width, height).gpu_low_latency
+}
+
+#[inline(always)]
+fn choose_monitor_low_latency_dirty_gpu_mode(
+    recording_mode: bool,
+    feature_enabled: bool,
+    force_enabled: bool,
+    mode_active: bool,
+    output_matches_source: bool,
+    frame_pixels_unchanged: bool,
+    dirty_gpu_preferred: bool,
+    low_latency_dirty_gpu_preferred: bool,
+) -> bool {
+    if !recording_mode || !feature_enabled || !output_matches_source {
+        return false;
+    }
+
+    if frame_pixels_unchanged {
+        return mode_active;
+    }
+
+    if force_enabled {
+        return dirty_gpu_preferred;
+    }
+
+    low_latency_dirty_gpu_preferred
+}
+
+#[inline(always)]
+fn should_use_monitor_low_latency_dirty_gpu_mode(
+    capture_mode: CaptureMode,
+    mode_active: bool,
+    output_matches_source: bool,
+    frame_pixels_unchanged: bool,
+    dirty_strategy: DirtyCopyStrategy,
+) -> bool {
+    choose_monitor_low_latency_dirty_gpu_mode(
+        capture_mode == CaptureMode::ScreenRecording,
+        monitor_dirty_gpu_copy_enabled(),
+        monitor_dirty_gpu_copy_force_enabled(),
+        mode_active,
+        output_matches_source,
+        frame_pixels_unchanged,
+        dirty_strategy.gpu,
+        dirty_strategy.gpu_low_latency,
+    )
 }
 
 #[inline(always)]
@@ -2037,6 +2139,14 @@ struct OutputCapturer {
     /// Pre-computed dirty-copy strategy for `pending_dirty_rects`.
     pending_dirty_cpu_copy_preferred: bool,
     pending_dirty_total_pixels: u64,
+    /// Whether monitor capture is currently using the single-slot
+    /// low-latency dirty GPU copy path.
+    monitor_low_latency_dirty_gpu_active: bool,
+    /// Whether slot 0 contains a complete monitor frame for incremental
+    /// dirty GPU updates.
+    monitor_low_latency_dirty_gpu_primed: bool,
+    /// Descriptor key for the primed low-latency monitor slot.
+    monitor_low_latency_dirty_gpu_desc: Option<(u32, u32, DXGI_FORMAT)>,
     /// Cached descriptor of the desktop texture from the duplication
     /// interface.  DXGI duplication textures don't change format/size
     /// mid-session, so we only need to query once (and re-query after
@@ -2102,6 +2212,9 @@ impl OutputCapturer {
             pending_dirty_rects: Vec::new(),
             pending_dirty_cpu_copy_preferred: false,
             pending_dirty_total_pixels: 0,
+            monitor_low_latency_dirty_gpu_active: false,
+            monitor_low_latency_dirty_gpu_primed: false,
+            monitor_low_latency_dirty_gpu_desc: None,
             cached_src_desc: None,
             spare_frame: None,
             region_slots: std::array::from_fn(|_| RegionStagingSlot::default()),
@@ -2134,6 +2247,9 @@ impl OutputCapturer {
         self.pending_dirty_rects.clear();
         self.pending_dirty_cpu_copy_preferred = false;
         self.pending_dirty_total_pixels = 0;
+        self.monitor_low_latency_dirty_gpu_active = false;
+        self.monitor_low_latency_dirty_gpu_primed = false;
+        self.monitor_low_latency_dirty_gpu_desc = None;
         self.cached_src_desc = None;
         self.invalidate_region_pipeline();
         self.dxgi_rect_buffer.clear();
@@ -2159,6 +2275,9 @@ impl OutputCapturer {
         self.pending_dirty_rects.clear();
         self.pending_dirty_cpu_copy_preferred = false;
         self.pending_dirty_total_pixels = 0;
+        self.monitor_low_latency_dirty_gpu_active = false;
+        self.monitor_low_latency_dirty_gpu_primed = false;
+        self.monitor_low_latency_dirty_gpu_desc = None;
         self.staging_ring.reset_pipeline();
         self.reset_region_pipeline();
     }
@@ -2620,6 +2739,9 @@ impl OutputCapturer {
         self.pending_dirty_rects.clear();
         self.pending_dirty_cpu_copy_preferred = false;
         self.pending_dirty_total_pixels = 0;
+        self.monitor_low_latency_dirty_gpu_active = false;
+        self.monitor_low_latency_dirty_gpu_primed = false;
+        self.monitor_low_latency_dirty_gpu_desc = None;
         self.staging_ring.reset_pipeline();
 
         let mut destination_has_history = destination_has_history;
@@ -2998,142 +3120,249 @@ impl OutputCapturer {
         let (effective_source, effective_desc, effective_hdr) =
             self.effective_source(&desktop_texture, src_desc)?;
 
-        // Ensure staging ring has matching textures.
-        if self.capture_mode == CaptureMode::ScreenRecording {
-            self.staging_ring
-                .ensure_slots(&self.device, &effective_desc, STAGING_SLOTS)?;
-            let frame_pixels_unchanged = frame.metadata.is_duplicate || source_unchanged;
-            let pending_slot_compatible = self.pending_desc.as_ref().is_some_and(|desc| {
-                desc.Width == effective_desc.Width
-                    && desc.Height == effective_desc.Height
-                    && desc.Format == effective_desc.Format
-            }) && self.pending_hdr == effective_hdr;
-            let skip_submit_copy = should_skip_screenrecord_submit_copy(
-                duplicate_fastpath,
-                pending_slot_compatible,
-                frame.metadata.is_duplicate,
-                source_unchanged,
+        let frame_pixels_unchanged = frame.metadata.is_duplicate || source_unchanged;
+        let output_matches_source = has_frame_history
+            && frame.width() == effective_desc.Width
+            && frame.height() == effective_desc.Height;
+
+        let mut normalized_dirty_rects = std::mem::take(&mut self.source_dirty_rects_scratch);
+        normalized_dirty_rects.clear();
+        let mut current_dirty_strategy = DirtyCopyStrategy::default();
+        if !frame_pixels_unchanged
+            && !frame.metadata.dirty_rects.is_empty()
+            && frame.metadata.dirty_rects.len() <= DXGI_DIRTY_COPY_MAX_RECTS
+        {
+            normalized_dirty_rects.extend_from_slice(&frame.metadata.dirty_rects);
+            normalize_dirty_rects_in_place(
+                &mut normalized_dirty_rects,
+                effective_desc.Width,
+                effective_desc.Height,
             );
+            current_dirty_strategy = evaluate_dirty_copy_strategy(
+                &normalized_dirty_rects,
+                effective_desc.Width,
+                effective_desc.Height,
+            );
+        }
 
-            let mut read_slot = self.staging_ring.latest_write_slot();
-            let mut read_desc = effective_desc;
-            let mut read_hdr = effective_hdr;
-            let mut read_is_duplicate = frame_pixels_unchanged;
-            let mut read_dirty_rects: &[DirtyRect] = &[];
-            let mut read_dirty_cpu_copy_preferred = false;
-            let mut read_dirty_total_pixels = 0u64;
+        let convert_result = (|| -> CaptureResult<()> {
+            if self.capture_mode == CaptureMode::ScreenRecording {
+                let use_monitor_low_latency_dirty_gpu =
+                    should_use_monitor_low_latency_dirty_gpu_mode(
+                        self.capture_mode,
+                        self.monitor_low_latency_dirty_gpu_active,
+                        output_matches_source,
+                        frame_pixels_unchanged,
+                        current_dirty_strategy,
+                    );
 
-            if skip_submit_copy {
-                if let Some(prev_desc) = self.pending_desc.as_ref() {
-                    read_desc = *prev_desc;
-                    read_hdr = self.pending_hdr;
-                    // The pending slot may still contain new pixels that
-                    // haven't been consumed yet (pipeline catch-up after a
-                    // non-duplicate frame). Respect its duplicate state.
-                    read_is_duplicate = self.pending_is_duplicate;
-                    read_dirty_rects = &self.pending_dirty_rects;
-                    read_dirty_cpu_copy_preferred = self.pending_dirty_cpu_copy_preferred;
-                    read_dirty_total_pixels = self.pending_dirty_total_pixels;
-                }
-            } else {
-                let submitted_read_slot = self
-                    .staging_ring
-                    .submit_copy(&self.context, &effective_source)?;
-                if let (Some(slot), Some(prev_desc)) =
-                    (submitted_read_slot, self.pending_desc.as_ref())
-                {
-                    // Read back the previous slot while the next copy is in flight.
-                    read_slot = slot;
-                    read_desc = *prev_desc;
-                    read_hdr = self.pending_hdr;
-                    read_is_duplicate = self.pending_is_duplicate;
-                    read_dirty_rects = &self.pending_dirty_rects;
-                    read_dirty_cpu_copy_preferred = self.pending_dirty_cpu_copy_preferred;
-                    read_dirty_total_pixels = self.pending_dirty_total_pixels;
+                if use_monitor_low_latency_dirty_gpu {
+                    if !self.monitor_low_latency_dirty_gpu_active {
+                        self.pending_desc = None;
+                        self.pending_hdr = None;
+                        self.pending_is_duplicate = false;
+                        self.pending_dirty_rects.clear();
+                        self.pending_dirty_cpu_copy_preferred = false;
+                        self.pending_dirty_total_pixels = 0;
+                        self.staging_ring.reset_pipeline();
+                        self.monitor_low_latency_dirty_gpu_primed = false;
+                        self.monitor_low_latency_dirty_gpu_desc = None;
+                    }
+                    self.monitor_low_latency_dirty_gpu_active = true;
+
+                    self.staging_ring
+                        .ensure_slots(&self.device, &effective_desc, 1)?;
+                    let desc_key = (
+                        effective_desc.Width,
+                        effective_desc.Height,
+                        effective_desc.Format,
+                    );
+                    if self.monitor_low_latency_dirty_gpu_desc != Some(desc_key) {
+                        self.monitor_low_latency_dirty_gpu_desc = Some(desc_key);
+                        self.monitor_low_latency_dirty_gpu_primed = false;
+                    }
+
+                    let skip_readback = output_matches_source && frame_pixels_unchanged;
+                    if !skip_readback {
+                        let use_dirty_gpu_copy = self.monitor_low_latency_dirty_gpu_primed
+                            && !normalized_dirty_rects.is_empty()
+                            && current_dirty_strategy.gpu;
+                        let use_dirty_cpu_copy = output_matches_source
+                            && !normalized_dirty_rects.is_empty()
+                            && current_dirty_strategy.cpu;
+                        self.staging_ring.copy_and_read_with_strategy(
+                            &self.context,
+                            &effective_source,
+                            &effective_desc,
+                            &mut frame,
+                            effective_hdr,
+                            &normalized_dirty_rects,
+                            current_dirty_strategy.dirty_pixels,
+                            use_dirty_cpu_copy,
+                            use_dirty_gpu_copy,
+                        )?;
+                        self.monitor_low_latency_dirty_gpu_primed = true;
+                    }
+
+                    self.pending_desc = None;
+                    self.pending_hdr = None;
+                    self.pending_is_duplicate = false;
+                    self.pending_dirty_rects.clear();
+                    self.pending_dirty_cpu_copy_preferred = false;
+                    self.pending_dirty_total_pixels = 0;
                 } else {
-                    // Bootstrap/desync path: read the freshly submitted slot.
-                    read_slot = self.staging_ring.latest_write_slot();
-                    read_desc = effective_desc;
-                    read_hdr = effective_hdr;
-                    read_is_duplicate = frame_pixels_unchanged;
+                    if self.monitor_low_latency_dirty_gpu_active {
+                        self.monitor_low_latency_dirty_gpu_active = false;
+                        self.monitor_low_latency_dirty_gpu_primed = false;
+                        self.monitor_low_latency_dirty_gpu_desc = None;
+                        self.staging_ring.reset_pipeline();
+                    }
+
+                    self.staging_ring
+                        .ensure_slots(&self.device, &effective_desc, STAGING_SLOTS)?;
+                    let pending_slot_compatible = self.pending_desc.as_ref().is_some_and(|desc| {
+                        desc.Width == effective_desc.Width
+                            && desc.Height == effective_desc.Height
+                            && desc.Format == effective_desc.Format
+                    }) && self.pending_hdr == effective_hdr;
+                    let skip_submit_copy = should_skip_screenrecord_submit_copy(
+                        duplicate_fastpath,
+                        pending_slot_compatible,
+                        frame.metadata.is_duplicate,
+                        source_unchanged,
+                    );
+
+                    let mut read_slot = self.staging_ring.latest_write_slot();
+                    let mut read_desc = effective_desc;
+                    let mut read_hdr = effective_hdr;
+                    let mut read_is_duplicate = frame_pixels_unchanged;
+                    let mut read_dirty_rects: &[DirtyRect] = &[];
+                    let mut read_dirty_cpu_copy_preferred = false;
+                    let mut read_dirty_total_pixels = 0u64;
+
+                    if skip_submit_copy {
+                        if let Some(prev_desc) = self.pending_desc.as_ref() {
+                            read_desc = *prev_desc;
+                            read_hdr = self.pending_hdr;
+                            // The pending slot may still contain new pixels that
+                            // haven't been consumed yet (pipeline catch-up after a
+                            // non-duplicate frame). Respect its duplicate state.
+                            read_is_duplicate = self.pending_is_duplicate;
+                            read_dirty_rects = &self.pending_dirty_rects;
+                            read_dirty_cpu_copy_preferred = self.pending_dirty_cpu_copy_preferred;
+                            read_dirty_total_pixels = self.pending_dirty_total_pixels;
+                        }
+                    } else {
+                        let submitted_read_slot = self
+                            .staging_ring
+                            .submit_copy(&self.context, &effective_source)?;
+                        if let (Some(slot), Some(prev_desc)) =
+                            (submitted_read_slot, self.pending_desc.as_ref())
+                        {
+                            // Read back the previous slot while the next copy is in flight.
+                            read_slot = slot;
+                            read_desc = *prev_desc;
+                            read_hdr = self.pending_hdr;
+                            read_is_duplicate = self.pending_is_duplicate;
+                            read_dirty_rects = &self.pending_dirty_rects;
+                            read_dirty_cpu_copy_preferred = self.pending_dirty_cpu_copy_preferred;
+                            read_dirty_total_pixels = self.pending_dirty_total_pixels;
+                        } else {
+                            // Bootstrap/desync path: read the freshly submitted slot.
+                            read_slot = self.staging_ring.latest_write_slot();
+                            read_desc = effective_desc;
+                            read_hdr = effective_hdr;
+                            read_is_duplicate = frame_pixels_unchanged;
+                        }
+                    }
+
+                    let read_output_matches_source = has_frame_history
+                        && frame.width() == read_desc.Width
+                        && frame.height() == read_desc.Height;
+                    let skip_readback = read_output_matches_source && read_is_duplicate;
+                    let use_dirty_copy = read_output_matches_source
+                        && !skip_readback
+                        && !read_dirty_rects.is_empty()
+                        && read_dirty_cpu_copy_preferred;
+                    self.staging_ring.read_slot_with_strategy(
+                        &self.context,
+                        read_slot,
+                        &read_desc,
+                        &mut frame,
+                        read_hdr,
+                        read_dirty_rects,
+                        read_dirty_total_pixels,
+                        use_dirty_copy,
+                        skip_readback,
+                    )?;
+
+                    if skip_submit_copy {
+                        // We intentionally kept the previous pending slot alive;
+                        // keep metadata aligned with that slot's unchanged contents.
+                        self.pending_is_duplicate = true;
+                        self.pending_dirty_rects.clear();
+                        self.pending_dirty_cpu_copy_preferred = false;
+                        self.pending_dirty_total_pixels = 0;
+                    } else {
+                        self.pending_desc = Some(effective_desc);
+                        self.pending_hdr = effective_hdr;
+                        self.pending_is_duplicate = frame_pixels_unchanged;
+                        self.pending_dirty_rects.clear();
+                        self.pending_dirty_cpu_copy_preferred = false;
+                        self.pending_dirty_total_pixels = 0;
+                        if !frame_pixels_unchanged && !normalized_dirty_rects.is_empty() {
+                            self.pending_dirty_rects
+                                .extend_from_slice(&normalized_dirty_rects);
+                            self.pending_dirty_cpu_copy_preferred = current_dirty_strategy.cpu;
+                            self.pending_dirty_total_pixels = current_dirty_strategy.dirty_pixels;
+                        }
+                    }
                 }
-            }
-
-            let output_matches_source = has_frame_history
-                && frame.width() == read_desc.Width
-                && frame.height() == read_desc.Height;
-            let skip_readback = output_matches_source && read_is_duplicate;
-            let use_dirty_copy = output_matches_source
-                && !skip_readback
-                && !read_dirty_rects.is_empty()
-                && read_dirty_cpu_copy_preferred;
-            self.staging_ring.read_slot_with_strategy(
-                &self.context,
-                read_slot,
-                &read_desc,
-                &mut frame,
-                read_hdr,
-                read_dirty_rects,
-                read_dirty_total_pixels,
-                use_dirty_copy,
-                skip_readback,
-            )?;
-
-            if skip_submit_copy {
-                // We intentionally kept the previous pending slot alive;
-                // keep metadata aligned with that slot's unchanged contents.
-                self.pending_is_duplicate = true;
-                self.pending_dirty_rects.clear();
-                self.pending_dirty_cpu_copy_preferred = false;
-                self.pending_dirty_total_pixels = 0;
             } else {
-                self.pending_desc = Some(effective_desc);
-                self.pending_hdr = effective_hdr;
-                self.pending_is_duplicate = frame_pixels_unchanged;
+                // Screenshot mode avoids recording-only buffering.
+                self.staging_ring
+                    .ensure_slots(&self.device, &effective_desc, 1)?;
+                self.pending_desc = None;
+                self.pending_hdr = None;
+                self.pending_is_duplicate = false;
                 self.pending_dirty_rects.clear();
                 self.pending_dirty_cpu_copy_preferred = false;
                 self.pending_dirty_total_pixels = 0;
-                if !frame_pixels_unchanged {
-                    self.pending_dirty_rects
-                        .extend_from_slice(&frame.metadata.dirty_rects);
-                    normalize_dirty_rects_in_place(
-                        &mut self.pending_dirty_rects,
-                        effective_desc.Width,
-                        effective_desc.Height,
-                    );
-                    let pending_dirty_strategy = evaluate_dirty_copy_strategy(
-                        &self.pending_dirty_rects,
-                        effective_desc.Width,
-                        effective_desc.Height,
-                    );
-                    self.pending_dirty_cpu_copy_preferred = pending_dirty_strategy.cpu;
-                    self.pending_dirty_total_pixels = pending_dirty_strategy.dirty_pixels;
-                }
+                self.monitor_low_latency_dirty_gpu_active = false;
+                self.monitor_low_latency_dirty_gpu_primed = false;
+                self.monitor_low_latency_dirty_gpu_desc = None;
+                self.staging_ring.reset_pipeline();
+                self.staging_ring.copy_and_read(
+                    &self.context,
+                    &effective_source,
+                    &effective_desc,
+                    &mut frame,
+                    effective_hdr,
+                )?;
             }
-        } else {
-            // Screenshot mode avoids recording-only buffering.
-            self.staging_ring
-                .ensure_slots(&self.device, &effective_desc, 1)?;
+            Ok(())
+        })();
+
+        normalized_dirty_rects.clear();
+        self.source_dirty_rects_scratch = normalized_dirty_rects;
+        unsafe {
+            self.duplication.ReleaseFrame().ok();
+        }
+        self.needs_presented_first_frame = false;
+        if let Err(err) = convert_result {
             self.pending_desc = None;
             self.pending_hdr = None;
             self.pending_is_duplicate = false;
             self.pending_dirty_rects.clear();
             self.pending_dirty_cpu_copy_preferred = false;
             self.pending_dirty_total_pixels = 0;
+            self.monitor_low_latency_dirty_gpu_active = false;
+            self.monitor_low_latency_dirty_gpu_primed = false;
+            self.monitor_low_latency_dirty_gpu_desc = None;
             self.staging_ring.reset_pipeline();
-            self.staging_ring.copy_and_read(
-                &self.context,
-                &effective_source,
-                &effective_desc,
-                &mut frame,
-                effective_hdr,
-            )?;
-        }
-        unsafe {
-            self.duplication.ReleaseFrame().ok();
+            return Err(err);
         }
 
-        self.needs_presented_first_frame = false;
         Ok(frame)
     }
 }
@@ -3680,6 +3909,36 @@ mod tests {
             DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS + 1
         ];
         assert!(!should_use_low_latency_dirty_gpu_copy(&rects, 1920, 1080));
+    }
+
+    #[test]
+    fn monitor_low_latency_dirty_gpu_mode_requires_recording_and_size_match() {
+        assert!(!choose_monitor_low_latency_dirty_gpu_mode(
+            false, true, false, false, true, false, true, true
+        ));
+        assert!(!choose_monitor_low_latency_dirty_gpu_mode(
+            true, true, false, false, false, false, true, true
+        ));
+    }
+
+    #[test]
+    fn monitor_low_latency_dirty_gpu_mode_sticks_for_duplicate_frames_when_active() {
+        assert!(choose_monitor_low_latency_dirty_gpu_mode(
+            true, true, false, true, true, true, false, false
+        ));
+        assert!(!choose_monitor_low_latency_dirty_gpu_mode(
+            true, true, false, false, true, true, false, false
+        ));
+    }
+
+    #[test]
+    fn monitor_low_latency_dirty_gpu_mode_force_flag_uses_regular_gpu_threshold() {
+        assert!(choose_monitor_low_latency_dirty_gpu_mode(
+            true, true, true, false, true, false, true, false
+        ));
+        assert!(!choose_monitor_low_latency_dirty_gpu_mode(
+            true, true, true, false, true, false, false, true
+        ));
     }
 
     fn test_blit(width: u32, height: u32) -> CaptureBlitRegion {
@@ -5011,6 +5270,208 @@ mod tests {
         assert!(
             optimized_ms <= legacy_ms * 1.03,
             "direct dirty extract path regressed: legacy={legacy_ms:.3}ms optimized={optimized_ms:.3}ms ({speedup:.2}x)"
+        );
+    }
+
+    #[test]
+    #[ignore = "performance benchmark guard; run explicitly with --ignored --nocapture"]
+    fn bench_monitor_dirty_gpu_copy_emulation_vs_full_copy() {
+        use std::hint::black_box;
+        use std::time::Duration;
+
+        const WIDTH: usize = 2560;
+        const HEIGHT: usize = 1440;
+        const WARMUP_ITERS: usize = 48;
+        const MEASURE_ITERS: usize = 280;
+
+        let pitch = WIDTH * 4;
+        let buffer_len = pitch * HEIGHT;
+        let dirty_rects = [
+            DirtyRect {
+                x: 0,
+                y: 0,
+                width: WIDTH as u32,
+                height: 24,
+            },
+            DirtyRect {
+                x: 0,
+                y: (HEIGHT - 24) as u32,
+                width: WIDTH as u32,
+                height: 24,
+            },
+            DirtyRect {
+                x: 0,
+                y: 32,
+                width: 24,
+                height: (HEIGHT - 64) as u32,
+            },
+            DirtyRect {
+                x: (WIDTH - 24) as u32,
+                y: 32,
+                width: 24,
+                height: (HEIGHT - 64) as u32,
+            },
+            DirtyRect {
+                x: 960,
+                y: 620,
+                width: 640,
+                height: 180,
+            },
+        ];
+
+        let converter = crate::convert::SurfaceRowConverter::new(
+            crate::convert::SurfacePixelFormat::Bgra8,
+            crate::convert::SurfaceConversionOptions::default(),
+        );
+
+        let mut previous_rgba = vec![0u8; buffer_len];
+        for (idx, byte) in previous_rgba.iter_mut().enumerate() {
+            *byte = (idx as u8).wrapping_mul(17).wrapping_add(91);
+        }
+
+        let mut source_rgba = vec![0u8; buffer_len];
+        let mut source_bgra = vec![0u8; buffer_len];
+        let mut staging_legacy = vec![0u8; buffer_len];
+        let mut staging_optimized = vec![0u8; buffer_len];
+        let mut output_legacy = previous_rgba.clone();
+        let mut output_optimized = previous_rgba.clone();
+
+        let seed_to_bgra = |src_rgba: &[u8], dst_bgra: &mut [u8]| {
+            dst_bgra.copy_from_slice(src_rgba);
+            for pixel in dst_bgra.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        };
+        seed_to_bgra(&previous_rgba, &mut staging_legacy);
+        staging_optimized.copy_from_slice(&staging_legacy);
+
+        let mut legacy_total = Duration::ZERO;
+        let mut optimized_total = Duration::ZERO;
+        let total_iters = WARMUP_ITERS + MEASURE_ITERS;
+        let mut sink = 0u64;
+
+        for iter in 0..total_iters {
+            source_rgba.copy_from_slice(output_legacy.as_slice());
+            for rect in &dirty_rects {
+                let x = rect.x as usize;
+                let y = rect.y as usize;
+                let width = rect.width as usize;
+                let height = rect.height as usize;
+                for row in 0..height {
+                    let row_offset = (y + row) * pitch + x * 4;
+                    for col in 0..width {
+                        let idx = row_offset + col * 4;
+                        source_rgba[idx] =
+                            (iter as u8).wrapping_mul(19).wrapping_add((idx / 4) as u8);
+                        source_rgba[idx + 1] =
+                            (iter as u8).wrapping_mul(11).wrapping_add((idx / 8) as u8);
+                        source_rgba[idx + 2] =
+                            (iter as u8).wrapping_mul(7).wrapping_add((idx / 16) as u8);
+                        source_rgba[idx + 3] = 0xFF;
+                    }
+                }
+            }
+            seed_to_bgra(&source_rgba, &mut source_bgra);
+
+            let legacy_start = std::time::Instant::now();
+            staging_legacy.copy_from_slice(&source_bgra);
+            unsafe {
+                let src_ptr = staging_legacy.as_ptr();
+                let dst_ptr = output_legacy.as_mut_ptr();
+                for rect in &dirty_rects {
+                    let x = rect.x as usize;
+                    let y = rect.y as usize;
+                    let width = rect.width as usize;
+                    let height = rect.height as usize;
+                    let src_offset = y * pitch + x * 4;
+                    let dst_offset = src_offset;
+                    converter.convert_rows_unchecked(
+                        src_ptr.add(src_offset),
+                        pitch,
+                        dst_ptr.add(dst_offset),
+                        pitch,
+                        width,
+                        height,
+                    );
+                }
+            }
+            let legacy_elapsed = legacy_start.elapsed();
+
+            let optimized_start = std::time::Instant::now();
+            unsafe {
+                let src_ptr = source_bgra.as_ptr();
+                let staging_ptr = staging_optimized.as_mut_ptr();
+                for rect in &dirty_rects {
+                    let x = rect.x as usize;
+                    let y = rect.y as usize;
+                    let width = rect.width as usize;
+                    let height = rect.height as usize;
+                    let row_bytes = width * 4;
+                    for row in 0..height {
+                        let offset = (y + row) * pitch + x * 4;
+                        std::ptr::copy_nonoverlapping(
+                            src_ptr.add(offset),
+                            staging_ptr.add(offset),
+                            row_bytes,
+                        );
+                    }
+                }
+
+                let stage_ptr = staging_optimized.as_ptr();
+                let dst_ptr = output_optimized.as_mut_ptr();
+                for rect in &dirty_rects {
+                    let x = rect.x as usize;
+                    let y = rect.y as usize;
+                    let width = rect.width as usize;
+                    let height = rect.height as usize;
+                    let src_offset = y * pitch + x * 4;
+                    let dst_offset = src_offset;
+                    converter.convert_rows_unchecked(
+                        stage_ptr.add(src_offset),
+                        pitch,
+                        dst_ptr.add(dst_offset),
+                        pitch,
+                        width,
+                        height,
+                    );
+                }
+            }
+            let optimized_elapsed = optimized_start.elapsed();
+
+            if iter >= WARMUP_ITERS {
+                legacy_total += legacy_elapsed;
+                optimized_total += optimized_elapsed;
+            }
+
+            assert_eq!(
+                output_optimized, output_legacy,
+                "monitor dirty-gpu emulation mismatch at iteration {iter}"
+            );
+            assert_eq!(
+                staging_optimized, staging_legacy,
+                "staging dirty-gpu emulation mismatch at iteration {iter}"
+            );
+
+            sink ^= output_legacy[(iter * 131) % output_legacy.len()] as u64;
+            sink ^= staging_optimized[(iter * 89) % staging_optimized.len()] as u64;
+        }
+        black_box(sink);
+
+        let legacy_ms = legacy_total.as_secs_f64() * 1000.0;
+        let optimized_ms = optimized_total.as_secs_f64() * 1000.0;
+        let speedup = if optimized_ms > 0.0 {
+            legacy_ms / optimized_ms
+        } else {
+            0.0
+        };
+
+        println!(
+            "dxgi monitor dirty-gpu benchmark: full-copy={legacy_ms:.3} ms dirty-copy={optimized_ms:.3} ms speedup={speedup:.2}x"
+        );
+
+        assert!(
+            optimized_ms <= legacy_ms * 1.05,
+            "monitor dirty-gpu path regressed beyond tolerance: full-copy={legacy_ms:.3}ms dirty-copy={optimized_ms:.3}ms ({speedup:.2}x)"
         );
     }
 

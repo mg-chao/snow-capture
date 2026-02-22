@@ -502,6 +502,12 @@ Tip: compare DXGI BGRA dirty-rect batch row-kernel path in window mode:
   legacy (cmd.exe):    setlocal && set SNOW_CAPTURE_DISABLE_DIRTY_RECT_BGRA_BATCH_KERNEL=1 && cargo run --release --example benchmark -- --backends dxgi --window-under-cursor && endlocal
   legacy (bash):       SNOW_CAPTURE_DISABLE_DIRTY_RECT_BGRA_BATCH_KERNEL=1 cargo run --release --example benchmark -- --backends dxgi --window-under-cursor
 
+Tip: compare DXGI region move-rect reconstruction in window mode:
+  optimized: cargo run --release --example benchmark -- --backends dxgi --window-under-cursor
+  legacy (PowerShell): $env:SNOW_CAPTURE_DXGI_DISABLE_REGION_MOVE_RECONSTRUCT=1; cargo run --release --example benchmark -- --backends dxgi --window-under-cursor; Remove-Item Env:SNOW_CAPTURE_DXGI_DISABLE_REGION_MOVE_RECONSTRUCT
+  legacy (cmd.exe):    setlocal && set SNOW_CAPTURE_DXGI_DISABLE_REGION_MOVE_RECONSTRUCT=1 && cargo run --release --example benchmark -- --backends dxgi --window-under-cursor && endlocal
+  legacy (bash):       SNOW_CAPTURE_DXGI_DISABLE_REGION_MOVE_RECONSTRUCT=1 cargo run --release --example benchmark -- --backends dxgi --window-under-cursor
+
 Tip: compare WGC dirty-rect conversion hints in window mode:
   optimized: cargo run --release --example benchmark -- --backends wgc --window-under-cursor
   legacy (PowerShell): $env:SNOW_CAPTURE_WGC_DISABLE_DIRTY_HINTS=1; cargo run --release --example benchmark -- --backends wgc --window-under-cursor; Remove-Item Env:SNOW_CAPTURE_WGC_DISABLE_DIRTY_HINTS

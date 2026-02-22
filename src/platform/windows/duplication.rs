@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
-    DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
+    DXGI_OUTDUPL_MOVE_RECT, DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, IDXGIOutput, IDXGIOutput1, IDXGIOutput5,
     IDXGIOutputDuplication, IDXGIResource,
 };
@@ -55,6 +55,7 @@ const DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS_DEFAULT: u64 = 1_048_576;
 const DXGI_REGION_LOW_LATENCY_MAX_PIXELS_DEFAULT: u64 = 1_048_576;
 const DXGI_REGION_STAGING_SLOTS: usize = 3;
 const DXGI_REGION_DIRTY_TRACK_MAX_RECTS: usize = DXGI_DIRTY_COPY_MAX_RECTS + 1;
+const DXGI_REGION_MOVE_TRACK_MAX_RECTS: usize = DXGI_REGION_DIRTY_TRACK_MAX_RECTS;
 const DXGI_DIRTY_RECT_DENSE_MERGE_LEGACY_MIN_RECTS: usize = 64;
 const DXGI_DIRTY_RECT_DENSE_MERGE_LEGACY_MAX_VERTICAL_SPAN: u32 = 96;
 
@@ -93,6 +94,12 @@ fn region_direct_dirty_extract_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED
         .get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_DIRECT_EXTRACT"))
+}
+
+#[inline]
+fn region_move_reconstruct_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_REGION_MOVE_RECONSTRUCT"))
 }
 
 #[inline]
@@ -209,10 +216,12 @@ struct RegionStagingSlot {
     present_time_qpc: i64,
     is_duplicate: bool,
     dirty_mode_available: bool,
+    move_mode_available: bool,
     dirty_cpu_copy_preferred: bool,
     dirty_gpu_copy_preferred: bool,
     dirty_total_pixels: u64,
     dirty_rects: Vec<DirtyRect>,
+    move_rects: Vec<MoveRect>,
     populated: bool,
 }
 
@@ -224,10 +233,12 @@ impl RegionStagingSlot {
         self.present_time_qpc = 0;
         self.is_duplicate = false;
         self.dirty_mode_available = false;
+        self.move_mode_available = false;
         self.dirty_cpu_copy_preferred = false;
         self.dirty_gpu_copy_preferred = false;
         self.dirty_total_pixels = 0;
         self.dirty_rects.clear();
+        self.move_rects.clear();
         self.populated = false;
     }
 
@@ -261,6 +272,16 @@ fn clamp_dirty_rect(rect: DirtyRect, width: u32, height: u32) -> Option<DirtyRec
         width: clamped_w,
         height: clamped_h,
     })
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MoveRect {
+    src_x: u32,
+    src_y: u32,
+    dst_x: u32,
+    dst_y: u32,
+    width: u32,
+    height: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -420,6 +441,251 @@ fn extract_region_dirty_rects_from_raw_slice(
             height: clipped_bottom.saturating_sub(clipped_y),
         });
     }
+}
+
+#[inline(always)]
+fn clamp_move_rect_to_surface(
+    raw_rect: &DXGI_OUTDUPL_MOVE_RECT,
+    source_width: u32,
+    source_height: u32,
+) -> Option<MoveRect> {
+    let source_w = i64::from(source_width);
+    let source_h = i64::from(source_height);
+    if source_w <= 0 || source_h <= 0 {
+        return None;
+    }
+
+    let dest_left = i64::from(raw_rect.DestinationRect.left);
+    let dest_top = i64::from(raw_rect.DestinationRect.top);
+    let dest_right = i64::from(raw_rect.DestinationRect.right);
+    let dest_bottom = i64::from(raw_rect.DestinationRect.bottom);
+    if dest_right <= dest_left || dest_bottom <= dest_top {
+        return None;
+    }
+
+    let clipped_dest_left = dest_left.max(0);
+    let clipped_dest_top = dest_top.max(0);
+    let clipped_dest_right = dest_right.min(source_w);
+    let clipped_dest_bottom = dest_bottom.min(source_h);
+    if clipped_dest_right <= clipped_dest_left || clipped_dest_bottom <= clipped_dest_top {
+        return None;
+    }
+
+    let source_left =
+        i64::from(raw_rect.SourcePoint.x).saturating_add(clipped_dest_left - dest_left);
+    let source_top = i64::from(raw_rect.SourcePoint.y).saturating_add(clipped_dest_top - dest_top);
+    let source_right = source_left.saturating_add(clipped_dest_right - clipped_dest_left);
+    let source_bottom = source_top.saturating_add(clipped_dest_bottom - clipped_dest_top);
+
+    let clipped_source_left = source_left.max(0);
+    let clipped_source_top = source_top.max(0);
+    let clipped_source_right = source_right.min(source_w);
+    let clipped_source_bottom = source_bottom.min(source_h);
+    if clipped_source_right <= clipped_source_left || clipped_source_bottom <= clipped_source_top {
+        return None;
+    }
+
+    let adjusted_dest_left =
+        clipped_dest_left.saturating_add(clipped_source_left.saturating_sub(source_left));
+    let adjusted_dest_top =
+        clipped_dest_top.saturating_add(clipped_source_top.saturating_sub(source_top));
+    let width = clipped_source_right.saturating_sub(clipped_source_left);
+    let height = clipped_source_bottom.saturating_sub(clipped_source_top);
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    Some(MoveRect {
+        src_x: clipped_source_left as u32,
+        src_y: clipped_source_top as u32,
+        dst_x: adjusted_dest_left as u32,
+        dst_y: adjusted_dest_top as u32,
+        width: width as u32,
+        height: height as u32,
+    })
+}
+
+#[inline(always)]
+fn clip_and_rebase_region_move_rect(rect: MoveRect, bounds: RegionDirtyBounds) -> Option<MoveRect> {
+    let width = i64::from(rect.width);
+    let height = i64::from(rect.height);
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    let src_x = i64::from(rect.src_x);
+    let src_y = i64::from(rect.src_y);
+    let dst_x = i64::from(rect.dst_x);
+    let dst_y = i64::from(rect.dst_y);
+    let region_x = i64::from(bounds.region_x);
+    let region_y = i64::from(bounds.region_y);
+    let region_right = i64::from(bounds.region_right);
+    let region_bottom = i64::from(bounds.region_bottom);
+
+    let start_x = 0i64.max(region_x - dst_x).max(region_x - src_x);
+    let start_y = 0i64.max(region_y - dst_y).max(region_y - src_y);
+    let end_x = width.min(region_right - dst_x).min(region_right - src_x);
+    let end_y = height.min(region_bottom - dst_y).min(region_bottom - src_y);
+    if end_x <= start_x || end_y <= start_y {
+        return None;
+    }
+
+    let rebased_src_x = src_x + start_x - region_x;
+    let rebased_src_y = src_y + start_y - region_y;
+    let rebased_dst_x = dst_x + start_x - region_x;
+    let rebased_dst_y = dst_y + start_y - region_y;
+    let rebased_width = end_x - start_x;
+    let rebased_height = end_y - start_y;
+    if rebased_width <= 0 || rebased_height <= 0 {
+        return None;
+    }
+
+    Some(MoveRect {
+        src_x: rebased_src_x as u32,
+        src_y: rebased_src_y as u32,
+        dst_x: rebased_dst_x as u32,
+        dst_y: rebased_dst_y as u32,
+        width: rebased_width as u32,
+        height: rebased_height as u32,
+    })
+}
+
+#[inline(always)]
+fn extract_region_move_rects_from_move_slice(
+    source_move_rects: &[MoveRect],
+    bounds: RegionDirtyBounds,
+    out: &mut Vec<MoveRect>,
+) {
+    out.clear();
+    for rect in source_move_rects {
+        if out.len() == DXGI_REGION_MOVE_TRACK_MAX_RECTS {
+            break;
+        }
+        if let Some(clipped) = clip_and_rebase_region_move_rect(*rect, bounds) {
+            out.push(clipped);
+        }
+    }
+}
+
+fn apply_move_rects_to_frame(
+    frame: &mut Frame,
+    move_rects: &[MoveRect],
+    dst_origin_x: u32,
+    dst_origin_y: u32,
+) -> CaptureResult<()> {
+    if move_rects.is_empty() {
+        return Ok(());
+    }
+
+    let frame_width = usize::try_from(frame.width()).map_err(|_| CaptureError::BufferOverflow)?;
+    let frame_height = usize::try_from(frame.height()).map_err(|_| CaptureError::BufferOverflow)?;
+    let dst_origin_x = usize::try_from(dst_origin_x).map_err(|_| CaptureError::BufferOverflow)?;
+    let dst_origin_y = usize::try_from(dst_origin_y).map_err(|_| CaptureError::BufferOverflow)?;
+    let pitch = frame_width
+        .checked_mul(4)
+        .ok_or(CaptureError::BufferOverflow)?;
+    let base = frame.as_mut_rgba_ptr();
+
+    for rect in move_rects {
+        let width = usize::try_from(rect.width).map_err(|_| CaptureError::BufferOverflow)?;
+        let height = usize::try_from(rect.height).map_err(|_| CaptureError::BufferOverflow)?;
+        if width == 0 || height == 0 {
+            continue;
+        }
+
+        let src_x = dst_origin_x
+            .checked_add(usize::try_from(rect.src_x).map_err(|_| CaptureError::BufferOverflow)?)
+            .ok_or(CaptureError::BufferOverflow)?;
+        let src_y = dst_origin_y
+            .checked_add(usize::try_from(rect.src_y).map_err(|_| CaptureError::BufferOverflow)?)
+            .ok_or(CaptureError::BufferOverflow)?;
+        let dst_x = dst_origin_x
+            .checked_add(usize::try_from(rect.dst_x).map_err(|_| CaptureError::BufferOverflow)?)
+            .ok_or(CaptureError::BufferOverflow)?;
+        let dst_y = dst_origin_y
+            .checked_add(usize::try_from(rect.dst_y).map_err(|_| CaptureError::BufferOverflow)?)
+            .ok_or(CaptureError::BufferOverflow)?;
+
+        let src_right = src_x
+            .checked_add(width)
+            .ok_or(CaptureError::BufferOverflow)?;
+        let src_bottom = src_y
+            .checked_add(height)
+            .ok_or(CaptureError::BufferOverflow)?;
+        let dst_right = dst_x
+            .checked_add(width)
+            .ok_or(CaptureError::BufferOverflow)?;
+        let dst_bottom = dst_y
+            .checked_add(height)
+            .ok_or(CaptureError::BufferOverflow)?;
+        if src_right > frame_width
+            || src_bottom > frame_height
+            || dst_right > frame_width
+            || dst_bottom > frame_height
+        {
+            return Err(CaptureError::BufferOverflow);
+        }
+
+        let row_bytes = width.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+        let src_row_start = src_y
+            .checked_mul(pitch)
+            .and_then(|base_offset| {
+                src_x
+                    .checked_mul(4)
+                    .and_then(|xoff| base_offset.checked_add(xoff))
+            })
+            .ok_or(CaptureError::BufferOverflow)?;
+        let dst_row_start = dst_y
+            .checked_mul(pitch)
+            .and_then(|base_offset| {
+                dst_x
+                    .checked_mul(4)
+                    .and_then(|xoff| base_offset.checked_add(xoff))
+            })
+            .ok_or(CaptureError::BufferOverflow)?;
+
+        if src_x == 0 && dst_x == 0 && row_bytes == pitch {
+            let total_bytes = row_bytes
+                .checked_mul(height)
+                .ok_or(CaptureError::BufferOverflow)?;
+            unsafe {
+                std::ptr::copy(
+                    base.add(src_row_start),
+                    base.add(dst_row_start),
+                    total_bytes,
+                );
+            }
+            continue;
+        }
+
+        if dst_y > src_y {
+            for row in (0..height).rev() {
+                let src_offset = src_row_start
+                    .checked_add(row.checked_mul(pitch).ok_or(CaptureError::BufferOverflow)?)
+                    .ok_or(CaptureError::BufferOverflow)?;
+                let dst_offset = dst_row_start
+                    .checked_add(row.checked_mul(pitch).ok_or(CaptureError::BufferOverflow)?)
+                    .ok_or(CaptureError::BufferOverflow)?;
+                unsafe {
+                    std::ptr::copy(base.add(src_offset), base.add(dst_offset), row_bytes);
+                }
+            }
+        } else {
+            for row in 0..height {
+                let src_offset = src_row_start
+                    .checked_add(row.checked_mul(pitch).ok_or(CaptureError::BufferOverflow)?)
+                    .ok_or(CaptureError::BufferOverflow)?;
+                let dst_offset = dst_row_start
+                    .checked_add(row.checked_mul(pitch).ok_or(CaptureError::BufferOverflow)?)
+                    .ok_or(CaptureError::BufferOverflow)?;
+                unsafe {
+                    std::ptr::copy(base.add(src_offset), base.add(dst_offset), row_bytes);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[inline(always)]
@@ -757,6 +1023,75 @@ fn extract_region_dirty_rects_direct(
     let actual_count = ((buf_size as usize) / std::mem::size_of::<RECT>()).min(rect_buffer.len());
     extract_region_dirty_rects_from_raw_slice(&rect_buffer[..actual_count], bounds, out);
     true
+}
+
+fn extract_move_rects(
+    duplication: &IDXGIOutputDuplication,
+    info: &DXGI_OUTDUPL_FRAME_INFO,
+    move_buffer: &mut Vec<DXGI_OUTDUPL_MOVE_RECT>,
+    source_width: u32,
+    source_height: u32,
+    out: &mut Vec<MoveRect>,
+) -> bool {
+    out.clear();
+    let metadata_bytes = info.TotalMetadataBufferSize as usize;
+    if metadata_bytes == 0 {
+        return true;
+    }
+
+    let max_rects = metadata_bytes / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>();
+    if max_rects == 0 {
+        return true;
+    }
+    if move_buffer.len() < max_rects {
+        move_buffer.resize(max_rects, DXGI_OUTDUPL_MOVE_RECT::default());
+    }
+
+    let mut buf_size = info.TotalMetadataBufferSize;
+    let hr =
+        unsafe { duplication.GetFrameMoveRects(buf_size, move_buffer.as_mut_ptr(), &mut buf_size) };
+    if hr.is_err() {
+        out.clear();
+        return false;
+    }
+
+    let actual_count = ((buf_size as usize) / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>())
+        .min(move_buffer.len());
+    if actual_count > DXGI_REGION_MOVE_TRACK_MAX_RECTS {
+        out.clear();
+        return false;
+    }
+    for raw_rect in &move_buffer[..actual_count] {
+        if let Some(clamped) = clamp_move_rect_to_surface(raw_rect, source_width, source_height) {
+            out.push(clamped);
+        }
+    }
+    true
+}
+
+fn extract_region_move_rects(
+    source_move_rects: &[MoveRect],
+    source_width: u32,
+    source_height: u32,
+    blit: CaptureBlitRegion,
+    out: &mut Vec<MoveRect>,
+) -> bool {
+    let Some(bounds) = RegionDirtyBounds::from_source_and_blit(source_width, source_height, blit)
+    else {
+        out.clear();
+        return false;
+    };
+    extract_region_move_rects_from_move_slice(source_move_rects, bounds, out);
+    true
+}
+
+#[inline]
+fn can_use_region_dirty_reconstruct(
+    region_move_available: bool,
+    region_has_moves: bool,
+    move_reconstruct_enabled: bool,
+) -> bool {
+    region_move_available && (!region_has_moves || move_reconstruct_enabled)
 }
 
 fn hdr_to_sdr_params(hdr: HdrMonitorMetadata) -> Option<HdrToSdrParams> {
@@ -1720,8 +2055,11 @@ struct OutputCapturer {
     region_blit: Option<CaptureBlitRegion>,
     /// Scratch buffers reused for dirty-rect extraction to avoid per-frame allocations.
     dxgi_rect_buffer: Vec<RECT>,
+    dxgi_move_rect_buffer: Vec<DXGI_OUTDUPL_MOVE_RECT>,
     source_dirty_rects_scratch: Vec<DirtyRect>,
+    source_move_rects_scratch: Vec<MoveRect>,
     region_dirty_rects_scratch: Vec<DirtyRect>,
+    region_move_rects_scratch: Vec<MoveRect>,
     output: IDXGIOutput,
     hdr_to_sdr: Option<HdrToSdrParams>,
     gpu_tonemapper: Option<GpuTonemapper>,
@@ -1772,8 +2110,11 @@ impl OutputCapturer {
             region_adaptive_spin_polls: StagingRing::INITIAL_SPIN_POLLS,
             region_blit: None,
             dxgi_rect_buffer: Vec::new(),
+            dxgi_move_rect_buffer: Vec::new(),
             source_dirty_rects_scratch: Vec::new(),
+            source_move_rects_scratch: Vec::new(),
             region_dirty_rects_scratch: Vec::new(),
+            region_move_rects_scratch: Vec::new(),
             output: resolved.output.clone(),
             hdr_to_sdr,
             gpu_tonemapper,
@@ -1796,8 +2137,11 @@ impl OutputCapturer {
         self.cached_src_desc = None;
         self.invalidate_region_pipeline();
         self.dxgi_rect_buffer.clear();
+        self.dxgi_move_rect_buffer.clear();
         self.source_dirty_rects_scratch.clear();
+        self.source_move_rects_scratch.clear();
         self.region_dirty_rects_scratch.clear();
+        self.region_move_rects_scratch.clear();
         self.duplication = create_duplication(&self.output, &self.device)?;
         self.needs_presented_first_frame = true;
         Ok(())
@@ -2129,7 +2473,22 @@ impl OutputCapturer {
             is_duplicate: slot.is_duplicate,
         };
 
+        let moves_only = {
+            let slot = &self.region_slots[slot_idx];
+            let has_moves = destination_has_history
+                && region_move_reconstruct_enabled()
+                && slot.move_mode_available
+                && !slot.move_rects.is_empty();
+            if has_moves {
+                apply_move_rects_to_frame(out, &slot.move_rects, blit.dst_x, blit.dst_y)?;
+            }
+            has_moves && slot.dirty_mode_available && slot.dirty_rects.is_empty()
+        };
+
         if destination_has_history && sample.is_duplicate {
+            return Ok(sample);
+        }
+        if moves_only {
             return Ok(sample);
         }
 
@@ -2295,6 +2654,7 @@ impl OutputCapturer {
         }
 
         let mut region_dirty_rects = std::mem::take(&mut self.region_dirty_rects_scratch);
+        let mut region_move_rects = std::mem::take(&mut self.region_move_rects_scratch);
         let capture_result = (|| -> CaptureResult<CaptureSampleMetadata> {
             let src_desc = match self.cached_src_desc {
                 Some(desc) => desc,
@@ -2323,54 +2683,86 @@ impl OutputCapturer {
 
             let region_desc = Self::region_desc_for_blit(&effective_desc, blit);
 
-            let (region_dirty_available, region_unchanged) = if source_is_duplicate {
-                region_dirty_rects.clear();
-                (true, true)
-            } else {
-                let region_dirty_available = if region_direct_dirty_extract_enabled() {
-                    extract_region_dirty_rects_direct(
-                        &self.duplication,
-                        &frame_info,
-                        &mut self.dxgi_rect_buffer,
-                        effective_desc.Width,
-                        effective_desc.Height,
-                        blit,
-                        &mut region_dirty_rects,
-                    )
+            let (region_dirty_available, region_move_available, region_has_moves, region_unchanged) =
+                if source_is_duplicate {
+                    region_dirty_rects.clear();
+                    region_move_rects.clear();
+                    (true, true, false, true)
                 } else {
-                    let source_dirty_available = extract_dirty_rects(
-                        &self.duplication,
-                        &frame_info,
-                        &mut self.dxgi_rect_buffer,
-                        &mut self.source_dirty_rects_scratch,
-                    );
-                    if source_dirty_available {
-                        extract_region_dirty_rects(
-                            &self.source_dirty_rects_scratch,
+                    let region_dirty_available = if region_direct_dirty_extract_enabled() {
+                        extract_region_dirty_rects_direct(
+                            &self.duplication,
+                            &frame_info,
+                            &mut self.dxgi_rect_buffer,
                             effective_desc.Width,
                             effective_desc.Height,
                             blit,
                             &mut region_dirty_rects,
                         )
                     } else {
-                        region_dirty_rects.clear();
-                        false
+                        let source_dirty_available = extract_dirty_rects(
+                            &self.duplication,
+                            &frame_info,
+                            &mut self.dxgi_rect_buffer,
+                            &mut self.source_dirty_rects_scratch,
+                        );
+                        if source_dirty_available {
+                            extract_region_dirty_rects(
+                                &self.source_dirty_rects_scratch,
+                                effective_desc.Width,
+                                effective_desc.Height,
+                                blit,
+                                &mut region_dirty_rects,
+                            )
+                        } else {
+                            region_dirty_rects.clear();
+                            false
+                        }
+                    };
+                    let region_move_available = {
+                        let source_move_available = extract_move_rects(
+                            &self.duplication,
+                            &frame_info,
+                            &mut self.dxgi_move_rect_buffer,
+                            effective_desc.Width,
+                            effective_desc.Height,
+                            &mut self.source_move_rects_scratch,
+                        );
+                        let region_move_available = source_move_available
+                            && extract_region_move_rects(
+                                &self.source_move_rects_scratch,
+                                effective_desc.Width,
+                                effective_desc.Height,
+                                blit,
+                                &mut region_move_rects,
+                            );
+                        if !region_move_available {
+                            region_move_rects.clear();
+                        }
+                        region_move_available
+                    };
+
+                    if region_dirty_available
+                        && region_dirty_rects.len() <= DXGI_DIRTY_COPY_MAX_RECTS
+                    {
+                        normalize_dirty_rects_in_place(
+                            &mut region_dirty_rects,
+                            blit.width,
+                            blit.height,
+                        );
                     }
+
+                    let region_has_moves = region_move_available && !region_move_rects.is_empty();
+                    (
+                        region_dirty_available,
+                        region_move_available,
+                        region_has_moves,
+                        region_dirty_available
+                            && region_move_available
+                            && region_dirty_rects.is_empty()
+                            && !region_has_moves,
+                    )
                 };
-
-                if region_dirty_available && region_dirty_rects.len() <= DXGI_DIRTY_COPY_MAX_RECTS {
-                    normalize_dirty_rects_in_place(
-                        &mut region_dirty_rects,
-                        blit.width,
-                        blit.height,
-                    );
-                }
-
-                (
-                    region_dirty_available,
-                    region_dirty_available && region_dirty_rects.is_empty(),
-                )
-            };
             if self.capture_mode != CaptureMode::ScreenRecording
                 && destination_has_history
                 && (source_is_duplicate || region_unchanged)
@@ -2387,7 +2779,12 @@ impl OutputCapturer {
             }
 
             let recording_mode = self.capture_mode == CaptureMode::ScreenRecording;
-            let dirty_copy_strategy = if region_dirty_available {
+            let can_use_dirty_reconstruct = can_use_region_dirty_reconstruct(
+                region_move_available,
+                region_has_moves,
+                region_move_reconstruct_enabled(),
+            );
+            let dirty_copy_strategy = if region_dirty_available && can_use_dirty_reconstruct {
                 evaluate_dirty_copy_strategy(
                     &region_dirty_rects,
                     region_desc.Width,
@@ -2432,10 +2829,12 @@ impl OutputCapturer {
                 slot.hdr_to_sdr = effective_hdr;
                 slot.source_desc = Some(region_desc);
                 slot.dirty_mode_available = region_dirty_available;
+                slot.move_mode_available = region_move_available;
                 slot.dirty_cpu_copy_preferred = false;
                 slot.dirty_gpu_copy_preferred = false;
                 slot.dirty_total_pixels = 0;
                 slot.dirty_rects.clear();
+                slot.move_rects.clear();
                 slot.populated = true;
                 slot_idx
             } else {
@@ -2450,7 +2849,9 @@ impl OutputCapturer {
                     slot.hdr_to_sdr = effective_hdr;
                     slot.source_desc = Some(region_desc);
                     slot.dirty_mode_available = region_dirty_available;
+                    slot.move_mode_available = region_move_available;
                     std::mem::swap(&mut slot.dirty_rects, &mut region_dirty_rects);
+                    std::mem::swap(&mut slot.move_rects, &mut region_move_rects);
                     slot.dirty_cpu_copy_preferred =
                         region_dirty_available && dirty_copy_strategy.cpu;
                     let dirty_gpu_copy_preferred = if low_latency_recording {
@@ -2501,6 +2902,8 @@ impl OutputCapturer {
 
         region_dirty_rects.clear();
         self.region_dirty_rects_scratch = region_dirty_rects;
+        region_move_rects.clear();
+        self.region_move_rects_scratch = region_move_rects;
 
         unsafe {
             self.duplication.ReleaseFrame().ok();
@@ -3834,6 +4237,158 @@ mod tests {
     }
 
     #[test]
+    fn move_rect_clamp_trims_source_and_destination_bounds() {
+        let raw = DXGI_OUTDUPL_MOVE_RECT {
+            SourcePoint: windows::Win32::Foundation::POINT { x: 50, y: 10 },
+            DestinationRect: RECT {
+                left: -10,
+                top: 5,
+                right: 30,
+                bottom: 25,
+            },
+        };
+        let clamped = clamp_move_rect_to_surface(&raw, 100, 80).expect("expected clamped rect");
+        assert_eq!(
+            clamped,
+            MoveRect {
+                src_x: 60,
+                src_y: 10,
+                dst_x: 0,
+                dst_y: 5,
+                width: 30,
+                height: 20,
+            }
+        );
+
+        let raw_overflow = DXGI_OUTDUPL_MOVE_RECT {
+            SourcePoint: windows::Win32::Foundation::POINT { x: 90, y: 40 },
+            DestinationRect: RECT {
+                left: 70,
+                top: 40,
+                right: 100,
+                bottom: 60,
+            },
+        };
+        let clipped =
+            clamp_move_rect_to_surface(&raw_overflow, 100, 80).expect("expected clipped rect");
+        assert_eq!(
+            clipped,
+            MoveRect {
+                src_x: 90,
+                src_y: 40,
+                dst_x: 70,
+                dst_y: 40,
+                width: 10,
+                height: 20,
+            }
+        );
+    }
+
+    #[test]
+    fn region_move_rects_clip_and_rebase_require_shared_overlap() {
+        let bounds = RegionDirtyBounds::from_source_and_blit(
+            200,
+            120,
+            CaptureBlitRegion {
+                src_x: 40,
+                src_y: 20,
+                width: 80,
+                height: 60,
+                dst_x: 0,
+                dst_y: 0,
+            },
+        )
+        .expect("expected valid region bounds");
+        let source_moves = vec![
+            MoveRect {
+                src_x: 30,
+                src_y: 30,
+                dst_x: 70,
+                dst_y: 40,
+                width: 40,
+                height: 20,
+            },
+            MoveRect {
+                src_x: 0,
+                src_y: 0,
+                dst_x: 150,
+                dst_y: 10,
+                width: 20,
+                height: 20,
+            },
+        ];
+        let mut out = Vec::new();
+        extract_region_move_rects_from_move_slice(&source_moves, bounds, &mut out);
+        assert_eq!(
+            out,
+            vec![MoveRect {
+                src_x: 0,
+                src_y: 10,
+                dst_x: 40,
+                dst_y: 20,
+                width: 30,
+                height: 20,
+            }]
+        );
+    }
+
+    #[test]
+    fn region_dirty_reconstruct_requires_move_metadata_for_incremental_copy() {
+        assert!(can_use_region_dirty_reconstruct(true, false, true));
+        assert!(can_use_region_dirty_reconstruct(true, false, false));
+        assert!(can_use_region_dirty_reconstruct(true, true, true));
+        assert!(!can_use_region_dirty_reconstruct(true, true, false));
+        assert!(!can_use_region_dirty_reconstruct(false, false, true));
+        assert!(!can_use_region_dirty_reconstruct(false, true, true));
+    }
+
+    #[test]
+    fn apply_move_rects_handles_downward_overlap() {
+        let width = 8u32;
+        let height = 5u32;
+        let mut frame = Frame::empty();
+        frame
+            .ensure_rgba_capacity(width, height)
+            .expect("failed to allocate frame buffer");
+
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let pixel = y * width as usize + x;
+                let idx = pixel * 4;
+                frame.as_mut_rgba_bytes()[idx] = pixel as u8;
+                frame.as_mut_rgba_bytes()[idx + 1] = (pixel.wrapping_mul(3)) as u8;
+                frame.as_mut_rgba_bytes()[idx + 2] = (pixel.wrapping_mul(7)) as u8;
+                frame.as_mut_rgba_bytes()[idx + 3] = 0xFF;
+            }
+        }
+
+        let before = frame.as_rgba_bytes().to_vec();
+        let move_rects = [MoveRect {
+            src_x: 1,
+            src_y: 1,
+            dst_x: 1,
+            dst_y: 2,
+            width: 4,
+            height: 2,
+        }];
+        apply_move_rects_to_frame(&mut frame, &move_rects, 0, 0).expect("move apply failed");
+
+        let mut expected = before.clone();
+        let pitch = width as usize * 4;
+        for row in 0..move_rects[0].height as usize {
+            let src_offset =
+                (move_rects[0].src_y as usize + row) * pitch + move_rects[0].src_x as usize * 4;
+            let dst_offset =
+                (move_rects[0].dst_y as usize + row) * pitch + move_rects[0].dst_x as usize * 4;
+            let row_bytes = move_rects[0].width as usize * 4;
+            expected[dst_offset..dst_offset + row_bytes]
+                .copy_from_slice(&before[src_offset..src_offset + row_bytes]);
+        }
+
+        assert_eq!(frame.as_rgba_bytes(), expected.as_slice());
+    }
+
+    #[test]
     fn direct_region_dirty_extract_matches_legacy_clipping() {
         let source_width = 2560u32;
         let source_height = 1440u32;
@@ -4456,6 +5011,166 @@ mod tests {
         assert!(
             optimized_ms <= legacy_ms * 1.03,
             "direct dirty extract path regressed: legacy={legacy_ms:.3}ms optimized={optimized_ms:.3}ms ({speedup:.2}x)"
+        );
+    }
+
+    #[test]
+    #[ignore = "performance benchmark guard; run explicitly with --ignored --nocapture"]
+    fn bench_region_move_apply_vs_full_convert() {
+        use std::hint::black_box;
+        use std::time::Duration;
+
+        const WIDTH: usize = 1920;
+        const HEIGHT: usize = 1080;
+        const WARMUP_ITERS: usize = 80;
+        const MEASURE_ITERS: usize = 420;
+
+        let pitch = WIDTH * 4;
+        let buffer_len = pitch * HEIGHT;
+        let move_rects = [MoveRect {
+            src_x: 0,
+            src_y: 0,
+            dst_x: 0,
+            dst_y: 1,
+            width: WIDTH as u32,
+            height: (HEIGHT - 1) as u32,
+        }];
+        let dirty_rects = [DirtyRect {
+            x: 0,
+            y: 0,
+            width: WIDTH as u32,
+            height: 1,
+        }];
+
+        let mut seed_rgba = vec![0u8; buffer_len];
+        for (idx, byte) in seed_rgba.iter_mut().enumerate() {
+            *byte = (idx as u8).wrapping_mul(29).wrapping_add(11);
+        }
+
+        let mut source_frame = Frame::empty();
+        source_frame
+            .ensure_rgba_capacity(WIDTH as u32, HEIGHT as u32)
+            .expect("failed to allocate source frame");
+        let mut state_frame = Frame::empty();
+        state_frame
+            .ensure_rgba_capacity(WIDTH as u32, HEIGHT as u32)
+            .expect("failed to allocate state frame");
+        state_frame.as_mut_rgba_bytes().copy_from_slice(&seed_rgba);
+        let mut optimized_frame = Frame::empty();
+        optimized_frame
+            .ensure_rgba_capacity(WIDTH as u32, HEIGHT as u32)
+            .expect("failed to allocate optimized frame");
+        optimized_frame
+            .as_mut_rgba_bytes()
+            .copy_from_slice(&seed_rgba);
+
+        let converter = crate::convert::SurfaceRowConverter::new(
+            crate::convert::SurfacePixelFormat::Bgra8,
+            crate::convert::SurfaceConversionOptions::default(),
+        );
+        let mut source_bgra = vec![0u8; buffer_len];
+        let mut sink = 0u64;
+        let mut benchmark_legacy = vec![0u8; buffer_len];
+        let mut legacy_total = Duration::ZERO;
+        let mut optimized_total = Duration::ZERO;
+        let total_iters = WARMUP_ITERS + MEASURE_ITERS;
+
+        for iter in 0..total_iters {
+            source_frame
+                .as_mut_rgba_bytes()
+                .copy_from_slice(state_frame.as_rgba_bytes());
+            apply_move_rects_to_frame(&mut source_frame, &move_rects, 0, 0)
+                .expect("failed to synthesize source move");
+            for rect in &dirty_rects {
+                let row_start = rect.y as usize * pitch;
+                let row_end = row_start + rect.width as usize * 4;
+                for idx in (row_start..row_end).step_by(4) {
+                    source_frame.as_mut_rgba_bytes()[idx] =
+                        (iter as u8).wrapping_mul(13).wrapping_add((idx / 4) as u8);
+                    source_frame.as_mut_rgba_bytes()[idx + 1] =
+                        (iter as u8).wrapping_mul(7).wrapping_add((idx / 8) as u8);
+                    source_frame.as_mut_rgba_bytes()[idx + 2] =
+                        (iter as u8).wrapping_mul(3).wrapping_add((idx / 16) as u8);
+                    source_frame.as_mut_rgba_bytes()[idx + 3] = 0xFF;
+                }
+            }
+
+            source_bgra.copy_from_slice(source_frame.as_rgba_bytes());
+            for pixel in source_bgra.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+
+            let legacy_start = std::time::Instant::now();
+            crate::convert::convert_surface_to_rgba(
+                crate::convert::SurfacePixelFormat::Bgra8,
+                &source_bgra,
+                pitch,
+                &mut benchmark_legacy,
+                pitch,
+                WIDTH,
+                HEIGHT,
+                crate::convert::SurfaceConversionOptions::default(),
+            );
+            let legacy_elapsed = legacy_start.elapsed();
+
+            let optimized_start = std::time::Instant::now();
+            apply_move_rects_to_frame(&mut optimized_frame, &move_rects, 0, 0)
+                .expect("move apply failed during benchmark");
+            unsafe {
+                let dst_ptr = optimized_frame.as_mut_rgba_ptr();
+                let src_ptr = source_bgra.as_ptr();
+                for rect in &dirty_rects {
+                    let x = rect.x as usize;
+                    let y = rect.y as usize;
+                    let width = rect.width as usize;
+                    let height = rect.height as usize;
+                    let src_offset = y * pitch + x * 4;
+                    let dst_offset = y * pitch + x * 4;
+                    converter.convert_rows_unchecked(
+                        src_ptr.add(src_offset),
+                        pitch,
+                        dst_ptr.add(dst_offset),
+                        pitch,
+                        width,
+                        height,
+                    );
+                }
+            }
+            let optimized_elapsed = optimized_start.elapsed();
+
+            if iter >= WARMUP_ITERS {
+                legacy_total += legacy_elapsed;
+                optimized_total += optimized_elapsed;
+            }
+
+            assert_eq!(
+                optimized_frame.as_rgba_bytes(),
+                benchmark_legacy.as_slice(),
+                "move+dirty reconstruction mismatch at iteration {iter}",
+            );
+            state_frame
+                .as_mut_rgba_bytes()
+                .copy_from_slice(benchmark_legacy.as_slice());
+            sink ^= benchmark_legacy[(iter * 131) % benchmark_legacy.len()] as u64;
+            sink ^= optimized_frame.as_rgba_bytes()[(iter * 97) % buffer_len] as u64;
+        }
+        black_box(sink);
+
+        let legacy_ms = legacy_total.as_secs_f64() * 1000.0;
+        let optimized_ms = optimized_total.as_secs_f64() * 1000.0;
+        let speedup = if optimized_ms > 0.0 {
+            legacy_ms / optimized_ms
+        } else {
+            0.0
+        };
+
+        println!(
+            "dxgi region move benchmark: legacy={legacy_ms:.3} ms optimized={optimized_ms:.3} ms speedup={speedup:.2}x"
+        );
+
+        assert!(
+            optimized_ms <= legacy_ms * 1.05,
+            "move+dirty path regressed beyond tolerance: legacy={legacy_ms:.3}ms optimized={optimized_ms:.3}ms ({speedup:.2}x)"
         );
     }
 }

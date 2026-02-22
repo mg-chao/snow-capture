@@ -263,26 +263,163 @@ fn clamp_dirty_rect(rect: DirtyRect, width: u32, height: u32) -> Option<DirtyRec
     })
 }
 
-fn intersect_dirty_rects(a: DirtyRect, b: DirtyRect) -> Option<DirtyRect> {
-    let a_right = a.x.saturating_add(a.width);
-    let a_bottom = a.y.saturating_add(a.height);
-    let b_right = b.x.saturating_add(b.width);
-    let b_bottom = b.y.saturating_add(b.height);
+#[derive(Clone, Copy)]
+struct RegionDirtyBounds {
+    source_width: u32,
+    source_height: u32,
+    region_x: u32,
+    region_y: u32,
+    region_right: u32,
+    region_bottom: u32,
+}
 
-    let x = a.x.max(b.x);
-    let y = a.y.max(b.y);
-    let right = a_right.min(b_right);
-    let bottom = a_bottom.min(b_bottom);
+impl RegionDirtyBounds {
+    #[inline]
+    fn from_source_and_blit(
+        source_width: u32,
+        source_height: u32,
+        blit: CaptureBlitRegion,
+    ) -> Option<Self> {
+        let region = clamp_dirty_rect(
+            DirtyRect {
+                x: blit.src_x,
+                y: blit.src_y,
+                width: blit.width,
+                height: blit.height,
+            },
+            source_width,
+            source_height,
+        )?;
+
+        let region_right = region.x.saturating_add(region.width);
+        let region_bottom = region.y.saturating_add(region.height);
+        Some(Self {
+            source_width,
+            source_height,
+            region_x: region.x,
+            region_y: region.y,
+            region_right,
+            region_bottom,
+        })
+    }
+}
+
+#[inline(always)]
+fn clip_and_rebase_region_dirty_rect(
+    rect: DirtyRect,
+    bounds: RegionDirtyBounds,
+) -> Option<DirtyRect> {
+    let x = rect.x.min(bounds.source_width);
+    let y = rect.y.min(bounds.source_height);
+    if x >= bounds.source_width || y >= bounds.source_height {
+        return None;
+    }
+
+    let right = x.saturating_add(rect.width).min(bounds.source_width);
+    let bottom = y.saturating_add(rect.height).min(bounds.source_height);
     if right <= x || bottom <= y {
         return None;
     }
 
+    if right <= bounds.region_x
+        || x >= bounds.region_right
+        || bottom <= bounds.region_y
+        || y >= bounds.region_bottom
+    {
+        return None;
+    }
+
+    let clipped_x = x.max(bounds.region_x);
+    let clipped_y = y.max(bounds.region_y);
+    let clipped_right = right.min(bounds.region_right);
+    let clipped_bottom = bottom.min(bounds.region_bottom);
+    if clipped_right <= clipped_x || clipped_bottom <= clipped_y {
+        return None;
+    }
+
     Some(DirtyRect {
-        x,
-        y,
-        width: right - x,
-        height: bottom - y,
+        x: clipped_x.saturating_sub(bounds.region_x),
+        y: clipped_y.saturating_sub(bounds.region_y),
+        width: clipped_right.saturating_sub(clipped_x),
+        height: clipped_bottom.saturating_sub(clipped_y),
     })
+}
+
+#[inline(always)]
+fn extract_region_dirty_rects_from_dirty_slice(
+    source_dirty_rects: &[DirtyRect],
+    bounds: RegionDirtyBounds,
+    out: &mut Vec<DirtyRect>,
+) {
+    out.clear();
+    let max_rects = DXGI_REGION_DIRTY_TRACK_MAX_RECTS;
+    for rect in source_dirty_rects {
+        if out.len() == max_rects {
+            break;
+        }
+        if let Some(clipped) = clip_and_rebase_region_dirty_rect(*rect, bounds) {
+            out.push(clipped);
+        }
+    }
+}
+
+#[inline(always)]
+fn extract_region_dirty_rects_from_raw_slice(
+    raw_rects: &[RECT],
+    bounds: RegionDirtyBounds,
+    out: &mut Vec<DirtyRect>,
+) {
+    out.clear();
+    let max_rects = DXGI_REGION_DIRTY_TRACK_MAX_RECTS;
+    let source_width = bounds.source_width;
+    let source_height = bounds.source_height;
+    let region_x = bounds.region_x;
+    let region_y = bounds.region_y;
+    let region_right = bounds.region_right;
+    let region_bottom = bounds.region_bottom;
+
+    for raw_rect in raw_rects {
+        if out.len() == max_rects {
+            break;
+        }
+
+        let width = (i64::from(raw_rect.right) - i64::from(raw_rect.left)).max(0) as u32;
+        let height = (i64::from(raw_rect.bottom) - i64::from(raw_rect.top)).max(0) as u32;
+        if width == 0 || height == 0 {
+            continue;
+        }
+
+        let x = raw_rect.left.max(0) as u32;
+        let y = raw_rect.top.max(0) as u32;
+        if x >= source_width || y >= source_height {
+            continue;
+        }
+
+        let right = x.saturating_add(width).min(source_width);
+        let bottom = y.saturating_add(height).min(source_height);
+        if right <= x || bottom <= y {
+            continue;
+        }
+
+        if right <= region_x || x >= region_right || bottom <= region_y || y >= region_bottom {
+            continue;
+        }
+
+        let clipped_x = x.max(region_x);
+        let clipped_y = y.max(region_y);
+        let clipped_right = right.min(region_right);
+        let clipped_bottom = bottom.min(region_bottom);
+        if clipped_right <= clipped_x || clipped_bottom <= clipped_y {
+            continue;
+        }
+
+        out.push(DirtyRect {
+            x: clipped_x.saturating_sub(region_x),
+            y: clipped_y.saturating_sub(region_y),
+            width: clipped_right.saturating_sub(clipped_x),
+            height: clipped_bottom.saturating_sub(clipped_y),
+        });
+    }
 }
 
 #[inline(always)]
@@ -569,39 +706,12 @@ fn extract_region_dirty_rects(
     blit: CaptureBlitRegion,
     out: &mut Vec<DirtyRect>,
 ) -> bool {
-    out.clear();
-
-    let Some(region_bounds) = clamp_dirty_rect(
-        DirtyRect {
-            x: blit.src_x,
-            y: blit.src_y,
-            width: blit.width,
-            height: blit.height,
-        },
-        source_width,
-        source_height,
-    ) else {
+    let Some(bounds) = RegionDirtyBounds::from_source_and_blit(source_width, source_height, blit)
+    else {
+        out.clear();
         return false;
     };
-
-    for rect in source_dirty_rects {
-        let Some(clamped) = clamp_dirty_rect(*rect, source_width, source_height) else {
-            continue;
-        };
-        let Some(intersection) = intersect_dirty_rects(clamped, region_bounds) else {
-            continue;
-        };
-        if out.len() == DXGI_REGION_DIRTY_TRACK_MAX_RECTS {
-            break;
-        }
-        out.push(DirtyRect {
-            x: intersection.x.saturating_sub(region_bounds.x),
-            y: intersection.y.saturating_sub(region_bounds.y),
-            width: intersection.width,
-            height: intersection.height,
-        });
-    }
-
+    extract_region_dirty_rects_from_dirty_slice(source_dirty_rects, bounds, out);
     true
 }
 
@@ -614,28 +724,21 @@ fn extract_region_dirty_rects_direct(
     blit: CaptureBlitRegion,
     out: &mut Vec<DirtyRect>,
 ) -> bool {
-    out.clear();
-
-    let Some(region_bounds) = clamp_dirty_rect(
-        DirtyRect {
-            x: blit.src_x,
-            y: blit.src_y,
-            width: blit.width,
-            height: blit.height,
-        },
-        source_width,
-        source_height,
-    ) else {
+    let Some(bounds) = RegionDirtyBounds::from_source_and_blit(source_width, source_height, blit)
+    else {
+        out.clear();
         return false;
     };
 
     let dirty_bytes = info.TotalMetadataBufferSize as usize;
     if dirty_bytes == 0 {
+        out.clear();
         return true;
     }
 
     let max_rects = dirty_bytes / std::mem::size_of::<RECT>();
     if max_rects == 0 {
+        out.clear();
         return false;
     }
     if rect_buffer.len() < max_rects {
@@ -647,41 +750,12 @@ fn extract_region_dirty_rects_direct(
         duplication.GetFrameDirtyRects(buf_size, rect_buffer.as_mut_ptr(), &mut buf_size)
     };
     if hr.is_err() {
+        out.clear();
         return false;
     }
 
     let actual_count = ((buf_size as usize) / std::mem::size_of::<RECT>()).min(rect_buffer.len());
-    for raw_rect in &rect_buffer[..actual_count] {
-        if out.len() == DXGI_REGION_DIRTY_TRACK_MAX_RECTS {
-            break;
-        }
-
-        let width = (raw_rect.right - raw_rect.left).max(0) as u32;
-        let height = (raw_rect.bottom - raw_rect.top).max(0) as u32;
-        if width == 0 || height == 0 {
-            continue;
-        }
-
-        let dirty = DirtyRect {
-            x: raw_rect.left.max(0) as u32,
-            y: raw_rect.top.max(0) as u32,
-            width,
-            height,
-        };
-        let Some(clamped) = clamp_dirty_rect(dirty, source_width, source_height) else {
-            continue;
-        };
-        let Some(intersection) = intersect_dirty_rects(clamped, region_bounds) else {
-            continue;
-        };
-        out.push(DirtyRect {
-            x: intersection.x.saturating_sub(region_bounds.x),
-            y: intersection.y.saturating_sub(region_bounds.y),
-            width: intersection.width,
-            height: intersection.height,
-        });
-    }
-
+    extract_region_dirty_rects_from_raw_slice(&rect_buffer[..actual_count], bounds, out);
     true
 }
 
@@ -3721,7 +3795,12 @@ mod tests {
             dst_x: 0,
             dst_y: 0,
         };
-        let mut out = Vec::new();
+        let mut out = vec![DirtyRect {
+            x: 1,
+            y: 1,
+            width: 1,
+            height: 1,
+        }];
         assert!(!extract_region_dirty_rects(
             &source, 1920, 1080, blit, &mut out
         ));
@@ -3752,6 +3831,76 @@ mod tests {
             &source, 1920, 1080, blit, &mut out
         ));
         assert_eq!(out.len(), DXGI_REGION_DIRTY_TRACK_MAX_RECTS);
+    }
+
+    #[test]
+    fn direct_region_dirty_extract_matches_legacy_clipping() {
+        let source_width = 2560u32;
+        let source_height = 1440u32;
+        let workloads = make_direct_dirty_extract_inputs();
+        let blits = direct_dirty_extract_blits();
+        let mut legacy = Vec::new();
+        let mut optimized = Vec::new();
+
+        for (idx, raw_rects) in workloads.iter().enumerate() {
+            let blit = blits[idx % blits.len()];
+            assert!(extract_region_dirty_rects_from_raw_slice_legacy(
+                raw_rects,
+                source_width,
+                source_height,
+                blit,
+                &mut legacy,
+            ));
+            let bounds = RegionDirtyBounds::from_source_and_blit(source_width, source_height, blit)
+                .expect("expected valid blit bounds");
+            extract_region_dirty_rects_from_raw_slice(raw_rects, bounds, &mut optimized);
+            assert_eq!(optimized, legacy);
+        }
+    }
+
+    #[test]
+    fn direct_region_dirty_extract_handles_extreme_raw_coordinates() {
+        let source_width = 2560u32;
+        let source_height = 1440u32;
+        let blit = CaptureBlitRegion {
+            src_x: 0,
+            src_y: 0,
+            width: source_width,
+            height: source_height,
+            dst_x: 0,
+            dst_y: 0,
+        };
+        let raw_rects = vec![RECT {
+            left: i32::MIN,
+            top: i32::MIN,
+            right: i32::MAX,
+            bottom: i32::MAX,
+        }];
+
+        let mut legacy = Vec::new();
+        assert!(extract_region_dirty_rects_from_raw_slice_legacy(
+            &raw_rects,
+            source_width,
+            source_height,
+            blit,
+            &mut legacy,
+        ));
+
+        let bounds = RegionDirtyBounds::from_source_and_blit(source_width, source_height, blit)
+            .expect("expected valid blit bounds");
+        let mut optimized = Vec::new();
+        extract_region_dirty_rects_from_raw_slice(&raw_rects, bounds, &mut optimized);
+
+        assert_eq!(optimized, legacy);
+        assert_eq!(
+            optimized,
+            vec![DirtyRect {
+                x: 0,
+                y: 0,
+                width: source_width,
+                height: source_height,
+            }]
+        );
     }
 
     #[test]
@@ -3852,6 +4001,146 @@ mod tests {
             out.push(rects);
         }
         out
+    }
+
+    fn make_direct_dirty_extract_inputs() -> Vec<Vec<RECT>> {
+        let mut state = 0x1234_5678_9abc_def0_u64;
+        let mut workloads = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let mut rects = Vec::with_capacity(260);
+            let rect_count = 80 + ((state >> 5) as usize % 180);
+            for _ in 0..rect_count {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let left = ((state >> 18) as i32 & 0x1fff) - 1024;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let top = ((state >> 22) as i32 & 0x0fff) - 512;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let width = ((state >> 24) as i32 & 0x03ff) - 64;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let height = ((state >> 28) as i32 & 0x01ff) - 32;
+                let right = left.saturating_add(width);
+                let bottom = top.saturating_add(height);
+                rects.push(RECT {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                });
+            }
+            workloads.push(rects);
+        }
+        workloads
+    }
+
+    fn direct_dirty_extract_blits() -> [CaptureBlitRegion; 5] {
+        [
+            CaptureBlitRegion {
+                src_x: 0,
+                src_y: 0,
+                width: 2560,
+                height: 1440,
+                dst_x: 0,
+                dst_y: 0,
+            },
+            CaptureBlitRegion {
+                src_x: 120,
+                src_y: 80,
+                width: 1920,
+                height: 1080,
+                dst_x: 0,
+                dst_y: 0,
+            },
+            CaptureBlitRegion {
+                src_x: 320,
+                src_y: 160,
+                width: 1280,
+                height: 720,
+                dst_x: 0,
+                dst_y: 0,
+            },
+            CaptureBlitRegion {
+                src_x: 960,
+                src_y: 540,
+                width: 800,
+                height: 450,
+                dst_x: 0,
+                dst_y: 0,
+            },
+            CaptureBlitRegion {
+                src_x: 100,
+                src_y: 200,
+                width: 640,
+                height: 640,
+                dst_x: 0,
+                dst_y: 0,
+            },
+        ]
+    }
+
+    fn extract_region_dirty_rects_from_raw_slice_legacy(
+        raw_rects: &[RECT],
+        source_width: u32,
+        source_height: u32,
+        blit: CaptureBlitRegion,
+        out: &mut Vec<DirtyRect>,
+    ) -> bool {
+        out.clear();
+
+        let Some(region_bounds) = clamp_dirty_rect(
+            DirtyRect {
+                x: blit.src_x,
+                y: blit.src_y,
+                width: blit.width,
+                height: blit.height,
+            },
+            source_width,
+            source_height,
+        ) else {
+            return false;
+        };
+        let region_right = region_bounds.x.saturating_add(region_bounds.width);
+        let region_bottom = region_bounds.y.saturating_add(region_bounds.height);
+
+        for raw_rect in raw_rects {
+            if out.len() == DXGI_REGION_DIRTY_TRACK_MAX_RECTS {
+                break;
+            }
+
+            let width = (i64::from(raw_rect.right) - i64::from(raw_rect.left)).max(0) as u32;
+            let height = (i64::from(raw_rect.bottom) - i64::from(raw_rect.top)).max(0) as u32;
+            if width == 0 || height == 0 {
+                continue;
+            }
+
+            let dirty = DirtyRect {
+                x: raw_rect.left.max(0) as u32,
+                y: raw_rect.top.max(0) as u32,
+                width,
+                height,
+            };
+            let Some(clamped) = clamp_dirty_rect(dirty, source_width, source_height) else {
+                continue;
+            };
+
+            let clamped_right = clamped.x.saturating_add(clamped.width);
+            let clamped_bottom = clamped.y.saturating_add(clamped.height);
+            let x = clamped.x.max(region_bounds.x);
+            let y = clamped.y.max(region_bounds.y);
+            let right = clamped_right.min(region_right);
+            let bottom = clamped_bottom.min(region_bottom);
+            if right <= x || bottom <= y {
+                continue;
+            }
+
+            out.push(DirtyRect {
+                x: x.saturating_sub(region_bounds.x),
+                y: y.saturating_sub(region_bounds.y),
+                width: right.saturating_sub(x),
+                height: bottom.saturating_sub(y),
+            });
+        }
+
+        true
     }
 
     fn should_use_dirty_copy_legacy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
@@ -4072,6 +4361,101 @@ mod tests {
         assert!(
             optimized_ms <= reference_ms * 1.03,
             "merge-candidate normalize path regressed: reference={reference_ms:.3}ms optimized={optimized_ms:.3}ms ({speedup:.2}x)"
+        );
+    }
+
+    #[test]
+    #[ignore = "performance benchmark guard; run explicitly with --ignored --nocapture"]
+    fn bench_direct_region_dirty_extract_clip_vs_legacy() {
+        use std::hint::black_box;
+
+        let source_width = 2560u32;
+        let source_height = 1440u32;
+        let workloads = make_direct_dirty_extract_inputs();
+        let blits = direct_dirty_extract_blits();
+
+        let mut legacy_output = Vec::with_capacity(DXGI_REGION_DIRTY_TRACK_MAX_RECTS);
+        let mut optimized_output = Vec::with_capacity(DXGI_REGION_DIRTY_TRACK_MAX_RECTS);
+        for (idx, raw_rects) in workloads.iter().enumerate() {
+            let blit = blits[idx % blits.len()];
+            assert!(extract_region_dirty_rects_from_raw_slice_legacy(
+                raw_rects,
+                source_width,
+                source_height,
+                blit,
+                &mut legacy_output,
+            ));
+            let bounds = RegionDirtyBounds::from_source_and_blit(source_width, source_height, blit)
+                .expect("expected valid blit bounds");
+            extract_region_dirty_rects_from_raw_slice(raw_rects, bounds, &mut optimized_output);
+            assert_eq!(optimized_output, legacy_output);
+        }
+
+        let warmup_iters = 8_000usize;
+        let measure_iters = 180_000usize;
+        let mut sink = 0usize;
+
+        for iter in 0..warmup_iters {
+            let raw_rects = black_box(&workloads[iter % workloads.len()]);
+            let blit = black_box(blits[iter % blits.len()]);
+
+            extract_region_dirty_rects_from_raw_slice_legacy(
+                raw_rects,
+                source_width,
+                source_height,
+                blit,
+                &mut legacy_output,
+            );
+            sink ^= legacy_output.len();
+
+            let bounds = RegionDirtyBounds::from_source_and_blit(source_width, source_height, blit)
+                .expect("expected valid blit bounds");
+            extract_region_dirty_rects_from_raw_slice(raw_rects, bounds, &mut optimized_output);
+            sink ^= optimized_output.len() << 1;
+        }
+
+        let legacy_start = std::time::Instant::now();
+        for iter in 0..measure_iters {
+            let raw_rects = black_box(&workloads[iter % workloads.len()]);
+            let blit = black_box(blits[iter % blits.len()]);
+            extract_region_dirty_rects_from_raw_slice_legacy(
+                raw_rects,
+                source_width,
+                source_height,
+                blit,
+                &mut legacy_output,
+            );
+            sink ^= legacy_output.len();
+        }
+        let legacy_elapsed = legacy_start.elapsed();
+
+        let optimized_start = std::time::Instant::now();
+        for iter in 0..measure_iters {
+            let raw_rects = black_box(&workloads[iter % workloads.len()]);
+            let blit = black_box(blits[iter % blits.len()]);
+            let bounds = RegionDirtyBounds::from_source_and_blit(source_width, source_height, blit)
+                .expect("expected valid blit bounds");
+            extract_region_dirty_rects_from_raw_slice(raw_rects, bounds, &mut optimized_output);
+            sink ^= optimized_output.len() << 1;
+        }
+        let optimized_elapsed = optimized_start.elapsed();
+        black_box(sink);
+
+        let legacy_ms = legacy_elapsed.as_secs_f64() * 1000.0;
+        let optimized_ms = optimized_elapsed.as_secs_f64() * 1000.0;
+        let speedup = if optimized_ms > 0.0 {
+            legacy_ms / optimized_ms
+        } else {
+            0.0
+        };
+
+        println!(
+            "dxgi direct dirty extract benchmark: legacy={legacy_ms:.3} ms optimized={optimized_ms:.3} ms speedup={speedup:.2}x"
+        );
+
+        assert!(
+            optimized_ms <= legacy_ms * 1.03,
+            "direct dirty extract path regressed: legacy={legacy_ms:.3}ms optimized={optimized_ms:.3}ms ({speedup:.2}x)"
         );
     }
 }

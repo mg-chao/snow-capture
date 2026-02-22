@@ -25,6 +25,7 @@ cargo test --release platform::windows::wgc::tests::bench_dirty_region_rect_clam
 cargo test --release platform::windows::wgc::tests::bench_region_dirty_dense_fallback_vs_legacy -- --ignored --nocapture
 cargo test --release platform::windows::surface::tests::bench_trusted_direct_hints_vs_runtime_scan -- --ignored --nocapture
 cargo test --release platform::windows::surface::tests::bench_trusted_direct_bgra_batch_kernel_vs_legacy_dispatch -- --ignored --nocapture
+cargo test --release platform::windows::duplication::tests::bench_direct_region_dirty_extract_clip_vs_legacy -- --ignored --nocapture
 ```
 
 The test prints timing and fails if the optimized path regresses materially versus legacy.

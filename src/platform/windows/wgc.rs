@@ -55,6 +55,9 @@ const WGC_DIRTY_GPU_COPY_MAX_RECTS: usize = 64;
 const WGC_DIRTY_GPU_COPY_MAX_AREA_PERCENT: u64 = 45;
 const WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS: usize = 8;
 const WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT: u64 = 18;
+const WGC_REGION_DIRTY_DENSE_FALLBACK_MIN_RECTS: usize = WGC_DIRTY_COPY_MAX_RECTS + 32;
+const WGC_REGION_DIRTY_DENSE_FALLBACK_HARD_MAX_RECTS: usize = WGC_DIRTY_COPY_MAX_RECTS * 4;
+const WGC_REGION_DIRTY_DENSE_FALLBACK_AREA_PERCENT: u64 = 72;
 const WGC_DIRTY_REGION_FETCH_BATCH: usize = 64;
 const WGC_STALE_POLL_SPIN_MIN: u32 = 16;
 const WGC_STALE_POLL_SPIN_MAX: u32 = 256;
@@ -73,6 +76,13 @@ struct DirtyCopyStrategy {
     gpu: bool,
     gpu_low_latency: bool,
     dirty_pixels: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RegionDirtyRectExtraction {
+    available: bool,
+    unchanged: bool,
+    force_full_copy: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -129,6 +139,12 @@ fn region_low_latency_slot_enabled() -> bool {
 fn region_full_slot_map_fastpath_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_REGION_FULL_SLOT_MAP"))
+}
+
+#[inline]
+fn region_dirty_dense_fallback_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_REGION_DIRTY_DENSE_FALLBACK"))
 }
 
 #[inline]
@@ -278,9 +294,63 @@ fn clamp_dirty_region_rect(raw: RectInt32, width: u32, height: u32) -> Option<Di
     })
 }
 
+#[inline(always)]
+fn clip_dirty_region_rect_to_region(
+    raw: RectInt32,
+    source_width: u32,
+    source_height: u32,
+    region_bounds: DirtyRect,
+) -> Option<DirtyRect> {
+    if raw.Width <= 0 || raw.Height <= 0 {
+        return None;
+    }
+
+    let region_left = i64::from(region_bounds.x);
+    let region_top = i64::from(region_bounds.y);
+    let region_right = i64::from(region_bounds.x.saturating_add(region_bounds.width));
+    let region_bottom = i64::from(region_bounds.y.saturating_add(region_bounds.height));
+    if region_left >= region_right || region_top >= region_bottom {
+        return None;
+    }
+
+    let source_right = i64::from(source_width);
+    let source_bottom = i64::from(source_height);
+    if source_right <= 0 || source_bottom <= 0 {
+        return None;
+    }
+
+    let raw_left = i64::from(raw.X.max(0));
+    let raw_top = i64::from(raw.Y.max(0));
+    let raw_right = raw_left.saturating_add(i64::from(raw.Width));
+    let raw_bottom = raw_top.saturating_add(i64::from(raw.Height));
+
+    let clipped_left = raw_left.max(region_left);
+    let clipped_top = raw_top.max(region_top);
+    let clipped_right = raw_right.min(region_right).min(source_right);
+    let clipped_bottom = raw_bottom.min(region_bottom).min(source_bottom);
+    if clipped_right <= clipped_left || clipped_bottom <= clipped_top {
+        return None;
+    }
+
+    let x = u32::try_from(clipped_left.saturating_sub(region_left)).ok()?;
+    let y = u32::try_from(clipped_top.saturating_sub(region_top)).ok()?;
+    let width = u32::try_from(clipped_right.saturating_sub(clipped_left)).ok()?;
+    let height = u32::try_from(clipped_bottom.saturating_sub(clipped_top)).ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    Some(DirtyRect {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
 fn for_each_dirty_region(
     frame: &Direct3D11CaptureFrame,
-    mut visit: impl FnMut(RectInt32),
+    mut visit: impl FnMut(RectInt32) -> bool,
 ) -> Option<GraphicsCaptureDirtyRegionMode> {
     let mode = frame.DirtyRegionMode().ok()?;
     if !dirty_region_mode_supported(mode) {
@@ -308,7 +378,9 @@ fn for_each_dirty_region(
             }
 
             for raw in &batch[..fetched_len] {
-                visit(*raw);
+                if !visit(*raw) {
+                    return Some(mode);
+                }
             }
             start_idx = start_idx.saturating_add(u32::try_from(fetched_len).ok()?);
         }
@@ -317,7 +389,9 @@ fn for_each_dirty_region(
     if start_idx < count {
         for idx in start_idx..count {
             if let Ok(raw) = regions.GetAt(idx) {
-                visit(raw);
+                if !visit(raw) {
+                    return Some(mode);
+                }
             }
         }
     }
@@ -336,12 +410,14 @@ fn extract_dirty_rects(
         if let Some(clamped) = clamp_dirty_region_rect(raw, width, height) {
             out.push(clamped);
         }
+        true
     })?;
 
     normalize_dirty_rects_in_place(out, width, height);
     Some(mode)
 }
 
+#[cfg(test)]
 fn intersect_dirty_rects(a: DirtyRect, b: DirtyRect) -> Option<DirtyRect> {
     let a_right = a.x.saturating_add(a.width);
     let a_bottom = a.y.saturating_add(a.height);
@@ -380,6 +456,22 @@ fn intervals_overlap(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> bool
 #[inline(always)]
 fn intervals_touch_or_overlap(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> bool {
     a_start <= b_end && b_start <= a_end
+}
+
+#[inline(always)]
+fn dirty_rects_sorted_by_y_then_x(rects: &[DirtyRect]) -> bool {
+    if rects.len() <= 1 {
+        return true;
+    }
+
+    let mut previous = rects[0];
+    for rect in &rects[1..] {
+        if rect.y < previous.y || (rect.y == previous.y && rect.x < previous.x) {
+            return false;
+        }
+        previous = *rect;
+    }
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -517,9 +609,11 @@ fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height
         return;
     }
 
-    pending.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
+    if !dirty_rects_sorted_by_y_then_x(&pending) {
+        pending.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
+    }
     let mut merged: Vec<DirtyRectMergeCandidate> = Vec::with_capacity(pending.len());
-    for rect in pending {
+    for rect in pending.iter().copied() {
         let mut candidate = DirtyRectMergeCandidate::new(rect);
         loop {
             let mut merged_any = false;
@@ -563,8 +657,9 @@ fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height
         merged.insert(insert_at, candidate);
     }
 
-    rects.reserve(merged.len());
-    rects.extend(merged.into_iter().map(|candidate| candidate.rect));
+    pending.clear();
+    pending.extend(merged.into_iter().map(|candidate| candidate.rect));
+    *rects = pending;
 }
 
 #[cfg(test)]
@@ -646,7 +741,7 @@ fn extract_region_dirty_rects(
     source_height: u32,
     blit: CaptureBlitRegion,
     out: &mut Vec<DirtyRect>,
-) -> bool {
+) -> RegionDirtyRectExtraction {
     out.clear();
     let Some(region_bounds) = clamp_dirty_rect(
         DirtyRect {
@@ -658,30 +753,73 @@ fn extract_region_dirty_rects(
         source_width,
         source_height,
     ) else {
-        return false;
+        return RegionDirtyRectExtraction::default();
     };
-    if for_each_dirty_region(frame, |raw| {
-        let Some(clamped) = clamp_dirty_region_rect(raw, source_width, source_height) else {
-            return;
-        };
 
-        let Some(intersection) = intersect_dirty_rects(clamped, region_bounds) else {
-            return;
-        };
-        out.push(DirtyRect {
-            x: intersection.x.saturating_sub(region_bounds.x),
-            y: intersection.y.saturating_sub(region_bounds.y),
-            width: intersection.width,
-            height: intersection.height,
-        });
+    let dense_fallback_enabled = region_dirty_dense_fallback_enabled();
+    let total_region_pixels =
+        (region_bounds.width as u64).saturating_mul(region_bounds.height as u64);
+    let mut dense_fallback = false;
+    let mut dirty_pixels = 0u64;
+    let mut non_empty_rects = 0usize;
+
+    if for_each_dirty_region(frame, |raw| {
+        if dense_fallback {
+            return false;
+        }
+
+        if let Some(clipped) =
+            clip_dirty_region_rect_to_region(raw, source_width, source_height, region_bounds)
+        {
+            non_empty_rects = non_empty_rects.saturating_add(1);
+            dirty_pixels = dirty_pixels
+                .saturating_add((clipped.width as u64).saturating_mul(clipped.height as u64));
+
+            let exceeds_dense_area = total_region_pixels > 0
+                && dirty_pixels.saturating_mul(100)
+                    > total_region_pixels
+                        .saturating_mul(WGC_REGION_DIRTY_DENSE_FALLBACK_AREA_PERCENT);
+            let should_force_full_copy = dense_fallback_enabled
+                && (non_empty_rects > WGC_REGION_DIRTY_DENSE_FALLBACK_HARD_MAX_RECTS
+                    || (non_empty_rects > WGC_REGION_DIRTY_DENSE_FALLBACK_MIN_RECTS
+                        && exceeds_dense_area));
+            if should_force_full_copy {
+                dense_fallback = true;
+                out.clear();
+                return false;
+            }
+
+            out.push(clipped);
+        }
+        true
     })
     .is_none()
     {
-        return false;
+        return RegionDirtyRectExtraction::default();
+    }
+
+    if dense_fallback {
+        return RegionDirtyRectExtraction {
+            available: true,
+            unchanged: false,
+            force_full_copy: true,
+        };
+    }
+
+    if non_empty_rects == 0 {
+        return RegionDirtyRectExtraction {
+            available: true,
+            unchanged: true,
+            force_full_copy: false,
+        };
     }
 
     normalize_dirty_rects_in_place(out, region_bounds.width, region_bounds.height);
-    true
+    RegionDirtyRectExtraction {
+        available: true,
+        unchanged: out.is_empty(),
+        force_full_copy: false,
+    }
 }
 
 #[inline(always)]
@@ -2514,23 +2652,29 @@ impl WindowsGraphicsCaptureCapturer {
             }
 
             let region_desc = Self::region_desc_for_blit(&effective_desc, blit);
-            let (region_dirty_available, region_unchanged) =
+            let region_dirty_extraction =
                 if source_is_duplicate && duplicate_dirty_fastpath_enabled() {
                     region_dirty_rects.clear();
-                    (true, true)
+                    RegionDirtyRectExtraction {
+                        available: true,
+                        unchanged: true,
+                        force_full_copy: false,
+                    }
                 } else {
-                    let available = extract_region_dirty_rects(
+                    let extraction = extract_region_dirty_rects(
                         &capture_frame,
                         effective_desc.Width,
                         effective_desc.Height,
                         blit,
                         &mut region_dirty_rects,
                     );
-                    if !available {
+                    if !extraction.available {
                         region_dirty_rects.clear();
                     }
-                    (available, available && region_dirty_rects.is_empty())
+                    extraction
                 };
+            let region_dirty_available = region_dirty_extraction.available;
+            let region_unchanged = region_dirty_extraction.unchanged;
 
             if self.capture_mode != CaptureMode::ScreenRecording
                 && self.has_frame_history
@@ -2549,11 +2693,15 @@ impl WindowsGraphicsCaptureCapturer {
             }
 
             let recording_mode = self.capture_mode == CaptureMode::ScreenRecording;
-            let region_dirty_strategy = evaluate_dirty_copy_strategy(
-                &region_dirty_rects,
-                region_desc.Width,
-                region_desc.Height,
-            );
+            let region_dirty_strategy = if region_dirty_extraction.force_full_copy {
+                DirtyCopyStrategy::default()
+            } else {
+                evaluate_dirty_copy_strategy(
+                    &region_dirty_rects,
+                    region_desc.Width,
+                    region_desc.Height,
+                )
+            };
             let low_latency_recording = recording_mode
                 && destination_has_history
                 && region_low_latency_slot_enabled()
@@ -3629,6 +3777,133 @@ mod tests {
         normalize_dirty_rects_in_place(out, width, height);
     }
 
+    fn extract_region_raw_dirty_rects_legacy(
+        raw_rects: &[RectInt32],
+        source_width: u32,
+        source_height: u32,
+        blit: CaptureBlitRegion,
+        out: &mut Vec<DirtyRect>,
+    ) -> RegionDirtyRectExtraction {
+        out.clear();
+        let Some(region_bounds) = clamp_dirty_rect(
+            DirtyRect {
+                x: blit.src_x,
+                y: blit.src_y,
+                width: blit.width,
+                height: blit.height,
+            },
+            source_width,
+            source_height,
+        ) else {
+            return RegionDirtyRectExtraction::default();
+        };
+
+        out.reserve(raw_rects.len());
+        for raw in raw_rects {
+            let Some(clamped) = clamp_dirty_region_rect_legacy(*raw, source_width, source_height)
+            else {
+                continue;
+            };
+            let Some(intersection) = intersect_dirty_rects(clamped, region_bounds) else {
+                continue;
+            };
+            out.push(DirtyRect {
+                x: intersection.x.saturating_sub(region_bounds.x),
+                y: intersection.y.saturating_sub(region_bounds.y),
+                width: intersection.width,
+                height: intersection.height,
+            });
+        }
+
+        normalize_dirty_rects_in_place(out, region_bounds.width, region_bounds.height);
+        RegionDirtyRectExtraction {
+            available: true,
+            unchanged: out.is_empty(),
+            force_full_copy: false,
+        }
+    }
+
+    fn extract_region_raw_dirty_rects_optimized(
+        raw_rects: &[RectInt32],
+        source_width: u32,
+        source_height: u32,
+        blit: CaptureBlitRegion,
+        dense_fallback_enabled: bool,
+        out: &mut Vec<DirtyRect>,
+    ) -> RegionDirtyRectExtraction {
+        out.clear();
+        let Some(region_bounds) = clamp_dirty_rect(
+            DirtyRect {
+                x: blit.src_x,
+                y: blit.src_y,
+                width: blit.width,
+                height: blit.height,
+            },
+            source_width,
+            source_height,
+        ) else {
+            return RegionDirtyRectExtraction::default();
+        };
+
+        let total_region_pixels =
+            (region_bounds.width as u64).saturating_mul(region_bounds.height as u64);
+        let mut dense_fallback = false;
+        let mut dirty_pixels = 0u64;
+        let mut non_empty_rects = 0usize;
+        out.reserve(raw_rects.len());
+
+        for raw in raw_rects {
+            if dense_fallback {
+                break;
+            }
+            let Some(clipped) =
+                clip_dirty_region_rect_to_region(*raw, source_width, source_height, region_bounds)
+            else {
+                continue;
+            };
+            non_empty_rects = non_empty_rects.saturating_add(1);
+            dirty_pixels = dirty_pixels
+                .saturating_add((clipped.width as u64).saturating_mul(clipped.height as u64));
+            let exceeds_dense_area = total_region_pixels > 0
+                && dirty_pixels.saturating_mul(100)
+                    > total_region_pixels
+                        .saturating_mul(WGC_REGION_DIRTY_DENSE_FALLBACK_AREA_PERCENT);
+            if dense_fallback_enabled
+                && (non_empty_rects > WGC_REGION_DIRTY_DENSE_FALLBACK_HARD_MAX_RECTS
+                    || (non_empty_rects > WGC_REGION_DIRTY_DENSE_FALLBACK_MIN_RECTS
+                        && exceeds_dense_area))
+            {
+                dense_fallback = true;
+                out.clear();
+                break;
+            }
+            out.push(clipped);
+        }
+
+        if dense_fallback {
+            return RegionDirtyRectExtraction {
+                available: true,
+                unchanged: false,
+                force_full_copy: true,
+            };
+        }
+
+        if non_empty_rects == 0 {
+            return RegionDirtyRectExtraction {
+                available: true,
+                unchanged: true,
+                force_full_copy: false,
+            };
+        }
+
+        normalize_dirty_rects_in_place(out, region_bounds.width, region_bounds.height);
+        RegionDirtyRectExtraction {
+            available: true,
+            unchanged: out.is_empty(),
+            force_full_copy: false,
+        }
+    }
+
     #[test]
     fn dirty_region_rect_clamp_matches_legacy_logic() {
         let mut state = 0x1234_5678_9abc_def0u64;
@@ -3652,6 +3927,131 @@ mod tests {
             let optimized = clamp_dirty_region_rect(raw, 1920, 1080);
             assert_eq!(optimized, legacy);
         }
+    }
+
+    #[test]
+    fn region_dirty_extraction_matches_legacy_when_dense_fallback_is_disabled() {
+        let mut raw_rects = row_major_raw_rects(32, 24, 14, 6, 36, 24, 14, 12, 84);
+        raw_rects.extend(row_major_raw_rects(680, 420, 5, 4, 22, 18, 18, 14, 20));
+
+        let blit = CaptureBlitRegion {
+            src_x: 0,
+            src_y: 0,
+            width: 1920,
+            height: 1080,
+            dst_x: 0,
+            dst_y: 0,
+        };
+
+        let mut legacy = Vec::new();
+        let mut optimized = Vec::new();
+        let legacy_state =
+            extract_region_raw_dirty_rects_legacy(&raw_rects, 1920, 1080, blit, &mut legacy);
+        let optimized_state = extract_region_raw_dirty_rects_optimized(
+            &raw_rects,
+            1920,
+            1080,
+            blit,
+            false,
+            &mut optimized,
+        );
+
+        assert_eq!(legacy_state, optimized_state);
+        assert_eq!(legacy, optimized);
+    }
+
+    #[test]
+    fn region_dirty_extraction_matches_legacy_for_out_of_bounds_rects_when_dense_fallback_disabled()
+    {
+        let blit = CaptureBlitRegion {
+            src_x: 0,
+            src_y: 0,
+            width: 1920,
+            height: 1080,
+            dst_x: 0,
+            dst_y: 0,
+        };
+
+        let mut state = 0x6a09_e667_f3bc_c909_u64;
+        for case_idx in 0..256 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let rect_count = 6 + ((state >> 7) as usize % 190);
+            let mut raw_rects = Vec::with_capacity(rect_count);
+            for _ in 0..rect_count {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let x = (((state >> 8) as i32) % 3600) - 1200;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let y = (((state >> 20) as i32) % 2200) - 700;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let width = (((state >> 28) as i32) % 960) - 80;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let height = (((state >> 36) as i32) % 720) - 60;
+                raw_rects.push(RectInt32 {
+                    X: x,
+                    Y: y,
+                    Width: width,
+                    Height: height,
+                });
+            }
+
+            let mut legacy = Vec::new();
+            let mut optimized = Vec::new();
+            let legacy_state =
+                extract_region_raw_dirty_rects_legacy(&raw_rects, 1920, 1080, blit, &mut legacy);
+            let optimized_state = extract_region_raw_dirty_rects_optimized(
+                &raw_rects,
+                1920,
+                1080,
+                blit,
+                false,
+                &mut optimized,
+            );
+
+            assert_eq!(
+                legacy_state, optimized_state,
+                "state mismatch in randomized case {case_idx}",
+            );
+            assert_eq!(
+                legacy, optimized,
+                "rect mismatch in randomized case {case_idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn region_dirty_extraction_dense_fallback_preserves_full_copy_decision() {
+        let raw_rects = row_major_raw_rects(0, 0, 45, 20, 8, 6, 2, 2, 900);
+        let blit = CaptureBlitRegion {
+            src_x: 0,
+            src_y: 0,
+            width: 1920,
+            height: 1080,
+            dst_x: 0,
+            dst_y: 0,
+        };
+
+        let mut legacy = Vec::new();
+        let mut optimized = Vec::new();
+        let legacy_state =
+            extract_region_raw_dirty_rects_legacy(&raw_rects, 1920, 1080, blit, &mut legacy);
+        let optimized_state = extract_region_raw_dirty_rects_optimized(
+            &raw_rects,
+            1920,
+            1080,
+            blit,
+            true,
+            &mut optimized,
+        );
+
+        assert!(legacy_state.available);
+        assert!(!legacy_state.unchanged);
+        let legacy_strategy = evaluate_dirty_copy_strategy(&legacy, blit.width, blit.height);
+        assert_eq!(legacy_strategy, DirtyCopyStrategy::default());
+
+        assert!(optimized_state.available);
+        assert!(!optimized_state.unchanged);
+        assert!(optimized_state.force_full_copy);
+        assert!(optimized.is_empty());
     }
 
     fn should_use_dirty_copy_legacy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
@@ -3833,6 +4233,155 @@ mod tests {
         assert!(
             optimized_ms <= legacy_ms * 1.05,
             "dirty-rect clamp/normalize regressed: legacy={legacy_ms:.3}ms optimized={optimized_ms:.3}ms ({speedup:.2}x)"
+        );
+    }
+
+    #[test]
+    #[ignore = "performance benchmark guard; run explicitly with --ignored --nocapture"]
+    fn bench_region_dirty_dense_fallback_vs_legacy() {
+        use std::hint::black_box;
+
+        let blit = CaptureBlitRegion {
+            src_x: 0,
+            src_y: 0,
+            width: 1920,
+            height: 1080,
+            dst_x: 0,
+            dst_y: 0,
+        };
+        let workloads = vec![
+            row_major_raw_rects(0, 0, 45, 20, 8, 6, 2, 2, 900),
+            row_major_raw_rects(0, 0, 20, 16, 80, 60, 16, 6, 320),
+            row_major_raw_rects(4, 6, 40, 22, 10, 8, 2, 2, 820),
+        ];
+
+        let mut legacy_rects = Vec::<DirtyRect>::new();
+        let mut optimized_rects = Vec::<DirtyRect>::new();
+        for raw_rects in &workloads {
+            let legacy_state = extract_region_raw_dirty_rects_legacy(
+                raw_rects,
+                1920,
+                1080,
+                blit,
+                &mut legacy_rects,
+            );
+            let legacy_strategy =
+                evaluate_dirty_copy_strategy(&legacy_rects, blit.width, blit.height);
+            assert!(legacy_state.available);
+            assert!(!legacy_state.unchanged);
+            assert_eq!(
+                legacy_strategy,
+                DirtyCopyStrategy::default(),
+                "workload unexpectedly eligible for dirty copy; benchmark expects full-copy fallback",
+            );
+
+            let optimized_state = extract_region_raw_dirty_rects_optimized(
+                raw_rects,
+                1920,
+                1080,
+                blit,
+                true,
+                &mut optimized_rects,
+            );
+            assert!(optimized_state.available);
+            assert!(!optimized_state.unchanged);
+            assert!(optimized_state.force_full_copy);
+            assert!(optimized_rects.is_empty());
+        }
+
+        let warmup_iters = 8_000usize;
+        let measure_iters = 70_000usize;
+        let mut sink = 0usize;
+
+        for iter in 0..warmup_iters {
+            let raw_rects = black_box(&workloads[iter % workloads.len()]);
+            let legacy_state = extract_region_raw_dirty_rects_legacy(
+                raw_rects,
+                1920,
+                1080,
+                blit,
+                &mut legacy_rects,
+            );
+            let legacy_strategy =
+                evaluate_dirty_copy_strategy(&legacy_rects, blit.width, blit.height);
+            sink ^= legacy_rects.len();
+            sink ^= legacy_state.available as usize;
+            sink ^= (legacy_strategy.cpu as usize) << 1;
+
+            let optimized_state = extract_region_raw_dirty_rects_optimized(
+                raw_rects,
+                1920,
+                1080,
+                blit,
+                true,
+                &mut optimized_rects,
+            );
+            let optimized_strategy = if optimized_state.force_full_copy {
+                DirtyCopyStrategy::default()
+            } else {
+                evaluate_dirty_copy_strategy(&optimized_rects, blit.width, blit.height)
+            };
+            sink ^= optimized_rects.len() << 1;
+            sink ^= (optimized_state.force_full_copy as usize) << 2;
+            sink ^= (optimized_strategy.gpu as usize) << 3;
+        }
+
+        let legacy_start = std::time::Instant::now();
+        for iter in 0..measure_iters {
+            let raw_rects = black_box(&workloads[iter % workloads.len()]);
+            let legacy_state = extract_region_raw_dirty_rects_legacy(
+                raw_rects,
+                1920,
+                1080,
+                blit,
+                &mut legacy_rects,
+            );
+            let legacy_strategy =
+                evaluate_dirty_copy_strategy(&legacy_rects, blit.width, blit.height);
+            sink ^= legacy_rects.len();
+            sink ^= legacy_state.available as usize;
+            sink ^= (legacy_strategy.cpu as usize) << 1;
+        }
+        let legacy_elapsed = legacy_start.elapsed();
+
+        let optimized_start = std::time::Instant::now();
+        for iter in 0..measure_iters {
+            let raw_rects = black_box(&workloads[iter % workloads.len()]);
+            let optimized_state = extract_region_raw_dirty_rects_optimized(
+                raw_rects,
+                1920,
+                1080,
+                blit,
+                true,
+                &mut optimized_rects,
+            );
+            let optimized_strategy = if optimized_state.force_full_copy {
+                DirtyCopyStrategy::default()
+            } else {
+                evaluate_dirty_copy_strategy(&optimized_rects, blit.width, blit.height)
+            };
+            sink ^= optimized_rects.len() << 1;
+            sink ^= (optimized_state.force_full_copy as usize) << 2;
+            sink ^= (optimized_strategy.gpu as usize) << 3;
+        }
+        let optimized_elapsed = optimized_start.elapsed();
+
+        black_box(sink);
+
+        let legacy_ms = legacy_elapsed.as_secs_f64() * 1000.0;
+        let optimized_ms = optimized_elapsed.as_secs_f64() * 1000.0;
+        let speedup = if optimized_ms > 0.0 {
+            legacy_ms / optimized_ms
+        } else {
+            f64::INFINITY
+        };
+        println!(
+            "wgc region dense-fallback benchmark: legacy={legacy_ms:.3} ms optimized={optimized_ms:.3} ms speedup={speedup:.2}x"
+        );
+
+        assert!(
+            optimized_ms <= legacy_ms * 0.90,
+            "dense-fallback path did not improve enough: legacy={legacy_ms:.3}ms optimized={optimized_ms:.3}ms ({speedup:.2}x)"
         );
     }
 

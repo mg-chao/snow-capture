@@ -508,6 +508,12 @@ Tip: compare WGC dirty-region batch fetching in region mode:
   legacy (cmd.exe):    setlocal && set SNOW_CAPTURE_WGC_DISABLE_DIRTY_REGION_BATCH_FETCH=1 && cargo run --release --example benchmark -- --backends wgc --region-center 1600x900 --sample-interval-ms 8 && endlocal
   legacy (bash):       SNOW_CAPTURE_WGC_DISABLE_DIRTY_REGION_BATCH_FETCH=1 cargo run --release --example benchmark -- --backends wgc --region-center 1600x900 --sample-interval-ms 8
 
+Tip: compare WGC dense dirty-region fallback in region mode:
+  optimized: cargo run --release --example benchmark -- --backends wgc --region-center 1920x1080 --sample-interval-ms 8
+  legacy (PowerShell): $env:SNOW_CAPTURE_WGC_DISABLE_REGION_DIRTY_DENSE_FALLBACK=1; cargo run --release --example benchmark -- --backends wgc --region-center 1920x1080 --sample-interval-ms 8; Remove-Item Env:SNOW_CAPTURE_WGC_DISABLE_REGION_DIRTY_DENSE_FALLBACK
+  legacy (cmd.exe):    setlocal && set SNOW_CAPTURE_WGC_DISABLE_REGION_DIRTY_DENSE_FALLBACK=1 && cargo run --release --example benchmark -- --backends wgc --region-center 1920x1080 --sample-interval-ms 8 && endlocal
+  legacy (bash):       SNOW_CAPTURE_WGC_DISABLE_REGION_DIRTY_DENSE_FALLBACK=1 cargo run --release --example benchmark -- --backends wgc --region-center 1920x1080 --sample-interval-ms 8
+
 Tip: compare the GDI span single-scan incremental path (sequential + parallel):
   optimized: cargo run --release --example benchmark -- --backends gdi --region-center 1600x900
   legacy (PowerShell): $env:SNOW_CAPTURE_DISABLE_GDI_SPAN_SINGLE_SCAN=1; cargo run --release --example benchmark -- --backends gdi --region-center 1600x900; Remove-Item Env:SNOW_CAPTURE_DISABLE_GDI_SPAN_SINGLE_SCAN

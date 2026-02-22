@@ -22,6 +22,7 @@ cargo test --release platform::windows::gdi::tests::bench_parallel_span_scan_vs_
 cargo test --release platform::windows::gdi::tests::bench_parallel_span_auto_vs_compare_then_diff_sparse_damage -- --ignored --nocapture
 cargo test --release platform::windows::gdi::tests::bench_parallel_span_auto_vs_compare_then_diff_duplicate_surface -- --ignored --nocapture
 cargo test --release platform::windows::wgc::tests::bench_dirty_region_rect_clamp_and_normalize_vs_legacy -- --ignored --nocapture
+cargo test --release platform::windows::wgc::tests::bench_region_dirty_dense_fallback_vs_legacy -- --ignored --nocapture
 ```
 
 The test prints timing and fails if the optimized path regresses materially versus legacy.
@@ -44,6 +45,7 @@ Useful options:
 - `-GuardBaselinePath <csv>`: enforce regression check against a saved baseline
 - `-MinImprovementPct <value>`: required p50 improvement vs legacy
 - `-MaxDuplicatePct <value>`: duplicate-frame budget guard for workload validity
+- Legacy toggle for dense region fallback: `SNOW_CAPTURE_WGC_DISABLE_REGION_DIRTY_DENSE_FALLBACK=1`
 - Legacy toggle for A/B: `SNOW_CAPTURE_DISABLE_GDI_SPAN_SINGLE_SCAN=1`
 
 ## 3) End-to-end display benchmark: WGC dirty-region batch fetch

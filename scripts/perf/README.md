@@ -23,6 +23,7 @@ cargo test --release platform::windows::gdi::tests::bench_parallel_span_auto_vs_
 cargo test --release platform::windows::gdi::tests::bench_parallel_span_auto_vs_compare_then_diff_duplicate_surface -- --ignored --nocapture
 cargo test --release platform::windows::wgc::tests::bench_dirty_region_rect_clamp_and_normalize_vs_legacy -- --ignored --nocapture
 cargo test --release platform::windows::wgc::tests::bench_region_dirty_dense_fallback_vs_legacy -- --ignored --nocapture
+cargo test --release platform::windows::wgc::tests::bench_full_dirty_dense_fallback_vs_legacy -- --ignored --nocapture
 cargo test --release platform::windows::surface::tests::bench_trusted_direct_hints_vs_runtime_scan -- --ignored --nocapture
 cargo test --release platform::windows::surface::tests::bench_trusted_direct_bgra_batch_kernel_vs_legacy_dispatch -- --ignored --nocapture
 cargo test --release platform::windows::duplication::tests::bench_direct_region_dirty_extract_clip_vs_legacy -- --ignored --nocapture
@@ -93,3 +94,4 @@ Useful toggles for focused A/B:
 
 - `SNOW_CAPTURE_DISABLE_DIRTY_RECT_TRUSTED_DIRECT=1`: force the pre-batch trusted direct path
 - `SNOW_CAPTURE_DISABLE_DIRTY_RECT_BGRA_BATCH_KERNEL=1`: disable BGRA batch row-kernel dispatch
+- `SNOW_CAPTURE_WGC_DISABLE_FULL_DIRTY_DENSE_FALLBACK=1`: disable WGC full-frame dense dirty fallback

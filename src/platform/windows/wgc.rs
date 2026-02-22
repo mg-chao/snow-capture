@@ -55,6 +55,9 @@ const WGC_DIRTY_GPU_COPY_MAX_RECTS: usize = 64;
 const WGC_DIRTY_GPU_COPY_MAX_AREA_PERCENT: u64 = 45;
 const WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS: usize = 8;
 const WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT: u64 = 18;
+const WGC_FULL_DIRTY_DENSE_FALLBACK_MIN_RECTS: usize = WGC_DIRTY_COPY_MAX_RECTS + 32;
+const WGC_FULL_DIRTY_DENSE_FALLBACK_HARD_MAX_RECTS: usize = WGC_DIRTY_COPY_MAX_RECTS * 4;
+const WGC_FULL_DIRTY_DENSE_FALLBACK_AREA_PERCENT: u64 = 72;
 const WGC_REGION_DIRTY_DENSE_FALLBACK_MIN_RECTS: usize = WGC_DIRTY_COPY_MAX_RECTS + 32;
 const WGC_REGION_DIRTY_DENSE_FALLBACK_HARD_MAX_RECTS: usize = WGC_DIRTY_COPY_MAX_RECTS * 4;
 const WGC_REGION_DIRTY_DENSE_FALLBACK_AREA_PERCENT: u64 = 72;
@@ -145,6 +148,12 @@ fn region_full_slot_map_fastpath_enabled() -> bool {
 fn region_dirty_dense_fallback_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_REGION_DIRTY_DENSE_FALLBACK"))
+}
+
+#[inline]
+fn full_dirty_dense_fallback_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_FULL_DIRTY_DENSE_FALLBACK"))
 }
 
 #[inline]
@@ -406,12 +415,61 @@ fn extract_dirty_rects(
     out: &mut Vec<DirtyRect>,
 ) -> Option<GraphicsCaptureDirtyRegionMode> {
     out.clear();
+    let dense_fallback_enabled = full_dirty_dense_fallback_enabled();
+    if !dense_fallback_enabled {
+        let mode = for_each_dirty_region(frame, |raw| {
+            if let Some(clamped) = clamp_dirty_region_rect(raw, width, height) {
+                out.push(clamped);
+            }
+            true
+        })?;
+
+        normalize_dirty_rects_in_place(out, width, height);
+        return Some(mode);
+    }
+
+    let total_pixels = (width as u64).saturating_mul(height as u64);
+    let mut dense_fallback = false;
+    let mut dirty_pixels = 0u64;
+    let mut non_empty_rects = 0usize;
+
     let mode = for_each_dirty_region(frame, |raw| {
+        if dense_fallback {
+            return false;
+        }
+
         if let Some(clamped) = clamp_dirty_region_rect(raw, width, height) {
+            non_empty_rects = non_empty_rects.saturating_add(1);
+            dirty_pixels = dirty_pixels
+                .saturating_add((clamped.width as u64).saturating_mul(clamped.height as u64));
+            let exceeds_dense_area = total_pixels > 0
+                && dirty_pixels.saturating_mul(100)
+                    > total_pixels.saturating_mul(WGC_FULL_DIRTY_DENSE_FALLBACK_AREA_PERCENT);
+            let should_force_full_copy = non_empty_rects
+                > WGC_FULL_DIRTY_DENSE_FALLBACK_HARD_MAX_RECTS
+                || (non_empty_rects > WGC_FULL_DIRTY_DENSE_FALLBACK_MIN_RECTS
+                    && exceeds_dense_area);
+            if should_force_full_copy {
+                dense_fallback = true;
+                out.clear();
+                if width > 0 && height > 0 {
+                    out.push(DirtyRect {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                    });
+                }
+                return false;
+            }
             out.push(clamped);
         }
         true
     })?;
+
+    if dense_fallback {
+        return Some(mode);
+    }
 
     normalize_dirty_rects_in_place(out, width, height);
     Some(mode)
@@ -2759,8 +2817,7 @@ impl WindowsGraphicsCaptureCapturer {
                     slot.hdr_to_sdr = effective_hdr;
                     slot.source_desc = Some(region_desc);
                     slot.dirty_mode_available = region_dirty_available;
-                    slot.dirty_rects.clear();
-                    slot.dirty_rects.extend_from_slice(&region_dirty_rects);
+                    std::mem::swap(&mut slot.dirty_rects, &mut region_dirty_rects);
                     let dirty_gpu_copy_preferred = if low_latency_recording {
                         region_dirty_strategy.gpu_low_latency
                     } else {
@@ -3029,8 +3086,7 @@ impl WindowsGraphicsCaptureCapturer {
                 {
                     let slot = &mut self.staging_slots[write_slot];
                     slot.dirty_mode_available = source_dirty_available;
-                    slot.dirty_rects.clear();
-                    slot.dirty_rects.extend_from_slice(&source_dirty_rects);
+                    std::mem::swap(&mut slot.dirty_rects, &mut source_dirty_rects);
                     let strategy = evaluate_dirty_copy_strategy(
                         &slot.dirty_rects,
                         effective_desc.Width,
@@ -3904,6 +3960,92 @@ mod tests {
         }
     }
 
+    fn extract_full_raw_dirty_rects_legacy(
+        raw_rects: &[RectInt32],
+        width: u32,
+        height: u32,
+        out: &mut Vec<DirtyRect>,
+    ) -> RegionDirtyRectExtraction {
+        out.clear();
+        out.reserve(raw_rects.len());
+        for raw in raw_rects {
+            if let Some(clamped) = clamp_dirty_region_rect_legacy(*raw, width, height) {
+                out.push(clamped);
+            }
+        }
+        normalize_dirty_rects_in_place(out, width, height);
+        RegionDirtyRectExtraction {
+            available: true,
+            unchanged: out.is_empty(),
+            force_full_copy: false,
+        }
+    }
+
+    fn extract_full_raw_dirty_rects_optimized(
+        raw_rects: &[RectInt32],
+        width: u32,
+        height: u32,
+        dense_fallback_enabled: bool,
+        out: &mut Vec<DirtyRect>,
+    ) -> RegionDirtyRectExtraction {
+        out.clear();
+        let total_pixels = (width as u64).saturating_mul(height as u64);
+        let mut dense_fallback = false;
+        let mut dirty_pixels = 0u64;
+        let mut non_empty_rects = 0usize;
+        out.reserve(raw_rects.len());
+
+        for raw in raw_rects {
+            if dense_fallback {
+                break;
+            }
+            let Some(clamped) = clamp_dirty_region_rect(*raw, width, height) else {
+                continue;
+            };
+            non_empty_rects = non_empty_rects.saturating_add(1);
+            dirty_pixels = dirty_pixels
+                .saturating_add((clamped.width as u64).saturating_mul(clamped.height as u64));
+
+            let exceeds_dense_area = total_pixels > 0
+                && dirty_pixels.saturating_mul(100)
+                    > total_pixels.saturating_mul(WGC_FULL_DIRTY_DENSE_FALLBACK_AREA_PERCENT);
+            if dense_fallback_enabled
+                && (non_empty_rects > WGC_FULL_DIRTY_DENSE_FALLBACK_HARD_MAX_RECTS
+                    || (non_empty_rects > WGC_FULL_DIRTY_DENSE_FALLBACK_MIN_RECTS
+                        && exceeds_dense_area))
+            {
+                dense_fallback = true;
+                out.clear();
+                if width > 0 && height > 0 {
+                    out.push(DirtyRect {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                    });
+                }
+                break;
+            }
+
+            out.push(clamped);
+        }
+
+        if dense_fallback {
+            return RegionDirtyRectExtraction {
+                available: true,
+                unchanged: false,
+                force_full_copy: true,
+            };
+        }
+
+        normalize_dirty_rects_in_place(out, width, height);
+        RegionDirtyRectExtraction {
+            available: true,
+            unchanged: out.is_empty(),
+            force_full_copy: false,
+        }
+    }
+
     #[test]
     fn dirty_region_rect_clamp_matches_legacy_logic() {
         let mut state = 0x1234_5678_9abc_def0u64;
@@ -4052,6 +4194,101 @@ mod tests {
         assert!(!optimized_state.unchanged);
         assert!(optimized_state.force_full_copy);
         assert!(optimized.is_empty());
+    }
+
+    #[test]
+    fn full_dirty_extraction_matches_legacy_when_dense_fallback_is_disabled() {
+        let mut raw_rects = row_major_raw_rects(24, 20, 16, 8, 24, 20, 12, 10, 128);
+        raw_rects.extend(row_major_raw_rects(640, 360, 6, 5, 18, 14, 16, 12, 30));
+
+        let mut legacy = Vec::new();
+        let mut optimized = Vec::new();
+        let legacy_state = extract_full_raw_dirty_rects_legacy(&raw_rects, 1920, 1080, &mut legacy);
+        let optimized_state =
+            extract_full_raw_dirty_rects_optimized(&raw_rects, 1920, 1080, false, &mut optimized);
+
+        assert_eq!(legacy_state, optimized_state);
+        assert_eq!(legacy, optimized);
+    }
+
+    #[test]
+    fn full_dirty_extraction_matches_legacy_for_out_of_bounds_rects_when_dense_fallback_disabled() {
+        let mut state = 0x510e_527f_9b05_688c_u64;
+        for case_idx in 0..256 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let rect_count = 6 + ((state >> 7) as usize % 190);
+            let mut raw_rects = Vec::with_capacity(rect_count);
+            for _ in 0..rect_count {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let x = (((state >> 8) as i32) % 3600) - 1200;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let y = (((state >> 20) as i32) % 2200) - 700;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let width = (((state >> 28) as i32) % 960) - 80;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let height = (((state >> 36) as i32) % 720) - 60;
+                raw_rects.push(RectInt32 {
+                    X: x,
+                    Y: y,
+                    Width: width,
+                    Height: height,
+                });
+            }
+
+            let mut legacy = Vec::new();
+            let mut optimized = Vec::new();
+            let legacy_state =
+                extract_full_raw_dirty_rects_legacy(&raw_rects, 1920, 1080, &mut legacy);
+            let optimized_state = extract_full_raw_dirty_rects_optimized(
+                &raw_rects,
+                1920,
+                1080,
+                false,
+                &mut optimized,
+            );
+
+            assert_eq!(
+                legacy_state, optimized_state,
+                "state mismatch in randomized case {case_idx}",
+            );
+            assert_eq!(
+                legacy, optimized,
+                "rect mismatch in randomized case {case_idx}",
+            );
+        }
+    }
+
+    #[test]
+    fn full_dirty_extraction_dense_fallback_preserves_full_copy_decision() {
+        let raw_rects = row_major_raw_rects(0, 0, 45, 20, 8, 6, 2, 2, 900);
+
+        let mut legacy = Vec::new();
+        let mut optimized = Vec::new();
+        let legacy_state = extract_full_raw_dirty_rects_legacy(&raw_rects, 1920, 1080, &mut legacy);
+        let optimized_state =
+            extract_full_raw_dirty_rects_optimized(&raw_rects, 1920, 1080, true, &mut optimized);
+
+        assert!(legacy_state.available);
+        assert!(!legacy_state.unchanged);
+        let legacy_strategy = evaluate_dirty_copy_strategy(&legacy, 1920, 1080);
+        assert_eq!(legacy_strategy, DirtyCopyStrategy::default());
+
+        assert!(optimized_state.available);
+        assert!(!optimized_state.unchanged);
+        assert!(optimized_state.force_full_copy);
+        assert_eq!(
+            optimized,
+            vec![DirtyRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }],
+        );
+        let optimized_strategy = evaluate_dirty_copy_strategy(&optimized, 1920, 1080);
+        assert!(!optimized_strategy.cpu);
+        assert!(!optimized_strategy.gpu);
+        assert!(!optimized_strategy.gpu_low_latency);
     }
 
     fn should_use_dirty_copy_legacy(rects: &[DirtyRect], width: u32, height: u32) -> bool {
@@ -4382,6 +4619,121 @@ mod tests {
         assert!(
             optimized_ms <= legacy_ms * 0.90,
             "dense-fallback path did not improve enough: legacy={legacy_ms:.3}ms optimized={optimized_ms:.3}ms ({speedup:.2}x)"
+        );
+    }
+
+    #[test]
+    #[ignore = "performance benchmark guard; run explicitly with --ignored --nocapture"]
+    fn bench_full_dirty_dense_fallback_vs_legacy() {
+        use std::hint::black_box;
+
+        let workloads = vec![
+            row_major_raw_rects(0, 0, 45, 20, 8, 6, 2, 2, 900),
+            row_major_raw_rects(4, 4, 44, 20, 9, 7, 2, 2, 880),
+            row_major_raw_rects(8, 6, 41, 20, 10, 8, 2, 2, 820),
+        ];
+
+        let mut legacy_rects = Vec::<DirtyRect>::new();
+        let mut optimized_rects = Vec::<DirtyRect>::new();
+        for raw_rects in &workloads {
+            let legacy_state =
+                extract_full_raw_dirty_rects_legacy(raw_rects, 1920, 1080, &mut legacy_rects);
+            let legacy_strategy = evaluate_dirty_copy_strategy(&legacy_rects, 1920, 1080);
+            assert!(legacy_state.available);
+            assert!(!legacy_state.unchanged);
+            assert_eq!(
+                legacy_strategy,
+                DirtyCopyStrategy::default(),
+                "workload unexpectedly eligible for dirty copy; benchmark expects full-copy fallback",
+            );
+
+            let optimized_state = extract_full_raw_dirty_rects_optimized(
+                raw_rects,
+                1920,
+                1080,
+                true,
+                &mut optimized_rects,
+            );
+            let optimized_strategy = evaluate_dirty_copy_strategy(&optimized_rects, 1920, 1080);
+            assert!(optimized_state.available);
+            assert!(!optimized_state.unchanged);
+            assert!(optimized_state.force_full_copy);
+            assert!(!optimized_strategy.cpu);
+            assert!(!optimized_strategy.gpu);
+            assert!(!optimized_strategy.gpu_low_latency);
+        }
+
+        let warmup_iters = 8_000usize;
+        let measure_iters = 70_000usize;
+        let mut sink = 0usize;
+
+        for iter in 0..warmup_iters {
+            let raw_rects = black_box(&workloads[iter % workloads.len()]);
+            let legacy_state =
+                extract_full_raw_dirty_rects_legacy(raw_rects, 1920, 1080, &mut legacy_rects);
+            let legacy_strategy = evaluate_dirty_copy_strategy(&legacy_rects, 1920, 1080);
+            sink ^= legacy_rects.len();
+            sink ^= legacy_state.available as usize;
+            sink ^= (legacy_strategy.cpu as usize) << 1;
+
+            let optimized_state = extract_full_raw_dirty_rects_optimized(
+                raw_rects,
+                1920,
+                1080,
+                true,
+                &mut optimized_rects,
+            );
+            let optimized_strategy = evaluate_dirty_copy_strategy(&optimized_rects, 1920, 1080);
+            sink ^= optimized_rects.len() << 1;
+            sink ^= (optimized_state.force_full_copy as usize) << 2;
+            sink ^= (optimized_strategy.gpu as usize) << 3;
+        }
+
+        let legacy_start = std::time::Instant::now();
+        for iter in 0..measure_iters {
+            let raw_rects = black_box(&workloads[iter % workloads.len()]);
+            let legacy_state =
+                extract_full_raw_dirty_rects_legacy(raw_rects, 1920, 1080, &mut legacy_rects);
+            let legacy_strategy = evaluate_dirty_copy_strategy(&legacy_rects, 1920, 1080);
+            sink ^= legacy_rects.len();
+            sink ^= legacy_state.available as usize;
+            sink ^= (legacy_strategy.cpu as usize) << 1;
+        }
+        let legacy_elapsed = legacy_start.elapsed();
+
+        let optimized_start = std::time::Instant::now();
+        for iter in 0..measure_iters {
+            let raw_rects = black_box(&workloads[iter % workloads.len()]);
+            let optimized_state = extract_full_raw_dirty_rects_optimized(
+                raw_rects,
+                1920,
+                1080,
+                true,
+                &mut optimized_rects,
+            );
+            let optimized_strategy = evaluate_dirty_copy_strategy(&optimized_rects, 1920, 1080);
+            sink ^= optimized_rects.len() << 1;
+            sink ^= (optimized_state.force_full_copy as usize) << 2;
+            sink ^= (optimized_strategy.gpu as usize) << 3;
+        }
+        let optimized_elapsed = optimized_start.elapsed();
+
+        black_box(sink);
+
+        let legacy_ms = legacy_elapsed.as_secs_f64() * 1000.0;
+        let optimized_ms = optimized_elapsed.as_secs_f64() * 1000.0;
+        let speedup = if optimized_ms > 0.0 {
+            legacy_ms / optimized_ms
+        } else {
+            f64::INFINITY
+        };
+        println!(
+            "wgc full-frame dense-fallback benchmark: legacy={legacy_ms:.3} ms optimized={optimized_ms:.3} ms speedup={speedup:.2}x"
+        );
+
+        assert!(
+            optimized_ms <= legacy_ms * 0.90,
+            "full-frame dense-fallback path did not improve enough: legacy={legacy_ms:.3}ms optimized={optimized_ms:.3}ms ({speedup:.2}x)"
         );
     }
 

@@ -155,6 +155,19 @@ fn map_resource_read_with_spin(
     Ok(mapped)
 }
 
+#[inline(always)]
+fn map_resource_read_blocking(
+    context: &ID3D11DeviceContext,
+    resource: &ID3D11Resource,
+    map_context: &'static str,
+) -> CaptureResult<D3D11_MAPPED_SUBRESOURCE> {
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    unsafe { context.Map(resource, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
+        .context(map_context)
+        .map_err(CaptureError::Platform)?;
+    Ok(mapped)
+}
+
 #[derive(Clone, Copy)]
 struct DirtyRectWorkItem {
     src_offset: usize,
@@ -654,7 +667,7 @@ pub(crate) fn copy_mapped_surface_to_frame(
 ///
 /// When `staging_resource` is `Some`, the pre-cached `ID3D11Resource` is
 /// used directly, avoiding a COM `QueryInterface` (`cast()`) on every call.
-pub(crate) fn map_staging_to_frame(
+fn map_staging_to_frame_internal(
     context: &ID3D11DeviceContext,
     staging: &ID3D11Texture2D,
     staging_resource: Option<&ID3D11Resource>,
@@ -662,6 +675,7 @@ pub(crate) fn map_staging_to_frame(
     frame: &mut Frame,
     hdr_to_sdr: Option<HdrToSdrParams>,
     map_context: &'static str,
+    use_spin_map: bool,
 ) -> CaptureResult<()> {
     let owned_resource;
     let resource = match staging_resource {
@@ -675,13 +689,61 @@ pub(crate) fn map_staging_to_frame(
         }
     };
 
-    let mapped = map_resource_read_with_spin(context, resource, map_context)?;
+    let mapped = if use_spin_map {
+        map_resource_read_with_spin(context, resource, map_context)?
+    } else {
+        map_resource_read_blocking(context, resource, map_context)?
+    };
 
     let result = copy_mapped_surface_to_frame(frame, desc, &mapped, hdr_to_sdr);
     unsafe {
         context.Unmap(resource, 0);
     }
     result
+}
+
+pub(crate) fn map_staging_to_frame(
+    context: &ID3D11DeviceContext,
+    staging: &ID3D11Texture2D,
+    staging_resource: Option<&ID3D11Resource>,
+    desc: &D3D11_TEXTURE2D_DESC,
+    frame: &mut Frame,
+    hdr_to_sdr: Option<HdrToSdrParams>,
+    map_context: &'static str,
+) -> CaptureResult<()> {
+    map_staging_to_frame_internal(
+        context,
+        staging,
+        staging_resource,
+        desc,
+        frame,
+        hdr_to_sdr,
+        map_context,
+        true,
+    )
+}
+
+/// Blocking map variant for screenshot-style single-shot paths where
+/// immediate completion is preferred over spin polling.
+pub(crate) fn map_staging_to_frame_blocking(
+    context: &ID3D11DeviceContext,
+    staging: &ID3D11Texture2D,
+    staging_resource: Option<&ID3D11Resource>,
+    desc: &D3D11_TEXTURE2D_DESC,
+    frame: &mut Frame,
+    hdr_to_sdr: Option<HdrToSdrParams>,
+    map_context: &'static str,
+) -> CaptureResult<()> {
+    map_staging_to_frame_internal(
+        context,
+        staging,
+        staging_resource,
+        desc,
+        frame,
+        hdr_to_sdr,
+        map_context,
+        false,
+    )
 }
 
 /// Map a populated staging texture and convert a source sub-rectangle into

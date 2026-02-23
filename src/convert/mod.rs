@@ -791,18 +791,7 @@ fn f16_nt_supported() -> bool {
 
 #[inline]
 fn bgra_nt_unaligned_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_BGRA_NT_UNALIGNED")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
-    })
+    true
 }
 
 #[cfg(target_arch = "x86_64")]

@@ -41,8 +41,6 @@ use super::gpu_tonemap::{GpuF16Converter, GpuTonemapper};
 use super::monitor::{HdrMonitorMetadata, MonitorResolver};
 use super::surface::{self, StagingSampleDesc};
 
-use crate::env_config::define_env_flag;
-
 const WGC_FRAME_TIMEOUT: Duration = Duration::from_millis(250);
 const WGC_STALE_FRAME_TIMEOUT_MIN: Duration = Duration::from_micros(400);
 const WGC_STALE_FRAME_TIMEOUT_MAX: Duration = Duration::from_millis(2);
@@ -134,21 +132,6 @@ struct WgcStaleTimeoutConfig {
     increase_step: Duration,
 }
 
-define_env_flag!(enabled_unless(region_dirty_gpu_copy_enabled, "SNOW_CAPTURE_WGC_DISABLE_REGION_DIRTY_GPU_COPY"));
-define_env_flag!(enabled_unless(duplicate_dirty_fastpath_enabled, "SNOW_CAPTURE_WGC_DISABLE_DUPLICATE_DIRTY_FASTPATH"));
-define_env_flag!(enabled_unless(immediate_stale_return_enabled, "SNOW_CAPTURE_WGC_DISABLE_IMMEDIATE_STALE_RETURN"));
-define_env_flag!(enabled_unless(region_duplicate_short_circuit_enabled, "SNOW_CAPTURE_WGC_DISABLE_REGION_DUPLICATE_SHORTCIRCUIT"));
-define_env_flag!(enabled_when(region_low_latency_slot_enabled, "SNOW_CAPTURE_WGC_ENABLE_REGION_LOW_LATENCY_SLOT"));
-define_env_flag!(enabled_unless(region_full_slot_map_fastpath_enabled, "SNOW_CAPTURE_WGC_DISABLE_REGION_FULL_SLOT_MAP"));
-define_env_flag!(enabled_unless(region_dirty_dense_fallback_enabled, "SNOW_CAPTURE_WGC_DISABLE_REGION_DIRTY_DENSE_FALLBACK"));
-define_env_flag!(enabled_unless(full_dirty_dense_fallback_enabled, "SNOW_CAPTURE_WGC_DISABLE_FULL_DIRTY_DENSE_FALLBACK"));
-define_env_flag!(enabled_unless(dirty_rect_conversion_hints_enabled, "SNOW_CAPTURE_WGC_DISABLE_DIRTY_HINTS"));
-define_env_flag!(enabled_unless(dirty_region_batch_fetch_enabled, "SNOW_CAPTURE_WGC_DISABLE_DIRTY_REGION_BATCH_FETCH"));
-define_env_flag!(enabled_unless(duplicate_short_circuit_enabled, "SNOW_CAPTURE_WGC_DISABLE_DUPLICATE_SHORTCIRCUIT"));
-define_env_flag!(enabled_unless(borrowed_source_resource_cast_enabled, "SNOW_CAPTURE_WGC_DISABLE_BORROWED_SOURCE_RESOURCE"));
-define_env_flag!(enabled_unless(borrowed_slot_resource_enabled, "SNOW_CAPTURE_WGC_DISABLE_BORROWED_SLOT_RESOURCE"));
-define_env_flag!(enabled_unless(aggressive_stale_timeout_enabled, "SNOW_CAPTURE_WGC_DISABLE_AGGRESSIVE_STALE_TIMEOUT"));
-
 #[inline(always)]
 fn stale_timeout_config(aggressive: bool) -> WgcStaleTimeoutConfig {
     if aggressive {
@@ -172,7 +155,7 @@ fn stale_timeout_config(aggressive: bool) -> WgcStaleTimeoutConfig {
 
 #[inline(always)]
 fn active_stale_timeout_config() -> WgcStaleTimeoutConfig {
-    stale_timeout_config(aggressive_stale_timeout_enabled())
+    stale_timeout_config(true)
 }
 
 #[inline(always)]
@@ -347,27 +330,25 @@ fn for_each_dirty_region(
     }
 
     let mut start_idx = 0u32;
-    if dirty_region_batch_fetch_enabled() {
-        let mut batch = [RectInt32::default(); WGC_DIRTY_REGION_FETCH_BATCH];
-        while start_idx < count {
-            let remaining = usize::try_from(count - start_idx).ok()?;
-            let batch_len = remaining.min(batch.len());
-            let fetched = match regions.GetMany(start_idx, &mut batch[..batch_len]) {
-                Ok(value) => value,
-                Err(_) => break,
-            };
-            let fetched_len = usize::try_from(fetched).ok()?.min(batch_len);
-            if fetched_len == 0 {
-                break;
-            }
-
-            for raw in &batch[..fetched_len] {
-                if !visit(*raw) {
-                    return Some(mode);
-                }
-            }
-            start_idx = start_idx.saturating_add(u32::try_from(fetched_len).ok()?);
+    let mut batch = [RectInt32::default(); WGC_DIRTY_REGION_FETCH_BATCH];
+    while start_idx < count {
+        let remaining = usize::try_from(count - start_idx).ok()?;
+        let batch_len = remaining.min(batch.len());
+        let fetched = match regions.GetMany(start_idx, &mut batch[..batch_len]) {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        let fetched_len = usize::try_from(fetched).ok()?.min(batch_len);
+        if fetched_len == 0 {
+            break;
         }
+
+        for raw in &batch[..fetched_len] {
+            if !visit(*raw) {
+                return Some(mode);
+            }
+        }
+        start_idx = start_idx.saturating_add(u32::try_from(fetched_len).ok()?);
     }
 
     if start_idx < count {
@@ -390,21 +371,6 @@ fn extract_dirty_rects(
     out: &mut Vec<DirtyRect>,
 ) -> Option<GraphicsCaptureDirtyRegionMode> {
     out.clear();
-    let dense_fallback_enabled = full_dirty_dense_fallback_enabled();
-    if !dense_fallback_enabled {
-        let mut sorted_hint = true;
-        let mut previous_rect = None;
-        let mode = for_each_dirty_region(frame, |raw| {
-            if let Some(clamped) = clamp_dirty_region_rect(raw, width, height) {
-                update_dirty_rect_sort_hint(&mut sorted_hint, &mut previous_rect, clamped);
-                out.push(clamped);
-            }
-            true
-        })?;
-
-        normalize_dirty_rects_preclamped_in_place(out, width, height, sorted_hint);
-        return Some(mode);
-    }
 
     let total_pixels = (width as u64).saturating_mul(height as u64);
     let mut dense_fallback = false;
@@ -480,11 +446,13 @@ thread_local! {
     static DIRTY_RECT_MERGE_SCRATCH: RefCell<Vec<dirty_rect::DirtyRectMergeCandidate>> = const { RefCell::new(Vec::new()) };
 }
 
+#[cfg(test)]
 #[inline(always)]
 fn dirty_rect_order_non_decreasing(previous: DirtyRect, current: DirtyRect) -> bool {
     current.y > previous.y || (current.y == previous.y && current.x >= previous.x)
 }
 
+#[cfg(test)]
 #[inline(always)]
 fn update_dirty_rect_sort_hint(
     sorted: &mut bool,
@@ -656,15 +624,11 @@ fn extract_region_dirty_rects(
         return RegionDirtyRectExtraction::default();
     };
 
-    let dense_fallback_enabled = region_dirty_dense_fallback_enabled();
     let total_region_pixels =
         (region_bounds.width as u64).saturating_mul(region_bounds.height as u64);
     let mut dense_fallback = false;
     let mut dirty_pixels = 0u64;
     let mut non_empty_rects = 0usize;
-    let track_sorted_hint = !dense_fallback_enabled;
-    let mut sorted_hint = track_sorted_hint;
-    let mut previous_rect = None;
 
     if for_each_dirty_region(frame, |raw| {
         if dense_fallback {
@@ -680,19 +644,16 @@ fn extract_region_dirty_rects(
                 && dirty_pixels.saturating_mul(100)
                     > total_region_pixels
                         .saturating_mul(WGC_REGION_DIRTY_DENSE_FALLBACK_AREA_PERCENT);
-            let should_force_full_copy = dense_fallback_enabled
-                && (non_empty_rects > WGC_REGION_DIRTY_DENSE_FALLBACK_HARD_MAX_RECTS
-                    || (non_empty_rects > WGC_REGION_DIRTY_DENSE_FALLBACK_MIN_RECTS
-                        && exceeds_dense_area));
+            let should_force_full_copy = non_empty_rects
+                > WGC_REGION_DIRTY_DENSE_FALLBACK_HARD_MAX_RECTS
+                || (non_empty_rects > WGC_REGION_DIRTY_DENSE_FALLBACK_MIN_RECTS
+                    && exceeds_dense_area);
             if should_force_full_copy {
                 dense_fallback = true;
                 out.clear();
                 return false;
             }
 
-            if track_sorted_hint {
-                update_dirty_rect_sort_hint(&mut sorted_hint, &mut previous_rect, clipped);
-            }
             out.push(clipped);
         }
         true
@@ -722,7 +683,7 @@ fn extract_region_dirty_rects(
         out,
         region_bounds.width,
         region_bounds.height,
-        track_sorted_hint && sorted_hint,
+        false,
     );
     RegionDirtyRectExtraction {
         available: true,
@@ -737,10 +698,6 @@ fn dirty_rect_conversion_hints(
     dirty_pixels: u64,
     trusted_bounds: bool,
 ) -> surface::DirtyRectConversionHints {
-    if !dirty_rect_conversion_hints_enabled() {
-        return surface::DirtyRectConversionHints::default();
-    }
-
     surface::DirtyRectConversionHints {
         trusted_bounds,
         non_empty_rects: Some(rects.len()),
@@ -787,14 +744,12 @@ fn should_use_low_latency_dirty_gpu_copy(rects: &[DirtyRect], width: u32, height
 
 #[inline(always)]
 fn should_short_circuit_region_duplicate(
-    optimization_enabled: bool,
     capture_mode: CaptureMode,
     destination_has_history: bool,
     source_is_duplicate: bool,
     pending_slot_available: bool,
 ) -> bool {
     should_short_circuit_duplicate(
-        optimization_enabled,
         capture_mode,
         destination_has_history,
         source_is_duplicate,
@@ -804,14 +759,12 @@ fn should_short_circuit_region_duplicate(
 
 #[inline(always)]
 fn should_short_circuit_duplicate(
-    optimization_enabled: bool,
     capture_mode: CaptureMode,
     destination_has_history: bool,
     source_is_duplicate: bool,
     pending_slot_available: bool,
 ) -> bool {
-    optimization_enabled
-        && capture_mode == CaptureMode::ScreenRecording
+    capture_mode == CaptureMode::ScreenRecording
         && destination_has_history
         && source_is_duplicate
         && pending_slot_available
@@ -891,13 +844,11 @@ fn with_texture_resource<T>(
     cast_context: &'static str,
     f: impl FnOnce(&ID3D11Resource) -> CaptureResult<T>,
 ) -> CaptureResult<T> {
-    if borrowed_source_resource_cast_enabled() {
-        let raw = texture.as_raw();
-        // SAFETY: ID3D11Texture2D inherits from ID3D11Resource, so the raw
-        // COM pointer is valid when viewed through the base interface.
-        if let Some(resource) = unsafe { ID3D11Resource::from_raw_borrowed(&raw) } {
-            return f(resource);
-        }
+    let raw = texture.as_raw();
+    // SAFETY: ID3D11Texture2D inherits from ID3D11Resource, so the raw
+    // COM pointer is valid when viewed through the base interface.
+    if let Some(resource) = unsafe { ID3D11Resource::from_raw_borrowed(&raw) } {
+        return f(resource);
     }
 
     let owned_resource: ID3D11Resource = texture
@@ -1269,7 +1220,7 @@ impl WindowsGraphicsCaptureCapturer {
             // reuse, avoid spending the stale timeout budget on every capture
             // call. A single atomic/mutex check is enough; if a new frame lands
             // right after this check we'll pick it up on the next call.
-            if immediate_stale_return_enabled() && self.pending_slot.is_some() {
+            if self.pending_slot.is_some() {
                 if let Some(fresh) = self.try_take_latest_frame()? {
                     self.relax_stale_timeout();
                     return Ok(Some(fresh));
@@ -1301,7 +1252,7 @@ impl WindowsGraphicsCaptureCapturer {
     ) -> CaptureResult<Option<(Direct3D11CaptureFrame, i64)>> {
         if allow_stale_return {
             // Mirror the full-frame low-latency path for region capture.
-            if immediate_stale_return_enabled() && self.region_pending_slot.is_some() {
+            if self.region_pending_slot.is_some() {
                 if let Some(fresh) = self.try_take_latest_frame()? {
                     self.relax_stale_timeout();
                     return Ok(Some(fresh));
@@ -1540,109 +1491,6 @@ impl WindowsGraphicsCaptureCapturer {
         blit: CaptureBlitRegion,
         can_use_dirty_gpu_copy: bool,
     ) -> CaptureResult<()> {
-        if !borrowed_slot_resource_enabled() {
-            let staging_resource = self.region_slots[slot_idx]
-                .staging_resource
-                .as_ref()
-                .ok_or_else(|| {
-                    CaptureError::Platform(anyhow::anyhow!(
-                        "failed to resolve WGC region staging resource for slot {}",
-                        slot_idx
-                    ))
-                })?
-                .clone();
-            let query = self.region_slots[slot_idx].query.clone();
-
-            let mut used_dirty_copy = false;
-            if can_use_dirty_gpu_copy && region_dirty_gpu_copy_enabled() {
-                let use_dirty_copy = {
-                    let slot = &self.region_slots[slot_idx];
-                    slot.dirty_gpu_copy_preferred
-                };
-
-                if use_dirty_copy {
-                    let slot = &self.region_slots[slot_idx];
-                    for rect in &slot.dirty_rects {
-                        let source_left = blit
-                            .src_x
-                            .checked_add(rect.x)
-                            .ok_or(CaptureError::BufferOverflow)?;
-                        let source_top = blit
-                            .src_y
-                            .checked_add(rect.y)
-                            .ok_or(CaptureError::BufferOverflow)?;
-                        let source_right = source_left
-                            .checked_add(rect.width)
-                            .ok_or(CaptureError::BufferOverflow)?;
-                        let source_bottom = source_top
-                            .checked_add(rect.height)
-                            .ok_or(CaptureError::BufferOverflow)?;
-                        let source_box = D3D11_BOX {
-                            left: source_left,
-                            top: source_top,
-                            front: 0,
-                            right: source_right,
-                            bottom: source_bottom,
-                            back: 1,
-                        };
-                        unsafe {
-                            self.context.CopySubresourceRegion(
-                                &staging_resource,
-                                0,
-                                rect.x,
-                                rect.y,
-                                0,
-                                source_resource,
-                                0,
-                                Some(&source_box),
-                            );
-                        }
-                    }
-                    used_dirty_copy = true;
-                }
-            }
-
-            if !used_dirty_copy {
-                let src_right = blit
-                    .src_x
-                    .checked_add(blit.width)
-                    .ok_or(CaptureError::BufferOverflow)?;
-                let src_bottom = blit
-                    .src_y
-                    .checked_add(blit.height)
-                    .ok_or(CaptureError::BufferOverflow)?;
-                let source_box = D3D11_BOX {
-                    left: blit.src_x,
-                    top: blit.src_y,
-                    front: 0,
-                    right: src_right,
-                    bottom: src_bottom,
-                    back: 1,
-                };
-
-                unsafe {
-                    self.context.CopySubresourceRegion(
-                        &staging_resource,
-                        0,
-                        0,
-                        0,
-                        0,
-                        source_resource,
-                        0,
-                        Some(&source_box),
-                    );
-                }
-            }
-
-            if let Some(query) = query.as_ref() {
-                unsafe {
-                    self.context.End(query);
-                }
-            }
-            self.region_slots[slot_idx].populated = true;
-            return Ok(());
-        }
-
         let mut used_dirty_copy = false;
         {
             let slot = &self.region_slots[slot_idx];
@@ -1653,10 +1501,7 @@ impl WindowsGraphicsCaptureCapturer {
                 ))
             })?;
 
-            if can_use_dirty_gpu_copy
-                && region_dirty_gpu_copy_enabled()
-                && slot.dirty_gpu_copy_preferred
-            {
+            if can_use_dirty_gpu_copy && slot.dirty_gpu_copy_preferred {
                 for rect in &slot.dirty_rects {
                     let source_left = blit
                         .src_x
@@ -1744,78 +1589,6 @@ impl WindowsGraphicsCaptureCapturer {
         source_resource: &ID3D11Resource,
         can_use_dirty_gpu_copy: bool,
     ) -> CaptureResult<()> {
-        if !borrowed_slot_resource_enabled() {
-            let staging_resource = self.staging_slots[slot_idx]
-                .staging_resource
-                .as_ref()
-                .ok_or_else(|| {
-                    CaptureError::Platform(anyhow::anyhow!(
-                        "failed to resolve WGC staging resource for slot {}",
-                        slot_idx
-                    ))
-                })?
-                .clone();
-            let query = self.staging_slots[slot_idx].query.clone();
-
-            let mut used_dirty_copy = false;
-            if can_use_dirty_gpu_copy {
-                let use_dirty_copy = {
-                    let slot = &self.staging_slots[slot_idx];
-                    slot.dirty_gpu_copy_preferred
-                };
-
-                if use_dirty_copy {
-                    let slot = &self.staging_slots[slot_idx];
-                    for rect in &slot.dirty_rects {
-                        let right = rect
-                            .x
-                            .checked_add(rect.width)
-                            .ok_or(CaptureError::BufferOverflow)?;
-                        let bottom = rect
-                            .y
-                            .checked_add(rect.height)
-                            .ok_or(CaptureError::BufferOverflow)?;
-                        let source_box = D3D11_BOX {
-                            left: rect.x,
-                            top: rect.y,
-                            front: 0,
-                            right,
-                            bottom,
-                            back: 1,
-                        };
-                        unsafe {
-                            self.context.CopySubresourceRegion(
-                                &staging_resource,
-                                0,
-                                rect.x,
-                                rect.y,
-                                0,
-                                source_resource,
-                                0,
-                                Some(&source_box),
-                            );
-                        }
-                    }
-                    used_dirty_copy = true;
-                }
-            }
-
-            if !used_dirty_copy {
-                unsafe {
-                    self.context
-                        .CopyResource(&staging_resource, source_resource);
-                }
-            }
-
-            if let Some(query) = query.as_ref() {
-                unsafe {
-                    self.context.End(query);
-                }
-            }
-            self.staging_slots[slot_idx].populated = true;
-            return Ok(());
-        }
-
         let mut used_dirty_copy = false;
         {
             let slot = &self.staging_slots[slot_idx];
@@ -2036,8 +1809,7 @@ impl WindowsGraphicsCaptureCapturer {
                 && destination_has_history
                 && slot.dirty_cpu_copy_preferred
                 && !slot.dirty_rects.is_empty();
-            let write_full_slot_direct = region_full_slot_map_fastpath_enabled()
-                && blit.dst_x == 0
+            let write_full_slot_direct = blit.dst_x == 0
                 && blit.dst_y == 0
                 && out.width() == source_desc.Width
                 && out.height() == source_desc.Height;
@@ -2388,7 +2160,6 @@ impl WindowsGraphicsCaptureCapturer {
         }
 
         if should_short_circuit_region_duplicate(
-            region_duplicate_short_circuit_enabled(),
             self.capture_mode,
             destination_has_history,
             source_is_duplicate,
@@ -2473,27 +2244,26 @@ impl WindowsGraphicsCaptureCapturer {
             }
 
             let region_desc = Self::region_desc_for_blit(&effective_desc, blit);
-            let region_dirty_extraction =
-                if source_is_duplicate && duplicate_dirty_fastpath_enabled() {
+            let region_dirty_extraction = if source_is_duplicate {
+                region_dirty_rects.clear();
+                RegionDirtyRectExtraction {
+                    available: true,
+                    unchanged: true,
+                    force_full_copy: false,
+                }
+            } else {
+                let extraction = extract_region_dirty_rects(
+                    &capture_frame,
+                    effective_desc.Width,
+                    effective_desc.Height,
+                    blit,
+                    &mut region_dirty_rects,
+                );
+                if !extraction.available {
                     region_dirty_rects.clear();
-                    RegionDirtyRectExtraction {
-                        available: true,
-                        unchanged: true,
-                        force_full_copy: false,
-                    }
-                } else {
-                    let extraction = extract_region_dirty_rects(
-                        &capture_frame,
-                        effective_desc.Width,
-                        effective_desc.Height,
-                        blit,
-                        &mut region_dirty_rects,
-                    );
-                    if !extraction.available {
-                        region_dirty_rects.clear();
-                    }
-                    extraction
-                };
+                }
+                extraction
+            };
             let region_dirty_available = region_dirty_extraction.available;
             let region_unchanged = region_dirty_extraction.unchanged;
 
@@ -2523,21 +2293,12 @@ impl WindowsGraphicsCaptureCapturer {
                     region_desc.Height,
                 )
             };
-            let low_latency_recording = recording_mode
-                && destination_has_history
-                && region_low_latency_slot_enabled()
-                && region_dirty_available
-                && region_dirty_strategy.gpu_low_latency;
-            let write_slot = if low_latency_recording {
-                self.region_pending_slot.unwrap_or(0)
-            } else if recording_mode {
+            let write_slot = if recording_mode {
                 self.region_next_write_slot % WGC_STAGING_SLOTS
             } else {
                 0
             };
-            let read_slot = if low_latency_recording {
-                write_slot
-            } else if recording_mode {
+            let read_slot = if recording_mode {
                 self.region_pending_slot.unwrap_or(write_slot)
             } else {
                 write_slot
@@ -2563,15 +2324,12 @@ impl WindowsGraphicsCaptureCapturer {
                 slot_idx
             } else {
                 self.ensure_region_slot(write_slot, &region_desc)?;
-                let can_use_dirty_gpu_copy = destination_has_history
-                    && if low_latency_recording {
-                        true
-                    } else {
-                        let slot = &self.region_slots[write_slot];
-                        slot.populated
-                            && slot.present_time_ticks != 0
-                            && slot.present_time_ticks == previous_present_time
-                    };
+                let can_use_dirty_gpu_copy = destination_has_history && {
+                    let slot = &self.region_slots[write_slot];
+                    slot.populated
+                        && slot.present_time_ticks != 0
+                        && slot.present_time_ticks == previous_present_time
+                };
                 {
                     let slot = &mut self.region_slots[write_slot];
                     slot.capture_time = Some(capture_time);
@@ -2581,16 +2339,11 @@ impl WindowsGraphicsCaptureCapturer {
                     slot.source_desc = Some(region_desc);
                     slot.dirty_mode_available = region_dirty_available;
                     std::mem::swap(&mut slot.dirty_rects, &mut region_dirty_rects);
-                    let dirty_gpu_copy_preferred = if low_latency_recording {
-                        region_dirty_strategy.gpu_low_latency
-                    } else {
-                        region_dirty_strategy.gpu
-                    };
                     slot.dirty_cpu_copy_preferred =
                         region_dirty_available && region_dirty_strategy.cpu;
                     slot.dirty_gpu_copy_preferred = can_use_dirty_gpu_copy
                         && region_dirty_available
-                        && dirty_gpu_copy_preferred;
+                        && region_dirty_strategy.gpu;
                     slot.dirty_total_pixels = region_dirty_strategy.dirty_pixels;
                     slot.populated = true;
                 }
@@ -2617,11 +2370,7 @@ impl WindowsGraphicsCaptureCapturer {
             if recording_mode {
                 if !skip_submit_copy {
                     self.region_pending_slot = Some(write_slot);
-                    if low_latency_recording {
-                        self.region_next_write_slot = write_slot;
-                    } else {
-                        self.region_next_write_slot = (write_slot + 1) % WGC_STAGING_SLOTS;
-                    }
+                    self.region_next_write_slot = (write_slot + 1) % WGC_STAGING_SLOTS;
                 }
             } else {
                 self.region_pending_slot = None;
@@ -2693,7 +2442,6 @@ impl WindowsGraphicsCaptureCapturer {
         }
 
         if should_short_circuit_duplicate(
-            duplicate_short_circuit_enabled(),
             self.capture_mode,
             destination_has_history,
             source_is_duplicate,
@@ -2767,26 +2515,25 @@ impl WindowsGraphicsCaptureCapturer {
                     (frame_texture.clone(), src_desc, self.hdr_to_sdr)
                 };
 
-            let (source_dirty_available, source_unchanged) =
-                if source_is_duplicate && duplicate_dirty_fastpath_enabled() {
+            let (source_dirty_available, source_unchanged) = if source_is_duplicate {
+                source_dirty_rects.clear();
+                (true, true)
+            } else {
+                let source_dirty_mode = extract_dirty_rects(
+                    &capture_frame,
+                    effective_desc.Width,
+                    effective_desc.Height,
+                    &mut source_dirty_rects,
+                );
+                let source_dirty_available = source_dirty_mode.is_some();
+                if !source_dirty_available {
                     source_dirty_rects.clear();
-                    (true, true)
-                } else {
-                    let source_dirty_mode = extract_dirty_rects(
-                        &capture_frame,
-                        effective_desc.Width,
-                        effective_desc.Height,
-                        &mut source_dirty_rects,
-                    );
-                    let source_dirty_available = source_dirty_mode.is_some();
-                    if !source_dirty_available {
-                        source_dirty_rects.clear();
-                    }
-                    (
-                        source_dirty_available,
-                        source_dirty_available && source_dirty_rects.is_empty(),
-                    )
-                };
+                }
+                (
+                    source_dirty_available,
+                    source_dirty_available && source_dirty_rects.is_empty(),
+                )
+            };
 
             let emitted_duplicate = time_ticks != 0 && time_ticks == self.last_emitted_present_time;
             if self.capture_mode != CaptureMode::ScreenRecording
@@ -3196,14 +2943,12 @@ mod tests {
     #[test]
     fn duplicate_short_circuit_requires_recording_mode() {
         assert!(!should_short_circuit_duplicate(
-            true,
             CaptureMode::Screenshot,
             true,
             true,
             true,
         ));
         assert!(should_short_circuit_duplicate(
-            true,
             CaptureMode::ScreenRecording,
             true,
             true,
@@ -3214,14 +2959,12 @@ mod tests {
     #[test]
     fn duplicate_short_circuit_requires_duplicate_with_history() {
         assert!(!should_short_circuit_duplicate(
-            true,
             CaptureMode::ScreenRecording,
             false,
             true,
             true,
         ));
         assert!(!should_short_circuit_duplicate(
-            true,
             CaptureMode::ScreenRecording,
             true,
             false,
@@ -3230,16 +2973,8 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_short_circuit_requires_enabled_and_pending_slot() {
+    fn duplicate_short_circuit_requires_pending_slot() {
         assert!(!should_short_circuit_duplicate(
-            false,
-            CaptureMode::ScreenRecording,
-            true,
-            true,
-            true,
-        ));
-        assert!(!should_short_circuit_duplicate(
-            true,
             CaptureMode::ScreenRecording,
             true,
             true,
@@ -3250,14 +2985,12 @@ mod tests {
     #[test]
     fn region_duplicate_short_circuit_requires_recording_mode() {
         assert!(!should_short_circuit_region_duplicate(
-            true,
             CaptureMode::Screenshot,
             true,
             true,
             true,
         ));
         assert!(should_short_circuit_region_duplicate(
-            true,
             CaptureMode::ScreenRecording,
             true,
             true,
@@ -3268,14 +3001,12 @@ mod tests {
     #[test]
     fn region_duplicate_short_circuit_requires_duplicate_with_history() {
         assert!(!should_short_circuit_region_duplicate(
-            true,
             CaptureMode::ScreenRecording,
             false,
             true,
             true,
         ));
         assert!(!should_short_circuit_region_duplicate(
-            true,
             CaptureMode::ScreenRecording,
             true,
             false,
@@ -3284,16 +3015,8 @@ mod tests {
     }
 
     #[test]
-    fn region_duplicate_short_circuit_requires_enabled_and_pending_slot() {
+    fn region_duplicate_short_circuit_requires_pending_slot() {
         assert!(!should_short_circuit_region_duplicate(
-            false,
-            CaptureMode::ScreenRecording,
-            true,
-            true,
-            true,
-        ));
-        assert!(!should_short_circuit_region_duplicate(
-            true,
             CaptureMode::ScreenRecording,
             true,
             true,

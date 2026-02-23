@@ -111,20 +111,7 @@ fn region_low_latency_max_pixels() -> u64 {
 
 #[inline]
 fn region_full_slot_map_fastpath_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if env_config::env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_REGION_FULL_SLOT_MAP_FASTPATH") {
-            return false;
-        }
-        // Backward-compatible opt-in alias from older builds.
-        // If explicitly set, honor the old truthy/falsey value.
-        if let Ok(_) = std::env::var("SNOW_CAPTURE_DXGI_ENABLE_REGION_FULL_SLOT_MAP_FASTPATH") {
-            return env_config::env_var_truthy(
-                "SNOW_CAPTURE_DXGI_ENABLE_REGION_FULL_SLOT_MAP_FASTPATH",
-            );
-        }
-        true
-    })
+    true
 }
 
 #[inline(always)]

@@ -402,11 +402,21 @@ impl CaptureSession {
         R: FnMut(&mut Self),
     {
         let max_retries = self.config.capture_retry_count;
+        let mut reuse = reuse;
         let reuse_sequence = reuse.as_ref().map(|f| f.metadata.sequence);
         let destination_has_history = matches!(
             (reuse_sequence, last_history_seq),
             (Some(reuse_seq), Some(last_seq)) if reuse_seq == last_seq
         );
+        if !destination_has_history {
+            // Backends that do not override `capture_with_history_hint`
+            // may infer history from frame metadata directly. Preserve
+            // allocation reuse but clear provenance metadata so stale
+            // buffers cannot trigger temporal fast paths.
+            if let Some(frame) = reuse.as_mut() {
+                frame.reset_metadata();
+            }
+        }
 
         self.sequence = self.sequence.wrapping_add(1);
         let seq = self.sequence;
@@ -762,6 +772,63 @@ mod tests {
         }
     }
 
+    struct MetadataDrivenBackend {
+        monitor: MonitorId,
+        inferred_history: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl MetadataDrivenBackend {
+        fn new(inferred_history: Arc<Mutex<Vec<bool>>>) -> Self {
+            Self {
+                monitor: MonitorId::from_parts(7, 9, 0, "metadata-monitor", true),
+                inferred_history,
+            }
+        }
+    }
+
+    struct MetadataDrivenCapturer {
+        inferred_history: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl MonitorCapturer for MetadataDrivenCapturer {
+        fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
+            // Simulate backends that do not override `capture_with_history_hint`
+            // and infer destination history directly from frame metadata.
+            let inferred_history = reuse
+                .as_ref()
+                .is_some_and(|frame| frame.metadata.capture_time.is_some())
+                && reuse
+                    .as_ref()
+                    .is_some_and(|frame| !frame.as_rgba_bytes().is_empty());
+            self.inferred_history.lock().unwrap().push(inferred_history);
+
+            let mut frame = reuse.unwrap_or_else(Frame::empty);
+            frame.ensure_rgba_capacity(4, 4)?;
+            frame.reset_metadata();
+            frame.metadata.capture_time = Some(Instant::now());
+            Ok(frame)
+        }
+    }
+
+    impl CaptureBackend for MetadataDrivenBackend {
+        fn enumerate_monitors(&self) -> CaptureResult<Vec<MonitorId>> {
+            Ok(vec![self.monitor.clone()])
+        }
+
+        fn primary_monitor(&self) -> CaptureResult<MonitorId> {
+            Ok(self.monitor.clone())
+        }
+
+        fn create_monitor_capturer(
+            &self,
+            _monitor: &MonitorId,
+        ) -> CaptureResult<Box<dyn MonitorCapturer>> {
+            Ok(Box::new(MetadataDrivenCapturer {
+                inferred_history: Arc::clone(&self.inferred_history),
+            }))
+        }
+    }
+
     struct DirectRegionBackend {
         monitor: MonitorId,
         desktop_calls: Arc<Mutex<usize>>,
@@ -874,6 +941,24 @@ mod tests {
         let _third = session.capture_frame_reuse(&target, second)?;
 
         let recorded = history_hints.lock().unwrap().clone();
+        assert_eq!(recorded, vec![false, false, true]);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_reuse_sequence_does_not_expose_stale_metadata_history() -> CaptureResult<()> {
+        let inferred_history = Arc::new(Mutex::new(Vec::new()));
+        let backend: Arc<dyn CaptureBackend> =
+            Arc::new(MetadataDrivenBackend::new(Arc::clone(&inferred_history)));
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        let target = CaptureTarget::PrimaryMonitor;
+
+        let mut first = session.capture_frame(&target)?;
+        first.metadata.sequence = first.metadata.sequence.wrapping_add(1);
+        let second = session.capture_frame_reuse(&target, first)?;
+        let _third = session.capture_frame_reuse(&target, second)?;
+
+        let recorded = inferred_history.lock().unwrap().clone();
         assert_eq!(recorded, vec![false, false, true]);
         Ok(())
     }

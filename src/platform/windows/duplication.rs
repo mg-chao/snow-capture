@@ -2885,10 +2885,15 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
                 // Stash a spare frame internally so the next call without
                 // an explicit reuse frame can skip allocation.
                 if self.output.spare_frame.is_none() {
-                    // We can't keep *this* frame (we're returning it), but
-                    // we pre-allocate a spare with matching capacity.
-                    let spare = Frame::empty();
-                    self.output.spare_frame = Some(spare);
+                    // We can't keep *this* frame (we're returning it), so
+                    // create a detached spare buffer with matching geometry.
+                    let mut spare = Frame::empty();
+                    if spare
+                        .ensure_rgba_capacity(frame.width(), frame.height())
+                        .is_ok()
+                    {
+                        self.output.spare_frame = Some(spare);
+                    }
                 }
                 Ok(frame)
             }

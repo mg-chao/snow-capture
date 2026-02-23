@@ -924,13 +924,10 @@ impl WindowsGraphicsCaptureCapturer {
         let cursor_config = CursorCaptureConfig::default();
         // Best-effort session tuning:
         // - Disable cursor composition unless explicitly requested.
-        // - Disable the capture border where allowed by the OS.
         let _ = session.SetIsCursorCaptureEnabled(cursor_config.capture_cursor);
-        let _ = session.SetIsBorderRequired(false);
-        // Screenshot mode favors single-frame latency; keep WGC dirty-region
-        // mode at the lighter ReportOnly setting until recording requests
-        // ReportAndRender.
-        let _ = session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly);
+        // Keep the platform default dirty-region mode at startup. For
+        // screenshot single-shot captures this avoids paying an extra
+        // mode-transition setup cost on the first frame.
 
         let signal = Arc::new(FrameSignal::default());
         let signal_for_frames = signal.clone();
@@ -1282,7 +1279,7 @@ impl WindowsGraphicsCaptureCapturer {
         self.region_dirty_rects_scratch.clear();
     }
 
-    fn ensure_staging_slot(
+    fn ensure_staging_slot_texture(
         &mut self,
         slot_idx: usize,
         desc: &D3D11_TEXTURE2D_DESC,
@@ -1314,6 +1311,16 @@ impl WindowsGraphicsCaptureCapturer {
             slot.source_desc = Some(*desc);
             slot.populated = false;
         }
+        Ok(())
+    }
+
+    fn ensure_staging_slot(
+        &mut self,
+        slot_idx: usize,
+        desc: &D3D11_TEXTURE2D_DESC,
+    ) -> CaptureResult<()> {
+        self.ensure_staging_slot_texture(slot_idx, desc)?;
+        let slot = &mut self.staging_slots[slot_idx];
 
         if slot.query.is_none() {
             let query_desc = D3D11_QUERY_DESC {
@@ -1329,7 +1336,7 @@ impl WindowsGraphicsCaptureCapturer {
         Ok(())
     }
 
-    fn ensure_region_slot(
+    fn ensure_region_slot_texture(
         &mut self,
         slot_idx: usize,
         desc: &D3D11_TEXTURE2D_DESC,
@@ -1354,7 +1361,18 @@ impl WindowsGraphicsCaptureCapturer {
             desc,
             needs_recreate,
             "failed to create WGC region staging texture",
-        )
+        )?;
+        Ok(())
+    }
+
+    fn ensure_region_slot(
+        &mut self,
+        slot_idx: usize,
+        desc: &D3D11_TEXTURE2D_DESC,
+    ) -> CaptureResult<()> {
+        self.ensure_region_slot_texture(slot_idx, desc)?;
+        let slot = &mut self.region.slots[slot_idx];
+        region_pipeline::ensure_region_slot_query(&self.device, slot)
     }
 
     fn copy_region_source_to_slot(
@@ -2004,7 +2022,7 @@ impl WindowsGraphicsCaptureCapturer {
             let region_desc = surface::region_desc_for_blit(&effective_desc, blit);
             if single_shot_screenshot {
                 let write_slot = 0usize;
-                self.ensure_region_slot(write_slot, &region_desc)?;
+                self.ensure_region_slot_texture(write_slot, &region_desc)?;
                 {
                     let slot = &self.region.slots[write_slot];
                     let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
@@ -2040,9 +2058,6 @@ impl WindowsGraphicsCaptureCapturer {
                         },
                     )?;
                 }
-                unsafe {
-                    self.context.Flush();
-                }
                 {
                     let slot = &self.region.slots[write_slot];
                     let staging = slot.staging.as_ref().ok_or_else(|| {
@@ -2050,7 +2065,7 @@ impl WindowsGraphicsCaptureCapturer {
                             "failed to resolve WGC region staging texture for screenshot fast path"
                         ))
                     })?;
-                    surface::map_staging_to_frame(
+                    surface::map_staging_to_frame_blocking(
                         &self.context,
                         staging,
                         slot.staging_resource.as_ref(),
@@ -2348,7 +2363,7 @@ impl WindowsGraphicsCaptureCapturer {
 
             if single_shot_screenshot {
                 let write_slot = 0usize;
-                self.ensure_staging_slot(write_slot, &effective_desc)?;
+                self.ensure_staging_slot_texture(write_slot, &effective_desc)?;
                 {
                     let slot = &self.staging_slots[write_slot];
                     let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
@@ -2367,9 +2382,6 @@ impl WindowsGraphicsCaptureCapturer {
                         },
                     )?;
                 }
-                unsafe {
-                    self.context.Flush();
-                }
                 {
                     let slot = &self.staging_slots[write_slot];
                     let staging = slot.staging.as_ref().ok_or_else(|| {
@@ -2377,7 +2389,7 @@ impl WindowsGraphicsCaptureCapturer {
                             "failed to resolve WGC staging texture for screenshot fast path"
                         ))
                     })?;
-                    surface::map_staging_to_frame(
+                    surface::map_staging_to_frame_blocking(
                         &self.context,
                         staging,
                         slot.staging_resource.as_ref(),
@@ -2550,12 +2562,12 @@ impl WindowsGraphicsCaptureCapturer {
             return;
         }
         self.capture_mode = mode;
-        let dirty_mode = if mode == CaptureMode::ScreenRecording {
-            GraphicsCaptureDirtyRegionMode::ReportAndRender
-        } else {
-            GraphicsCaptureDirtyRegionMode::ReportOnly
-        };
-        let _ = self.session.SetDirtyRegionMode(dirty_mode);
+        if mode == CaptureMode::ScreenRecording {
+            let _ = self.session.SetIsBorderRequired(false);
+            let _ = self
+                .session
+                .SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportAndRender);
+        }
         self.reset_staging_pipeline();
     }
 

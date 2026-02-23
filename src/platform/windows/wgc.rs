@@ -1276,6 +1276,34 @@ impl WindowsGraphicsCaptureCapturer {
         self.region_dirty_rects_scratch.clear();
     }
 
+    fn warm_recording_scratch(&mut self) {
+        self.source_dirty_rects_scratch
+            .reserve(WGC_DIRTY_COPY_MAX_RECTS);
+        self.region_dirty_rects_scratch
+            .reserve(WGC_DIRTY_COPY_MAX_RECTS);
+        for slot in &mut self.staging_slots {
+            slot.dirty_rects.reserve(WGC_DIRTY_COPY_MAX_RECTS);
+        }
+        for slot in &mut self.region.slots {
+            slot.dirty_rects.reserve(WGC_DIRTY_COPY_MAX_RECTS);
+        }
+    }
+
+    fn trim_scratch_for_screenshot(&mut self) {
+        self.source_dirty_rects_scratch.clear();
+        self.source_dirty_rects_scratch.shrink_to_fit();
+        self.region_dirty_rects_scratch.clear();
+        self.region_dirty_rects_scratch.shrink_to_fit();
+        for slot in &mut self.staging_slots {
+            slot.dirty_rects.clear();
+            slot.dirty_rects.shrink_to_fit();
+        }
+        for slot in &mut self.region.slots {
+            slot.dirty_rects.clear();
+            slot.dirty_rects.shrink_to_fit();
+        }
+    }
+
     fn ensure_staging_slot_texture(
         &mut self,
         slot_idx: usize,
@@ -2577,6 +2605,10 @@ impl WindowsGraphicsCaptureCapturer {
             }
         }
         self.reset_staging_pipeline();
+        match mode {
+            CaptureMode::ScreenRecording => self.warm_recording_scratch(),
+            CaptureMode::Screenshot => self.trim_scratch_for_screenshot(),
+        }
     }
 
     fn set_cursor_config(&mut self, config: CursorCaptureConfig) {

@@ -385,8 +385,73 @@ impl CaptureSession {
         Ok(())
     }
 
-    fn get_window_capturer(&mut self, window: &WindowId) -> &mut Box<dyn MonitorCapturer> {
-        self.window_capturers.get_mut(&window.key()).unwrap()
+    /// Shared capture-with-retry loop used by both monitor and window paths.
+    ///
+    /// Returns the captured frame (with sequence already stamped) and the
+    /// assigned sequence number. The caller is responsible for inserting
+    /// the sequence into the appropriate output-history map.
+    fn capture_with_retry<G, R>(
+        &mut self,
+        reuse: Option<Frame>,
+        last_history_seq: Option<u64>,
+        mut get_capturer: G,
+        mut remove_capturer: R,
+    ) -> CaptureResult<(Frame, u64)>
+    where
+        G: FnMut(&mut Self) -> CaptureResult<&mut Box<dyn MonitorCapturer>>,
+        R: FnMut(&mut Self),
+    {
+        let max_retries = self.config.capture_retry_count;
+        let reuse_sequence = reuse.as_ref().map(|f| f.metadata.sequence);
+        let destination_has_history = matches!(
+            (reuse_sequence, last_history_seq),
+            (Some(reuse_seq), Some(last_seq)) if reuse_seq == last_seq
+        );
+
+        self.sequence = self.sequence.wrapping_add(1);
+        let seq = self.sequence;
+
+        // First attempt -- may use the reuse buffer.
+        let cap_start = std::time::Instant::now();
+        let first_result = get_capturer(self)?
+            .capture_with_history_hint(reuse, destination_has_history);
+        let cap_dur = cap_start.elapsed();
+        match first_result {
+            Ok(mut frame) => {
+                frame.metadata.sequence = seq;
+                if frame.metadata.capture_duration.is_none() {
+                    frame.metadata.capture_duration = Some(cap_dur);
+                }
+                return Ok((frame, seq));
+            }
+            Err(error) if error.requires_worker_reset() && max_retries > 0 => {
+                remove_capturer(self);
+            }
+            Err(error) => return Err(error),
+        }
+
+        // Retry loop after capturer reset.
+        for attempt in 0..max_retries {
+            let retry_start = std::time::Instant::now();
+            let result = get_capturer(self)?
+                .capture_with_history_hint(None, false);
+            let retry_dur = retry_start.elapsed();
+            match result {
+                Ok(mut frame) => {
+                    frame.metadata.sequence = seq;
+                    if frame.metadata.capture_duration.is_none() {
+                        frame.metadata.capture_duration = Some(retry_dur);
+                    }
+                    return Ok((frame, seq));
+                }
+                Err(error) if error.requires_worker_reset() && attempt + 1 < max_retries => {
+                    remove_capturer(self);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(CaptureError::WorkerDead)
     }
 
     fn do_capture(&mut self, target: &CaptureTarget, reuse: Option<Frame>) -> CaptureResult<Frame> {
@@ -402,62 +467,19 @@ impl CaptureSession {
 
         let monitor = self.resolve_target(target)?;
         let key = monitor.key();
-        let max_retries = self.config.capture_retry_count;
-        let reuse_sequence = reuse.as_ref().map(|frame| frame.metadata.sequence);
-        let destination_has_history = matches!(
-            (reuse_sequence, self.monitor_output_history.get(&key)),
-            (Some(reuse_seq), Some(last_seq)) if reuse_seq == *last_seq
-        );
+        let last_history_seq = self.monitor_output_history.get(&key).copied();
 
-        self.sequence = self.sequence.wrapping_add(1);
-        let seq = self.sequence;
-
-        let cap_start = std::time::Instant::now();
-        let first_result = self
-            .get_or_create_capturer(&monitor)?
-            .capture_with_history_hint(reuse, destination_has_history);
-        let cap_dur = cap_start.elapsed();
-        match first_result {
-            Ok(mut frame) => {
-                frame.metadata.sequence = seq;
-                self.monitor_output_history.insert(key, seq);
-                if frame.metadata.capture_duration.is_none() {
-                    frame.metadata.capture_duration = Some(cap_dur);
-                }
-                return Ok(frame);
-            }
-            Err(error) if error.requires_worker_reset() && max_retries > 0 => {
-                self.capturers.remove(&key);
-                self.monitor_output_history.remove(&key);
-            }
-            Err(error) => return Err(error),
-        }
-
-        // Retry loop after capturer reset.
-        for attempt in 0..max_retries {
-            let retry_start = std::time::Instant::now();
-            let result = self
-                .get_or_create_capturer(&monitor)?
-                .capture_with_history_hint(None, false);
-            let retry_dur = retry_start.elapsed();
-            match result {
-                Ok(mut frame) => {
-                    frame.metadata.sequence = seq;
-                    self.monitor_output_history.insert(key, seq);
-                    if frame.metadata.capture_duration.is_none() {
-                        frame.metadata.capture_duration = Some(retry_dur);
-                    }
-                    return Ok(frame);
-                }
-                Err(error) if error.requires_worker_reset() && attempt + 1 < max_retries => {
-                    self.capturers.remove(&key);
-                    self.monitor_output_history.remove(&key);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        Err(CaptureError::WorkerDead)
+        let (frame, seq) = self.capture_with_retry(
+            reuse,
+            last_history_seq,
+            |s| s.get_or_create_capturer(&monitor),
+            |s| {
+                s.capturers.remove(&key);
+                s.monitor_output_history.remove(&key);
+            },
+        )?;
+        self.monitor_output_history.insert(key, seq);
+        Ok(frame)
     }
 
     fn do_capture_window(
@@ -468,64 +490,25 @@ impl CaptureSession {
         self.ensure_window_capturer(window)?;
 
         let key = window.key();
-        let max_retries = self.config.capture_retry_count;
-        let reuse_sequence = reuse.as_ref().map(|frame| frame.metadata.sequence);
-        let destination_has_history = matches!(
-            (reuse_sequence, self.window_output_history.get(&key)),
-            (Some(reuse_seq), Some(last_seq)) if reuse_seq == *last_seq
-        );
+        let last_history_seq = self.window_output_history.get(&key).copied();
+        let window = *window;
 
-        self.sequence = self.sequence.wrapping_add(1);
-        let seq = self.sequence;
-
-        let cap_start = std::time::Instant::now();
-        let first_result = self
-            .get_window_capturer(window)
-            .capture_with_history_hint(reuse, destination_has_history);
-        let cap_dur = cap_start.elapsed();
-        match first_result {
-            Ok(mut frame) => {
-                frame.metadata.sequence = seq;
-                self.window_output_history.insert(key, seq);
-                if frame.metadata.capture_duration.is_none() {
-                    frame.metadata.capture_duration = Some(cap_dur);
+        let (frame, seq) = self.capture_with_retry(
+            reuse,
+            last_history_seq,
+            |s| {
+                if !s.window_capturers.contains_key(&key) {
+                    s.ensure_window_capturer(&window)?;
                 }
-                return Ok(frame);
-            }
-            Err(error) if error.requires_worker_reset() && max_retries > 0 => {
-                self.window_capturers.remove(&key);
-                self.window_output_history.remove(&key);
-            }
-            Err(error) => return Err(error),
-        }
-
-        for attempt in 0..max_retries {
-            if !self.window_capturers.contains_key(&key) {
-                self.ensure_window_capturer(window)?;
-            }
-            let retry_start = std::time::Instant::now();
-            let result = self
-                .get_window_capturer(window)
-                .capture_with_history_hint(None, false);
-            let retry_dur = retry_start.elapsed();
-            match result {
-                Ok(mut frame) => {
-                    frame.metadata.sequence = seq;
-                    self.window_output_history.insert(key, seq);
-                    if frame.metadata.capture_duration.is_none() {
-                        frame.metadata.capture_duration = Some(retry_dur);
-                    }
-                    return Ok(frame);
-                }
-                Err(error) if error.requires_worker_reset() && attempt + 1 < max_retries => {
-                    self.window_capturers.remove(&key);
-                    self.window_output_history.remove(&key);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        Err(CaptureError::WorkerDead)
+                Ok(s.window_capturers.get_mut(&key).unwrap())
+            },
+            |s| {
+                s.window_capturers.remove(&key);
+                s.window_output_history.remove(&key);
+            },
+        )?;
+        self.window_output_history.insert(key, seq);
+        Ok(frame)
     }
 
     /// Capture a region that may span multiple monitors by compositing

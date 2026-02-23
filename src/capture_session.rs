@@ -413,8 +413,8 @@ impl CaptureSession {
 
         // First attempt -- may use the reuse buffer.
         let cap_start = std::time::Instant::now();
-        let first_result = get_capturer(self)?
-            .capture_with_history_hint(reuse, destination_has_history);
+        let first_result =
+            get_capturer(self)?.capture_with_history_hint(reuse, destination_has_history);
         let cap_dur = cap_start.elapsed();
         match first_result {
             Ok(mut frame) => {
@@ -433,8 +433,7 @@ impl CaptureSession {
         // Retry loop after capturer reset.
         for attempt in 0..max_retries {
             let retry_start = std::time::Instant::now();
-            let result = get_capturer(self)?
-                .capture_with_history_hint(None, false);
+            let result = get_capturer(self)?.capture_with_history_hint(None, false);
             let retry_dur = retry_start.elapsed();
             match result {
                 Ok(mut frame) => {

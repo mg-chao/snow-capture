@@ -34,6 +34,9 @@ use crate::window::WindowId;
 
 use super::com::CoInitGuard;
 use super::d3d11;
+use super::dirty_rect::{
+    self, DirtyCopyStrategy, DirtyCopyThresholds, DirtyRectDenseMergeThresholds,
+};
 use super::gpu_tonemap::{GpuF16Converter, GpuTonemapper};
 use super::monitor::{HdrMonitorMetadata, MonitorResolver};
 use super::surface::{self, StagingSampleDesc};
@@ -73,14 +76,19 @@ const WGC_QUERY_SPIN_INITIAL_POLLS: u32 = 4;
 const WGC_QUERY_SPIN_INCREASE_STEP: u32 = 4;
 const WGC_DIRTY_RECT_DENSE_MERGE_LEGACY_MIN_RECTS: usize = 64;
 const WGC_DIRTY_RECT_DENSE_MERGE_LEGACY_MAX_VERTICAL_SPAN: u32 = 96;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct DirtyCopyStrategy {
-    cpu: bool,
-    gpu: bool,
-    gpu_low_latency: bool,
-    dirty_pixels: u64,
-}
+const WGC_DIRTY_COPY_THRESHOLDS: DirtyCopyThresholds = DirtyCopyThresholds {
+    max_rects: WGC_DIRTY_COPY_MAX_RECTS,
+    max_area_percent: WGC_DIRTY_COPY_MAX_AREA_PERCENT,
+    gpu_max_rects: WGC_DIRTY_GPU_COPY_MAX_RECTS,
+    gpu_max_area_percent: WGC_DIRTY_GPU_COPY_MAX_AREA_PERCENT,
+    gpu_low_latency_max_rects: WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS,
+    gpu_low_latency_max_area_percent: WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT,
+};
+const WGC_DIRTY_RECT_DENSE_MERGE_THRESHOLDS: DirtyRectDenseMergeThresholds =
+    DirtyRectDenseMergeThresholds {
+        min_rects: WGC_DIRTY_RECT_DENSE_MERGE_LEGACY_MIN_RECTS,
+        max_vertical_span: WGC_DIRTY_RECT_DENSE_MERGE_LEGACY_MAX_VERTICAL_SPAN,
+    };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RegionDirtyRectExtraction {
@@ -275,26 +283,7 @@ fn hdr_to_sdr_params(hdr: HdrMonitorMetadata) -> Option<HdrToSdrParams> {
 }
 
 fn clamp_dirty_rect(rect: DirtyRect, width: u32, height: u32) -> Option<DirtyRect> {
-    let x = rect.x.min(width);
-    let y = rect.y.min(height);
-    if x >= width || y >= height {
-        return None;
-    }
-
-    let max_w = width - x;
-    let max_h = height - y;
-    let clamped_w = rect.width.min(max_w);
-    let clamped_h = rect.height.min(max_h);
-    if clamped_w == 0 || clamped_h == 0 {
-        return None;
-    }
-
-    Some(DirtyRect {
-        x,
-        y,
-        width: clamped_w,
-        height: clamped_h,
-    })
+    dirty_rect::clamp_dirty_rect(rect, width, height)
 }
 
 fn dirty_region_mode_supported(mode: GraphicsCaptureDirtyRegionMode) -> bool {
@@ -565,86 +554,8 @@ fn intersect_dirty_rects(a: DirtyRect, b: DirtyRect) -> Option<DirtyRect> {
     })
 }
 
-#[inline(always)]
-fn dirty_rect_bounds(rect: DirtyRect) -> (u32, u32) {
-    (
-        rect.x.saturating_add(rect.width),
-        rect.y.saturating_add(rect.height),
-    )
-}
-
-#[inline(always)]
-fn intervals_overlap(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> bool {
-    a_start < b_end && b_start < a_end
-}
-
-#[inline(always)]
-fn intervals_touch_or_overlap(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> bool {
-    a_start <= b_end && b_start <= a_end
-}
-
-#[inline(always)]
-fn dirty_rects_sorted_by_y_then_x(rects: &[DirtyRect]) -> bool {
-    if rects.len() <= 1 {
-        return true;
-    }
-
-    let mut previous = rects[0];
-    for rect in &rects[1..] {
-        if rect.y < previous.y || (rect.y == previous.y && rect.x < previous.x) {
-            return false;
-        }
-        previous = *rect;
-    }
-    true
-}
-
-#[derive(Clone, Copy)]
-struct DirtyRectMergeCandidate {
-    rect: DirtyRect,
-    right: u32,
-    bottom: u32,
-}
-
-impl DirtyRectMergeCandidate {
-    #[inline(always)]
-    fn new(rect: DirtyRect) -> Self {
-        let (right, bottom) = dirty_rect_bounds(rect);
-        Self {
-            rect,
-            right,
-            bottom,
-        }
-    }
-
-    #[inline(always)]
-    fn can_merge(self, other: Self) -> bool {
-        let horizontal_overlap =
-            intervals_overlap(self.rect.x, self.right, other.rect.x, other.right);
-        let vertical_overlap =
-            intervals_overlap(self.rect.y, self.bottom, other.rect.y, other.bottom);
-        let horizontal_touch_or_overlap =
-            intervals_touch_or_overlap(self.rect.x, self.right, other.rect.x, other.right);
-        let vertical_touch_or_overlap =
-            intervals_touch_or_overlap(self.rect.y, self.bottom, other.rect.y, other.bottom);
-
-        (horizontal_overlap && vertical_touch_or_overlap)
-            || (vertical_overlap && horizontal_touch_or_overlap)
-    }
-
-    #[inline(always)]
-    fn merge_in_place(&mut self, other: Self) {
-        self.rect.x = self.rect.x.min(other.rect.x);
-        self.rect.y = self.rect.y.min(other.rect.y);
-        self.right = self.right.max(other.right);
-        self.bottom = self.bottom.max(other.bottom);
-        self.rect.width = self.right.saturating_sub(self.rect.x);
-        self.rect.height = self.bottom.saturating_sub(self.rect.y);
-    }
-}
-
 thread_local! {
-    static DIRTY_RECT_MERGE_SCRATCH: RefCell<Vec<DirtyRectMergeCandidate>> = const { RefCell::new(Vec::new()) };
+    static DIRTY_RECT_MERGE_SCRATCH: RefCell<Vec<dirty_rect::DirtyRectMergeCandidate>> = const { RefCell::new(Vec::new()) };
 }
 
 #[inline(always)]
@@ -667,142 +578,18 @@ fn update_dirty_rect_sort_hint(
     *previous = Some(current);
 }
 
-fn dirty_rects_can_merge(a: DirtyRect, b: DirtyRect) -> bool {
-    DirtyRectMergeCandidate::new(a).can_merge(DirtyRectMergeCandidate::new(b))
-}
-
-fn merge_dirty_rects(a: DirtyRect, b: DirtyRect) -> DirtyRect {
-    let mut merged = DirtyRectMergeCandidate::new(a);
-    merged.merge_in_place(DirtyRectMergeCandidate::new(b));
-    merged.rect
-}
-
-#[inline(always)]
-unsafe fn remove_dirty_rect_candidate_at_unchecked(
-    candidates: &mut Vec<DirtyRectMergeCandidate>,
-    idx: usize,
-) {
-    let len = candidates.len();
-    debug_assert!(idx < len);
-    let ptr = candidates.as_mut_ptr();
-    unsafe {
-        let tail_len = len - idx - 1;
-        if tail_len > 0 {
-            std::ptr::copy(ptr.add(idx + 1), ptr.add(idx), tail_len);
-        }
-        candidates.set_len(len - 1);
-    }
-}
-
-fn normalize_dirty_rects_legacy_after_clamp(rects: &mut Vec<DirtyRect>) {
-    let mut changed = true;
-    while changed {
-        changed = false;
-
-        let mut i = 0usize;
-        while i < rects.len() {
-            let mut j = i + 1;
-            while j < rects.len() {
-                if dirty_rects_can_merge(rects[i], rects[j]) {
-                    rects[i] = merge_dirty_rects(rects[i], rects[j]);
-                    rects.swap_remove(j);
-                    changed = true;
-                } else {
-                    j += 1;
-                }
-            }
-            i += 1;
-        }
-    }
-
-    rects.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
-}
-
-fn should_use_legacy_dense_merge(rects: &[DirtyRect]) -> bool {
-    if rects.len() < WGC_DIRTY_RECT_DENSE_MERGE_LEGACY_MIN_RECTS {
-        return false;
-    }
-
-    let mut min_y = u32::MAX;
-    let mut max_y = 0u32;
-    for rect in rects {
-        min_y = min_y.min(rect.y);
-        max_y = max_y.max(rect.y.saturating_add(rect.height));
-    }
-
-    max_y.saturating_sub(min_y) <= WGC_DIRTY_RECT_DENSE_MERGE_LEGACY_MAX_VERTICAL_SPAN
-}
-
 fn normalize_dirty_rects_after_prepare_in_place(
     pending: &mut Vec<DirtyRect>,
     already_sorted_hint: bool,
 ) {
-    if pending.len() <= 1 {
-        return;
-    }
-
-    if should_use_legacy_dense_merge(pending) {
-        normalize_dirty_rects_legacy_after_clamp(pending);
-        return;
-    }
-
-    debug_assert!(!already_sorted_hint || dirty_rects_sorted_by_y_then_x(pending));
-    if !already_sorted_hint && !dirty_rects_sorted_by_y_then_x(pending) {
-        pending.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
-    }
-
     DIRTY_RECT_MERGE_SCRATCH.with(|scratch| {
         let mut merged = scratch.borrow_mut();
-        merged.clear();
-        merged.reserve(pending.len());
-
-        for rect in pending.iter().copied() {
-            let mut candidate = DirtyRectMergeCandidate::new(rect);
-            loop {
-                let mut merged_any = false;
-                let mut candidate_bottom = candidate.bottom;
-                let mut idx = 0usize;
-                while idx < merged.len() {
-                    let existing = merged[idx];
-                    if existing.bottom < candidate.rect.y {
-                        idx += 1;
-                        continue;
-                    }
-                    if existing.rect.y > candidate_bottom {
-                        break;
-                    }
-
-                    if candidate.can_merge(existing) {
-                        candidate.merge_in_place(existing);
-                        candidate_bottom = candidate.bottom;
-                        // SAFETY: `idx` is bounded by the loop condition (`idx < merged.len()`).
-                        unsafe { remove_dirty_rect_candidate_at_unchecked(&mut merged, idx) };
-                        merged_any = true;
-                    } else {
-                        idx += 1;
-                    }
-                }
-
-                if !merged_any {
-                    break;
-                }
-            }
-
-            let insert_at = merged
-                .binary_search_by(|probe| {
-                    probe
-                        .rect
-                        .y
-                        .cmp(&candidate.rect.y)
-                        .then_with(|| probe.rect.x.cmp(&candidate.rect.x))
-                })
-                .unwrap_or_else(|pos| pos);
-            merged.insert(insert_at, candidate);
-        }
-
-        pending.clear();
-        pending.extend(merged.iter().map(|candidate| candidate.rect));
-        merged.clear();
+        dirty_rect::normalize_dirty_rects_after_prepare_in_place(
+            pending,
+            already_sorted_hint,
+            WGC_DIRTY_RECT_DENSE_MERGE_THRESHOLDS,
+            &mut merged,
+        );
     });
 }
 
@@ -837,21 +624,16 @@ fn normalize_dirty_rects_preclamped_in_place(
 
 #[cfg(test)]
 fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height: u32) {
-    if rects.is_empty() {
-        return;
-    }
-
-    let mut pending = std::mem::take(rects);
-    let mut write = 0usize;
-    for read in 0..pending.len() {
-        if let Some(clamped) = clamp_dirty_rect(pending[read], width, height) {
-            pending[write] = clamped;
-            write += 1;
-        }
-    }
-    pending.truncate(write);
-    normalize_dirty_rects_after_prepare_in_place(&mut pending, false);
-    *rects = pending;
+    let mut merge_scratch = Vec::new();
+    dirty_rect::normalize_dirty_rects_in_place(
+        rects,
+        width,
+        height,
+        false,
+        WGC_DIRTY_RECT_DENSE_MERGE_THRESHOLDS,
+        true,
+        &mut merge_scratch,
+    );
 }
 
 #[cfg(test)]
@@ -874,9 +656,9 @@ fn normalize_dirty_rects_reference_in_place(rects: &mut Vec<DirtyRect>, width: u
         return;
     }
 
-    if should_use_legacy_dense_merge(&pending) {
+    if dirty_rect::should_use_legacy_dense_merge(&pending, WGC_DIRTY_RECT_DENSE_MERGE_THRESHOLDS) {
         *rects = pending;
-        normalize_dirty_rects_legacy_after_clamp(rects);
+        dirty_rect::normalize_dirty_rects_legacy_after_clamp(rects);
         return;
     }
 
@@ -901,8 +683,8 @@ fn normalize_dirty_rects_reference_in_place(rects: &mut Vec<DirtyRect>, width: u
                     break;
                 }
 
-                if dirty_rects_can_merge(candidate, existing) {
-                    candidate = merge_dirty_rects(candidate, existing);
+                if dirty_rect::dirty_rects_can_merge(candidate, existing) {
+                    candidate = dirty_rect::merge_dirty_rects(candidate, existing);
                     rects.remove(idx);
                     merged_any = true;
                 } else {
@@ -1063,95 +845,7 @@ fn dirty_rect_destination_bounds_trusted(
 }
 
 fn evaluate_dirty_copy_strategy(rects: &[DirtyRect], width: u32, height: u32) -> DirtyCopyStrategy {
-    if rects.is_empty() {
-        return DirtyCopyStrategy::default();
-    }
-
-    let total_pixels = (width as u64).saturating_mul(height as u64);
-    if total_pixels == 0 {
-        return DirtyCopyStrategy::default();
-    }
-
-    if rects.len() > WGC_DIRTY_COPY_MAX_RECTS {
-        return DirtyCopyStrategy::default();
-    }
-    let gpu_candidate = rects.len() <= WGC_DIRTY_GPU_COPY_MAX_RECTS;
-    let low_latency_candidate = rects.len() <= WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS;
-
-    let cpu_limit = total_pixels.saturating_mul(WGC_DIRTY_COPY_MAX_AREA_PERCENT);
-    let mut dirty_pixels = 0u64;
-
-    if !gpu_candidate {
-        for rect in rects {
-            dirty_pixels =
-                dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
-            if dirty_pixels.saturating_mul(100) > cpu_limit {
-                return DirtyCopyStrategy::default();
-            }
-        }
-        return DirtyCopyStrategy {
-            cpu: true,
-            gpu: false,
-            gpu_low_latency: false,
-            dirty_pixels,
-        };
-    }
-
-    let gpu_limit = total_pixels.saturating_mul(WGC_DIRTY_GPU_COPY_MAX_AREA_PERCENT);
-    if !low_latency_candidate {
-        let mut cpu = true;
-        let mut gpu = true;
-        for rect in rects {
-            dirty_pixels =
-                dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
-            let dirty_percent_scaled = dirty_pixels.saturating_mul(100);
-            if gpu && dirty_percent_scaled > gpu_limit {
-                gpu = false;
-            }
-            if cpu && dirty_percent_scaled > cpu_limit {
-                cpu = false;
-            }
-            if !cpu && !gpu {
-                break;
-            }
-        }
-        return DirtyCopyStrategy {
-            cpu,
-            gpu,
-            gpu_low_latency: false,
-            dirty_pixels,
-        };
-    }
-
-    let gpu_low_latency_limit =
-        total_pixels.saturating_mul(WGC_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT);
-    let mut cpu = true;
-    let mut gpu = true;
-    let mut gpu_low_latency = true;
-    for rect in rects {
-        dirty_pixels =
-            dirty_pixels.saturating_add((rect.width as u64).saturating_mul(rect.height as u64));
-        let dirty_percent_scaled = dirty_pixels.saturating_mul(100);
-        if gpu_low_latency && dirty_percent_scaled > gpu_low_latency_limit {
-            gpu_low_latency = false;
-        }
-        if gpu && dirty_percent_scaled > gpu_limit {
-            gpu = false;
-        }
-        if cpu && dirty_percent_scaled > cpu_limit {
-            cpu = false;
-        }
-        if !cpu && !gpu && !gpu_low_latency {
-            break;
-        }
-    }
-
-    DirtyCopyStrategy {
-        cpu,
-        gpu,
-        gpu_low_latency,
-        dirty_pixels,
-    }
+    dirty_rect::evaluate_dirty_copy_strategy(rects, width, height, WGC_DIRTY_COPY_THRESHOLDS)
 }
 
 #[cfg(test)]

@@ -3,13 +3,116 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 use crate::CaptureTarget;
-use crate::backend::{self, CaptureBackend, CaptureMode, CursorCaptureConfig, MonitorCapturer};
+use crate::backend::{
+    self, CaptureBackend, CaptureBlitRegion, CaptureMode, CaptureSampleMetadata,
+    CursorCaptureConfig, MonitorCapturer,
+};
 use crate::error::{CaptureError, CaptureResult};
 use crate::frame::Frame;
 use crate::monitor::{MonitorId, MonitorKey};
-use crate::region::MonitorLayout;
+use crate::region::{CaptureRegion, MonitorLayout};
 use crate::streaming::{StreamConfig, StreamHandle};
 use crate::window::{WindowId, WindowKey};
+
+#[derive(Clone, Debug)]
+struct RegionPlanEntry {
+    monitor: MonitorId,
+    monitor_key: MonitorKey,
+    blit: CaptureBlitRegion,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedRegionPlan {
+    region: CaptureRegion,
+    output_width: u32,
+    output_height: u32,
+    region_fully_covered: bool,
+    entries: Arc<[RegionPlanEntry]>,
+}
+
+fn copy_region_rgba(src: &Frame, blit: CaptureBlitRegion, dst: &mut Frame) -> CaptureResult<()> {
+    if blit.width == 0 || blit.height == 0 {
+        return Ok(());
+    }
+
+    let src_w = src.width() as usize;
+    let src_h = src.height() as usize;
+    let dst_w = dst.width() as usize;
+    let dst_h = dst.height() as usize;
+
+    let src_x = blit.src_x as usize;
+    let src_y = blit.src_y as usize;
+    let dst_x = blit.dst_x as usize;
+    let dst_y = blit.dst_y as usize;
+    let copy_w = blit.width as usize;
+    let copy_h = blit.height as usize;
+
+    let src_right = src_x
+        .checked_add(copy_w)
+        .ok_or(CaptureError::BufferOverflow)?;
+    let src_bottom = src_y
+        .checked_add(copy_h)
+        .ok_or(CaptureError::BufferOverflow)?;
+    let dst_right = dst_x
+        .checked_add(copy_w)
+        .ok_or(CaptureError::BufferOverflow)?;
+    let dst_bottom = dst_y
+        .checked_add(copy_h)
+        .ok_or(CaptureError::BufferOverflow)?;
+
+    if src_right > src_w || src_bottom > src_h || dst_right > dst_w || dst_bottom > dst_h {
+        return Err(CaptureError::BufferOverflow);
+    }
+
+    let src_stride = src_w.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+    let dst_stride = dst_w.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+    let row_bytes = copy_w.checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+
+    let src_bytes = src.as_rgba_bytes();
+    let dst_bytes = dst.as_mut_rgba_bytes();
+    let src_required_len = src_stride
+        .checked_mul(src_h)
+        .ok_or(CaptureError::BufferOverflow)?;
+    if src_bytes.len() < src_required_len {
+        return Err(CaptureError::BufferOverflow);
+    }
+    let dst_required_len = dst_stride
+        .checked_mul(dst_h)
+        .ok_or(CaptureError::BufferOverflow)?;
+    if dst_bytes.len() < dst_required_len {
+        return Err(CaptureError::BufferOverflow);
+    }
+    let src_start = src_y
+        .checked_mul(src_stride)
+        .and_then(|off| src_x.checked_mul(4).and_then(|xoff| off.checked_add(xoff)))
+        .ok_or(CaptureError::BufferOverflow)?;
+    let dst_start = dst_y
+        .checked_mul(dst_stride)
+        .and_then(|off| dst_x.checked_mul(4).and_then(|xoff| off.checked_add(xoff)))
+        .ok_or(CaptureError::BufferOverflow)?;
+
+    let mut src_row_start = src_start;
+    let mut dst_row_start = dst_start;
+    for _ in 0..copy_h {
+        let src_row_end = src_row_start
+            .checked_add(row_bytes)
+            .ok_or(CaptureError::BufferOverflow)?;
+        let dst_row_end = dst_row_start
+            .checked_add(row_bytes)
+            .ok_or(CaptureError::BufferOverflow)?;
+
+        dst_bytes[dst_row_start..dst_row_end]
+            .copy_from_slice(&src_bytes[src_row_start..src_row_end]);
+
+        src_row_start = src_row_start
+            .checked_add(src_stride)
+            .ok_or(CaptureError::BufferOverflow)?;
+        dst_row_start = dst_row_start
+            .checked_add(dst_stride)
+            .ok_or(CaptureError::BufferOverflow)?;
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureSessionConfig {
@@ -101,9 +204,15 @@ impl CaptureSessionBuilder {
             backend,
             capturers: FxHashMap::default(),
             window_capturers: FxHashMap::default(),
+            monitor_output_history: FxHashMap::default(),
+            window_output_history: FxHashMap::default(),
             config: self.config,
             sequence: 0,
             layout: None,
+            prepared_region_plan: None,
+            region_desktop_direct_support: FxHashMap::default(),
+            region_fallback_frames: FxHashMap::default(),
+            region_output_history_valid: false,
         })
     }
 }
@@ -118,10 +227,19 @@ pub struct CaptureSession {
     backend: Arc<dyn CaptureBackend>,
     capturers: FxHashMap<MonitorKey, Box<dyn MonitorCapturer>>,
     window_capturers: FxHashMap<WindowKey, Box<dyn MonitorCapturer>>,
+    /// Last output sequence per monitor. Reuse is considered to have
+    /// valid history only when its metadata sequence matches this value.
+    monitor_output_history: FxHashMap<MonitorKey, u64>,
+    /// Per-window map mirroring `monitor_output_history`.
+    window_output_history: FxHashMap<WindowKey, u64>,
     config: CaptureSessionConfig,
     sequence: u64,
     /// Lazily-initialized monitor layout for region capture.
     layout: Option<MonitorLayout>,
+    prepared_region_plan: Option<PreparedRegionPlan>,
+    region_desktop_direct_support: FxHashMap<MonitorKey, bool>,
+    region_fallback_frames: FxHashMap<MonitorKey, Frame>,
+    region_output_history_valid: bool,
 }
 
 impl CaptureSession {
@@ -191,6 +309,16 @@ impl CaptureSession {
     /// Update capture mode for both future and already-initialized
     /// monitor capturers.
     pub fn set_capture_mode(&mut self, mode: CaptureMode) {
+        if self.config.mode != mode {
+            // Reuse history is mode-sensitive (for example, some
+            // backend caches only advance in recording mode), so reset
+            // all reuse provenance on mode transitions.
+            self.monitor_output_history.clear();
+            self.window_output_history.clear();
+            self.region_output_history_valid = false;
+            self.region_desktop_direct_support.clear();
+            self.region_fallback_frames.clear();
+        }
         self.config.mode = mode;
         for capturer in self.capturers.values_mut() {
             capturer.set_capture_mode(mode);
@@ -257,26 +385,46 @@ impl CaptureSession {
         Ok(())
     }
 
-    fn get_window_capturer(&mut self, window: &WindowId) -> &mut Box<dyn MonitorCapturer> {
-        self.window_capturers.get_mut(&window.key()).unwrap()
-    }
-
-    fn do_capture(&mut self, target: &CaptureTarget, reuse: Option<Frame>) -> CaptureResult<Frame> {
-        match target {
-            CaptureTarget::Region(region) => return self.do_capture_region(region, reuse),
-            CaptureTarget::Window(window) => return self.do_capture_window(window, reuse),
-            _ => {}
-        }
-
-        let monitor = self.resolve_target(target)?;
-        let key = monitor.key();
+    /// Shared capture-with-retry loop used by both monitor and window paths.
+    ///
+    /// Returns the captured frame (with sequence already stamped) and the
+    /// assigned sequence number. The caller is responsible for inserting
+    /// the sequence into the appropriate output-history map.
+    fn capture_with_retry<G, R>(
+        &mut self,
+        reuse: Option<Frame>,
+        last_history_seq: Option<u64>,
+        mut get_capturer: G,
+        mut remove_capturer: R,
+    ) -> CaptureResult<(Frame, u64)>
+    where
+        G: FnMut(&mut Self) -> CaptureResult<&mut Box<dyn MonitorCapturer>>,
+        R: FnMut(&mut Self),
+    {
         let max_retries = self.config.capture_retry_count;
+        let mut reuse = reuse;
+        let reuse_sequence = reuse.as_ref().map(|f| f.metadata.sequence);
+        let destination_has_history = matches!(
+            (reuse_sequence, last_history_seq),
+            (Some(reuse_seq), Some(last_seq)) if reuse_seq == last_seq
+        );
+        if !destination_has_history {
+            // Backends that do not override `capture_with_history_hint`
+            // may infer history from frame metadata directly. Preserve
+            // allocation reuse but clear provenance metadata so stale
+            // buffers cannot trigger temporal fast paths.
+            if let Some(frame) = reuse.as_mut() {
+                frame.reset_metadata();
+            }
+        }
 
         self.sequence = self.sequence.wrapping_add(1);
         let seq = self.sequence;
 
+        // First attempt -- may use the reuse buffer.
         let cap_start = std::time::Instant::now();
-        let first_result = self.get_or_create_capturer(&monitor)?.capture(reuse);
+        let first_result =
+            get_capturer(self)?.capture_with_history_hint(reuse, destination_has_history);
         let cap_dur = cap_start.elapsed();
         match first_result {
             Ok(mut frame) => {
@@ -284,10 +432,10 @@ impl CaptureSession {
                 if frame.metadata.capture_duration.is_none() {
                     frame.metadata.capture_duration = Some(cap_dur);
                 }
-                return Ok(frame);
+                return Ok((frame, seq));
             }
             Err(error) if error.requires_worker_reset() && max_retries > 0 => {
-                self.capturers.remove(&key);
+                remove_capturer(self);
             }
             Err(error) => return Err(error),
         }
@@ -295,7 +443,7 @@ impl CaptureSession {
         // Retry loop after capturer reset.
         for attempt in 0..max_retries {
             let retry_start = std::time::Instant::now();
-            let result = self.get_or_create_capturer(&monitor)?.capture(None);
+            let result = get_capturer(self)?.capture_with_history_hint(None, false);
             let retry_dur = retry_start.elapsed();
             match result {
                 Ok(mut frame) => {
@@ -303,16 +451,44 @@ impl CaptureSession {
                     if frame.metadata.capture_duration.is_none() {
                         frame.metadata.capture_duration = Some(retry_dur);
                     }
-                    return Ok(frame);
+                    return Ok((frame, seq));
                 }
                 Err(error) if error.requires_worker_reset() && attempt + 1 < max_retries => {
-                    self.capturers.remove(&key);
+                    remove_capturer(self);
                 }
                 Err(error) => return Err(error),
             }
         }
 
         Err(CaptureError::WorkerDead)
+    }
+
+    fn do_capture(&mut self, target: &CaptureTarget, reuse: Option<Frame>) -> CaptureResult<Frame> {
+        match target {
+            CaptureTarget::Region(region) => return self.do_capture_region(region, reuse),
+            CaptureTarget::Window(window) => {
+                self.region_output_history_valid = false;
+                return self.do_capture_window(window, reuse);
+            }
+            _ => {}
+        }
+        self.region_output_history_valid = false;
+
+        let monitor = self.resolve_target(target)?;
+        let key = monitor.key();
+        let last_history_seq = self.monitor_output_history.get(&key).copied();
+
+        let (frame, seq) = self.capture_with_retry(
+            reuse,
+            last_history_seq,
+            |s| s.get_or_create_capturer(&monitor),
+            |s| {
+                s.capturers.remove(&key);
+                s.monitor_output_history.remove(&key);
+            },
+        )?;
+        self.monitor_output_history.insert(key, seq);
+        Ok(frame)
     }
 
     fn do_capture_window(
@@ -323,132 +499,676 @@ impl CaptureSession {
         self.ensure_window_capturer(window)?;
 
         let key = window.key();
-        let max_retries = self.config.capture_retry_count;
+        let last_history_seq = self.window_output_history.get(&key).copied();
+        let window = *window;
 
-        self.sequence = self.sequence.wrapping_add(1);
-        let seq = self.sequence;
-
-        let cap_start = std::time::Instant::now();
-        let first_result = self.get_window_capturer(window).capture(reuse);
-        let cap_dur = cap_start.elapsed();
-        match first_result {
-            Ok(mut frame) => {
-                frame.metadata.sequence = seq;
-                if frame.metadata.capture_duration.is_none() {
-                    frame.metadata.capture_duration = Some(cap_dur);
+        let (frame, seq) = self.capture_with_retry(
+            reuse,
+            last_history_seq,
+            |s| {
+                if !s.window_capturers.contains_key(&key) {
+                    s.ensure_window_capturer(&window)?;
                 }
-                return Ok(frame);
-            }
-            Err(error) if error.requires_worker_reset() && max_retries > 0 => {
-                self.window_capturers.remove(&key);
-            }
-            Err(error) => return Err(error),
-        }
-
-        for attempt in 0..max_retries {
-            if !self.window_capturers.contains_key(&key) {
-                self.ensure_window_capturer(window)?;
-            }
-            let retry_start = std::time::Instant::now();
-            let result = self.get_window_capturer(window).capture(None);
-            let retry_dur = retry_start.elapsed();
-            match result {
-                Ok(mut frame) => {
-                    frame.metadata.sequence = seq;
-                    if frame.metadata.capture_duration.is_none() {
-                        frame.metadata.capture_duration = Some(retry_dur);
-                    }
-                    return Ok(frame);
-                }
-                Err(error) if error.requires_worker_reset() && attempt + 1 < max_retries => {
-                    self.window_capturers.remove(&key);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        Err(CaptureError::WorkerDead)
+                Ok(s.window_capturers.get_mut(&key).unwrap())
+            },
+            |s| {
+                s.window_capturers.remove(&key);
+                s.window_output_history.remove(&key);
+            },
+        )?;
+        self.window_output_history.insert(key, seq);
+        Ok(frame)
     }
 
     /// Capture a region that may span multiple monitors by compositing
     /// individual monitor captures into a single output frame.
-    fn do_capture_region(
+    fn prepare_region_plan(
         &mut self,
-        region: &crate::region::CaptureRegion,
-        reuse: Option<Frame>,
-    ) -> CaptureResult<Frame> {
+        region: &CaptureRegion,
+    ) -> CaptureResult<(&PreparedRegionPlan, bool)> {
         // Lazily snapshot the monitor layout on first region capture.
         if self.layout.is_none() {
             let monitors = self.backend.enumerate_monitors()?;
             self.layout = Some(MonitorLayout::snapshot_from_monitors(monitors)?);
         }
-        let layout = self.layout.as_ref().unwrap();
 
-        let overlaps = layout.overlapping_monitors(region);
-        if overlaps.is_empty() {
-            return Err(CaptureError::InvalidTarget(
-                "region does not overlap any monitor".into(),
-            ));
+        let needs_rebuild = self
+            .prepared_region_plan
+            .as_ref()
+            .is_none_or(|cached| cached.region != *region);
+        if needs_rebuild {
+            let layout = self.layout.as_ref().unwrap();
+            let overlaps = layout.overlapping_monitors(region);
+            if overlaps.is_empty() {
+                return Err(CaptureError::InvalidTarget(
+                    "region does not overlap any monitor".into(),
+                ));
+            }
+
+            let mut entries = Vec::with_capacity(overlaps.len());
+            for (mon_geo, intersection) in overlaps {
+                entries.push(RegionPlanEntry {
+                    monitor_key: mon_geo.monitor.key(),
+                    monitor: mon_geo.monitor,
+                    blit: CaptureBlitRegion {
+                        src_x: (intersection.x - mon_geo.x) as u32,
+                        src_y: (intersection.y - mon_geo.y) as u32,
+                        width: intersection.width,
+                        height: intersection.height,
+                        dst_x: (intersection.x - region.x) as u32,
+                        dst_y: (intersection.y - region.y) as u32,
+                    },
+                });
+            }
+
+            let full_region_area = u64::from(region.width) * u64::from(region.height);
+            let covered_region_area = entries.iter().fold(0u64, |area, entry| {
+                area.saturating_add(u64::from(entry.blit.width) * u64::from(entry.blit.height))
+            });
+
+            self.prepared_region_plan = Some(PreparedRegionPlan {
+                region: *region,
+                output_width: region.width,
+                output_height: region.height,
+                region_fully_covered: covered_region_area == full_region_area,
+                entries: entries.into(),
+            });
         }
+
+        Ok((self.prepared_region_plan.as_ref().unwrap(), needs_rebuild))
+    }
+
+    fn do_capture_region(
+        &mut self,
+        region: &CaptureRegion,
+        reuse: Option<Frame>,
+    ) -> CaptureResult<Frame> {
+        let (entries, out_w, out_h, region_fully_covered, plan_changed) = {
+            let (plan, plan_changed) = self.prepare_region_plan(region)?;
+            (
+                Arc::clone(&plan.entries),
+                plan.output_width,
+                plan.output_height,
+                plan.region_fully_covered,
+                plan_changed,
+            )
+        };
 
         self.sequence = self.sequence.wrapping_add(1);
         let seq = self.sequence;
 
-        let out_w = region.width;
-        let out_h = region.height;
-
         // Prepare output frame.
         let mut out_frame = reuse.unwrap_or_else(Frame::empty);
+        let had_region_history = self.region_output_history_valid;
+        self.region_output_history_valid = false;
+        let destination_has_history = had_region_history
+            && !plan_changed
+            && out_frame.width() == out_w
+            && out_frame.height() == out_h
+            && !out_frame.as_rgba_bytes().is_empty();
         out_frame.ensure_rgba_capacity(out_w, out_h)?;
-        // Zero-fill so gaps between monitors are black.
-        let out_buf = out_frame.as_mut_rgba_bytes();
-        out_buf.iter_mut().for_each(|b| *b = 0);
+        out_frame.reset_metadata();
+        // Initialize only when first created or when the region target changed.
+        if !destination_has_history {
+            out_frame.as_mut_rgba_bytes().fill(0);
+        }
+
+        if region_fully_covered
+            && entries.len() == 1
+            && let Some(first_entry) = entries.first()
+        {
+            let first_entry = first_entry.clone();
+            let should_try_desktop_direct = self
+                .region_desktop_direct_support
+                .get(&first_entry.monitor_key)
+                .copied()
+                .unwrap_or(true);
+            if should_try_desktop_direct {
+                let direct_sample = {
+                    let capturer = self.get_or_create_capturer(&first_entry.monitor)?;
+                    capturer.capture_desktop_region_into(
+                        region.x,
+                        region.y,
+                        out_w,
+                        out_h,
+                        &mut out_frame,
+                        destination_has_history,
+                    )
+                };
+                match direct_sample {
+                    Ok(Some(sample)) => {
+                        self.region_desktop_direct_support
+                            .insert(first_entry.monitor_key, true);
+                        out_frame.metadata.sequence = seq;
+                        out_frame.metadata.capture_time = sample.capture_time;
+                        out_frame.metadata.present_time_qpc = sample.present_time_qpc;
+                        out_frame.metadata.is_duplicate =
+                            destination_has_history && sample.is_duplicate;
+                        self.region_output_history_valid = true;
+                        return Ok(out_frame);
+                    }
+                    Ok(None) => {
+                        self.region_desktop_direct_support
+                            .insert(first_entry.monitor_key, false);
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
 
         let mut latest_capture_time = None;
         let mut latest_present_qpc = None;
+        let mut all_duplicate = destination_has_history;
 
-        for (mon_geo, intersection) in &overlaps {
-            // Capture the full monitor.
-            let mon_frame = {
-                let capturer = self.get_or_create_capturer(&mon_geo.monitor)?;
-                capturer.capture(None)?
+        for entry in entries.iter() {
+            let sample = {
+                let capturer = self.get_or_create_capturer(&entry.monitor)?;
+                capturer.capture_region_into(entry.blit, &mut out_frame, destination_has_history)?
             };
 
-            // Track the latest timestamps.
-            if let Some(t) = mon_frame.metadata.capture_time {
-                latest_capture_time = Some(t);
-            }
-            if let Some(q) = mon_frame.metadata.present_time_qpc {
-                latest_present_qpc = Some(q);
-            }
+            let sample = if let Some(sample) = sample {
+                sample
+            } else {
+                let reuse_frame = self.region_fallback_frames.remove(&entry.monitor_key);
+                let reuse_has_history = reuse_frame.is_some();
+                let monitor_frame = {
+                    let capturer = self.get_or_create_capturer(&entry.monitor)?;
+                    capturer.capture_with_history_hint(reuse_frame, reuse_has_history)?
+                };
 
-            let src_bytes = mon_frame.as_rgba_bytes();
-            let src_w = mon_frame.width() as usize;
+                copy_region_rgba(&monitor_frame, entry.blit, &mut out_frame)?;
+                let sample = CaptureSampleMetadata {
+                    capture_time: monitor_frame.metadata.capture_time,
+                    present_time_qpc: monitor_frame.metadata.present_time_qpc,
+                    is_duplicate: monitor_frame.metadata.is_duplicate,
+                };
+                self.region_fallback_frames
+                    .insert(entry.monitor_key, monitor_frame);
+                sample
+            };
 
-            // Source rect within the monitor frame.
-            let src_x = (intersection.x - mon_geo.x) as usize;
-            let src_y = (intersection.y - mon_geo.y) as usize;
-            // Destination rect within the output frame.
-            let dst_x = (intersection.x - region.x) as usize;
-            let dst_y = (intersection.y - region.y) as usize;
-            let copy_w = intersection.width as usize;
-            let copy_h = intersection.height as usize;
-
-            let out_buf = out_frame.as_mut_rgba_bytes();
-            for row in 0..copy_h {
-                let src_off = ((src_y + row) * src_w + src_x) * 4;
-                let dst_off = ((dst_y + row) * out_w as usize + dst_x) * 4;
-                let len = copy_w * 4;
-                if src_off + len <= src_bytes.len() && dst_off + len <= out_buf.len() {
-                    out_buf[dst_off..dst_off + len]
-                        .copy_from_slice(&src_bytes[src_off..src_off + len]);
-                }
+            if let Some(t) = sample.capture_time {
+                latest_capture_time = Some(
+                    latest_capture_time.map_or(t, |current: std::time::Instant| current.max(t)),
+                );
             }
+            if let Some(q) = sample.present_time_qpc {
+                latest_present_qpc =
+                    Some(latest_present_qpc.map_or(q, |current: i64| current.max(q)));
+            }
+            all_duplicate &= sample.is_duplicate;
         }
 
         out_frame.metadata.sequence = seq;
         out_frame.metadata.capture_time = latest_capture_time;
         out_frame.metadata.present_time_qpc = latest_present_qpc;
+        out_frame.metadata.is_duplicate = all_duplicate;
+        self.region_output_history_valid = true;
         Ok(out_frame)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    struct MockBackend {
+        monitor: MonitorId,
+        history_hints: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl MockBackend {
+        fn new(history_hints: Arc<Mutex<Vec<bool>>>) -> Self {
+            Self {
+                monitor: MonitorId::from_parts(1, 2, 0, "mock-monitor", true),
+                history_hints,
+            }
+        }
+    }
+
+    struct MockMonitorCapturer {
+        history_hints: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl MonitorCapturer for MockMonitorCapturer {
+        fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
+            self.capture_with_history_hint(reuse, false)
+        }
+
+        fn capture_with_history_hint(
+            &mut self,
+            reuse: Option<Frame>,
+            destination_has_history: bool,
+        ) -> CaptureResult<Frame> {
+            self.history_hints
+                .lock()
+                .unwrap()
+                .push(destination_has_history);
+            let mut frame = reuse.unwrap_or_else(Frame::empty);
+            frame.ensure_rgba_capacity(4, 4)?;
+            frame.reset_metadata();
+            Ok(frame)
+        }
+    }
+
+    impl CaptureBackend for MockBackend {
+        fn enumerate_monitors(&self) -> CaptureResult<Vec<MonitorId>> {
+            Ok(vec![self.monitor.clone()])
+        }
+
+        fn primary_monitor(&self) -> CaptureResult<MonitorId> {
+            Ok(self.monitor.clone())
+        }
+
+        fn create_monitor_capturer(
+            &self,
+            _monitor: &MonitorId,
+        ) -> CaptureResult<Box<dyn MonitorCapturer>> {
+            Ok(Box::new(MockMonitorCapturer {
+                history_hints: Arc::clone(&self.history_hints),
+            }))
+        }
+    }
+
+    struct MetadataDrivenBackend {
+        monitor: MonitorId,
+        inferred_history: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl MetadataDrivenBackend {
+        fn new(inferred_history: Arc<Mutex<Vec<bool>>>) -> Self {
+            Self {
+                monitor: MonitorId::from_parts(7, 9, 0, "metadata-monitor", true),
+                inferred_history,
+            }
+        }
+    }
+
+    struct MetadataDrivenCapturer {
+        inferred_history: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl MonitorCapturer for MetadataDrivenCapturer {
+        fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
+            // Simulate backends that do not override `capture_with_history_hint`
+            // and infer destination history directly from frame metadata.
+            let inferred_history = reuse
+                .as_ref()
+                .is_some_and(|frame| frame.metadata.capture_time.is_some())
+                && reuse
+                    .as_ref()
+                    .is_some_and(|frame| !frame.as_rgba_bytes().is_empty());
+            self.inferred_history.lock().unwrap().push(inferred_history);
+
+            let mut frame = reuse.unwrap_or_else(Frame::empty);
+            frame.ensure_rgba_capacity(4, 4)?;
+            frame.reset_metadata();
+            frame.metadata.capture_time = Some(Instant::now());
+            Ok(frame)
+        }
+    }
+
+    impl CaptureBackend for MetadataDrivenBackend {
+        fn enumerate_monitors(&self) -> CaptureResult<Vec<MonitorId>> {
+            Ok(vec![self.monitor.clone()])
+        }
+
+        fn primary_monitor(&self) -> CaptureResult<MonitorId> {
+            Ok(self.monitor.clone())
+        }
+
+        fn create_monitor_capturer(
+            &self,
+            _monitor: &MonitorId,
+        ) -> CaptureResult<Box<dyn MonitorCapturer>> {
+            Ok(Box::new(MetadataDrivenCapturer {
+                inferred_history: Arc::clone(&self.inferred_history),
+            }))
+        }
+    }
+
+    struct DirectRegionBackend {
+        monitor: MonitorId,
+        desktop_calls: Arc<Mutex<usize>>,
+        region_calls: Arc<Mutex<usize>>,
+        supports_desktop_direct: bool,
+        desktop_should_error: bool,
+    }
+
+    struct DirectRegionCapturer {
+        desktop_calls: Arc<Mutex<usize>>,
+        region_calls: Arc<Mutex<usize>>,
+        supports_desktop_direct: bool,
+        desktop_should_error: bool,
+    }
+
+    impl MonitorCapturer for DirectRegionCapturer {
+        fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
+            Ok(reuse.unwrap_or_else(Frame::empty))
+        }
+
+        fn capture_region_into(
+            &mut self,
+            _blit: CaptureBlitRegion,
+            _destination: &mut Frame,
+            _destination_has_history: bool,
+        ) -> CaptureResult<Option<CaptureSampleMetadata>> {
+            *self.region_calls.lock().unwrap() += 1;
+            Ok(Some(CaptureSampleMetadata {
+                capture_time: Some(Instant::now()),
+                present_time_qpc: Some(0),
+                is_duplicate: false,
+            }))
+        }
+
+        fn capture_desktop_region_into(
+            &mut self,
+            _x: i32,
+            _y: i32,
+            _width: u32,
+            _height: u32,
+            _destination: &mut Frame,
+            _destination_has_history: bool,
+        ) -> CaptureResult<Option<CaptureSampleMetadata>> {
+            *self.desktop_calls.lock().unwrap() += 1;
+            if self.desktop_should_error {
+                return Err(CaptureError::Platform(anyhow::anyhow!(
+                    "mock desktop direct failure"
+                )));
+            }
+            if !self.supports_desktop_direct {
+                return Ok(None);
+            }
+            Ok(Some(CaptureSampleMetadata {
+                capture_time: Some(Instant::now()),
+                present_time_qpc: Some(0),
+                is_duplicate: true,
+            }))
+        }
+    }
+
+    impl CaptureBackend for DirectRegionBackend {
+        fn enumerate_monitors(&self) -> CaptureResult<Vec<MonitorId>> {
+            Ok(vec![self.monitor.clone()])
+        }
+
+        fn primary_monitor(&self) -> CaptureResult<MonitorId> {
+            Ok(self.monitor.clone())
+        }
+
+        fn create_monitor_capturer(
+            &self,
+            _monitor: &MonitorId,
+        ) -> CaptureResult<Box<dyn MonitorCapturer>> {
+            Ok(Box::new(DirectRegionCapturer {
+                desktop_calls: Arc::clone(&self.desktop_calls),
+                region_calls: Arc::clone(&self.region_calls),
+                supports_desktop_direct: self.supports_desktop_direct,
+                desktop_should_error: self.desktop_should_error,
+            }))
+        }
+    }
+
+    fn mock_layout(monitor: &MonitorId, x: i32, y: i32, width: u32, height: u32) -> MonitorLayout {
+        MonitorLayout {
+            monitors: vec![crate::region::MonitorGeometry {
+                monitor: monitor.clone(),
+                x,
+                y,
+                width,
+                height,
+            }],
+            virtual_left: x,
+            virtual_top: y,
+            virtual_width: width,
+            virtual_height: height,
+        }
+    }
+
+    #[test]
+    fn monitor_reuse_history_hint_requires_matching_sequence() -> CaptureResult<()> {
+        let history_hints = Arc::new(Mutex::new(Vec::new()));
+        let backend: Arc<dyn CaptureBackend> =
+            Arc::new(MockBackend::new(Arc::clone(&history_hints)));
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        let target = CaptureTarget::PrimaryMonitor;
+
+        let mut first = session.capture_frame(&target)?;
+        first.metadata.sequence = first.metadata.sequence.wrapping_add(1);
+        let second = session.capture_frame_reuse(&target, first)?;
+        let _third = session.capture_frame_reuse(&target, second)?;
+
+        let recorded = history_hints.lock().unwrap().clone();
+        assert_eq!(recorded, vec![false, false, true]);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_reuse_sequence_does_not_expose_stale_metadata_history() -> CaptureResult<()> {
+        let inferred_history = Arc::new(Mutex::new(Vec::new()));
+        let backend: Arc<dyn CaptureBackend> =
+            Arc::new(MetadataDrivenBackend::new(Arc::clone(&inferred_history)));
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        let target = CaptureTarget::PrimaryMonitor;
+
+        let mut first = session.capture_frame(&target)?;
+        first.metadata.sequence = first.metadata.sequence.wrapping_add(1);
+        let second = session.capture_frame_reuse(&target, first)?;
+        let _third = session.capture_frame_reuse(&target, second)?;
+
+        let recorded = inferred_history.lock().unwrap().clone();
+        assert_eq!(recorded, vec![false, false, true]);
+        Ok(())
+    }
+
+    #[test]
+    fn changing_capture_mode_clears_reuse_history() -> CaptureResult<()> {
+        let history_hints = Arc::new(Mutex::new(Vec::new()));
+        let backend: Arc<dyn CaptureBackend> =
+            Arc::new(MockBackend::new(Arc::clone(&history_hints)));
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        let target = CaptureTarget::PrimaryMonitor;
+
+        let first = session.capture_frame(&target)?;
+        session.set_capture_mode(CaptureMode::ScreenRecording);
+        let _second = session.capture_frame_reuse(&target, first)?;
+
+        let recorded = history_hints.lock().unwrap().clone();
+        assert_eq!(recorded, vec![false, false]);
+        Ok(())
+    }
+
+    #[test]
+    fn region_capture_uses_desktop_direct_path_when_supported() -> CaptureResult<()> {
+        let desktop_calls = Arc::new(Mutex::new(0usize));
+        let region_calls = Arc::new(Mutex::new(0usize));
+        let monitor = MonitorId::from_parts(1, 2, 0, "mock-monitor", true);
+        let backend: Arc<dyn CaptureBackend> = Arc::new(DirectRegionBackend {
+            monitor: monitor.clone(),
+            desktop_calls: Arc::clone(&desktop_calls),
+            region_calls: Arc::clone(&region_calls),
+            supports_desktop_direct: true,
+            desktop_should_error: false,
+        });
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        session.layout = Some(mock_layout(&monitor, 0, 0, 1920, 1080));
+
+        let target = CaptureTarget::Region(CaptureRegion::new(100, 50, 640, 360)?);
+        let frame = session.capture_frame(&target)?;
+        assert!(!frame.metadata.is_duplicate);
+        let next_frame = session.capture_frame_reuse(&target, frame)?;
+
+        assert!(next_frame.metadata.is_duplicate);
+        assert_eq!(*desktop_calls.lock().unwrap(), 2);
+        assert_eq!(*region_calls.lock().unwrap(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn region_capture_falls_back_when_desktop_direct_path_is_unavailable() -> CaptureResult<()> {
+        let desktop_calls = Arc::new(Mutex::new(0usize));
+        let region_calls = Arc::new(Mutex::new(0usize));
+        let monitor = MonitorId::from_parts(1, 2, 0, "mock-monitor", true);
+        let backend: Arc<dyn CaptureBackend> = Arc::new(DirectRegionBackend {
+            monitor: monitor.clone(),
+            desktop_calls: Arc::clone(&desktop_calls),
+            region_calls: Arc::clone(&region_calls),
+            supports_desktop_direct: false,
+            desktop_should_error: false,
+        });
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        session.layout = Some(mock_layout(&monitor, 0, 0, 1920, 1080));
+
+        let target = CaptureTarget::Region(CaptureRegion::new(100, 50, 640, 360)?);
+        let _frame = session.capture_frame(&target)?;
+
+        assert_eq!(*desktop_calls.lock().unwrap(), 1);
+        assert_eq!(*region_calls.lock().unwrap(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn region_capture_caches_unavailable_desktop_direct_path() -> CaptureResult<()> {
+        let desktop_calls = Arc::new(Mutex::new(0usize));
+        let region_calls = Arc::new(Mutex::new(0usize));
+        let monitor = MonitorId::from_parts(1, 2, 0, "mock-monitor", true);
+        let backend: Arc<dyn CaptureBackend> = Arc::new(DirectRegionBackend {
+            monitor: monitor.clone(),
+            desktop_calls: Arc::clone(&desktop_calls),
+            region_calls: Arc::clone(&region_calls),
+            supports_desktop_direct: false,
+            desktop_should_error: false,
+        });
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        session.layout = Some(mock_layout(&monitor, 0, 0, 1920, 1080));
+
+        let target = CaptureTarget::Region(CaptureRegion::new(100, 50, 640, 360)?);
+        let frame = session.capture_frame(&target)?;
+        let _frame = session.capture_frame_reuse(&target, frame)?;
+
+        assert_eq!(*desktop_calls.lock().unwrap(), 1);
+        assert_eq!(*region_calls.lock().unwrap(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn region_capture_retries_desktop_direct_path_after_mode_change() -> CaptureResult<()> {
+        let desktop_calls = Arc::new(Mutex::new(0usize));
+        let region_calls = Arc::new(Mutex::new(0usize));
+        let monitor = MonitorId::from_parts(1, 2, 0, "mock-monitor", true);
+        let backend: Arc<dyn CaptureBackend> = Arc::new(DirectRegionBackend {
+            monitor: monitor.clone(),
+            desktop_calls: Arc::clone(&desktop_calls),
+            region_calls: Arc::clone(&region_calls),
+            supports_desktop_direct: false,
+            desktop_should_error: false,
+        });
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        session.layout = Some(mock_layout(&monitor, 0, 0, 1920, 1080));
+
+        let target = CaptureTarget::Region(CaptureRegion::new(100, 50, 640, 360)?);
+        let _first = session.capture_frame(&target)?;
+        session.set_capture_mode(CaptureMode::ScreenRecording);
+        let _second = session.capture_frame(&target)?;
+
+        assert_eq!(*desktop_calls.lock().unwrap(), 2);
+        assert_eq!(*region_calls.lock().unwrap(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn region_capture_skips_desktop_direct_path_for_multi_monitor_regions() -> CaptureResult<()> {
+        let desktop_calls = Arc::new(Mutex::new(0usize));
+        let region_calls = Arc::new(Mutex::new(0usize));
+        let first_monitor = MonitorId::from_parts(1, 2, 0, "mock-monitor-a", true);
+        let second_monitor = MonitorId::from_parts(1, 2, 1, "mock-monitor-b", false);
+        let backend: Arc<dyn CaptureBackend> = Arc::new(DirectRegionBackend {
+            monitor: first_monitor.clone(),
+            desktop_calls: Arc::clone(&desktop_calls),
+            region_calls: Arc::clone(&region_calls),
+            supports_desktop_direct: true,
+            desktop_should_error: false,
+        });
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        session.layout = Some(MonitorLayout {
+            monitors: vec![
+                crate::region::MonitorGeometry {
+                    monitor: first_monitor,
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 480,
+                },
+                crate::region::MonitorGeometry {
+                    monitor: second_monitor,
+                    x: 640,
+                    y: 0,
+                    width: 640,
+                    height: 480,
+                },
+            ],
+            virtual_left: 0,
+            virtual_top: 0,
+            virtual_width: 1280,
+            virtual_height: 480,
+        });
+
+        let target = CaptureTarget::Region(CaptureRegion::new(0, 0, 1280, 480)?);
+        let _frame = session.capture_frame(&target)?;
+
+        assert_eq!(*desktop_calls.lock().unwrap(), 0);
+        assert_eq!(*region_calls.lock().unwrap(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn region_capture_falls_back_when_desktop_direct_path_errors() -> CaptureResult<()> {
+        let desktop_calls = Arc::new(Mutex::new(0usize));
+        let region_calls = Arc::new(Mutex::new(0usize));
+        let monitor = MonitorId::from_parts(1, 2, 0, "mock-monitor", true);
+        let backend: Arc<dyn CaptureBackend> = Arc::new(DirectRegionBackend {
+            monitor: monitor.clone(),
+            desktop_calls: Arc::clone(&desktop_calls),
+            region_calls: Arc::clone(&region_calls),
+            supports_desktop_direct: true,
+            desktop_should_error: true,
+        });
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        session.layout = Some(mock_layout(&monitor, 0, 0, 1920, 1080));
+
+        let target = CaptureTarget::Region(CaptureRegion::new(100, 50, 640, 360)?);
+        let _frame = session.capture_frame(&target)?;
+
+        assert_eq!(*desktop_calls.lock().unwrap(), 1);
+        assert_eq!(*region_calls.lock().unwrap(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn region_capture_skips_desktop_direct_path_for_partial_coverage() -> CaptureResult<()> {
+        let desktop_calls = Arc::new(Mutex::new(0usize));
+        let region_calls = Arc::new(Mutex::new(0usize));
+        let monitor = MonitorId::from_parts(1, 2, 0, "mock-monitor", true);
+        let backend: Arc<dyn CaptureBackend> = Arc::new(DirectRegionBackend {
+            monitor: monitor.clone(),
+            desktop_calls: Arc::clone(&desktop_calls),
+            region_calls: Arc::clone(&region_calls),
+            supports_desktop_direct: true,
+            desktop_should_error: false,
+        });
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        session.layout = Some(mock_layout(&monitor, 0, 0, 128, 128));
+
+        // Region extends beyond monitor bounds, so only a partial overlap is
+        // covered by monitor entries and the desktop-direct fast path should
+        // not run.
+        let target = CaptureTarget::Region(CaptureRegion::new(-16, -16, 128, 128)?);
+        let _frame = session.capture_frame(&target)?;
+
+        assert_eq!(*desktop_calls.lock().unwrap(), 0);
+        assert_eq!(*region_calls.lock().unwrap(), 1);
+        Ok(())
     }
 }

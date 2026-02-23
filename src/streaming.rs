@@ -180,13 +180,19 @@ impl StreamHandle {
         })
     }
 
-    /// Get the receiver end of the capture event channel.
+    /// Get the raw receiver end of the capture event channel.
+    ///
+    /// **Note:** Prefer `recv()`, `try_recv()`, or `recv_timeout()` on
+    /// `StreamHandle` directly — those methods keep `buffer_fill` accurate.
+    /// Reading from the raw receiver bypasses fill tracking.
     pub fn receiver(&self) -> &mpsc::Receiver<CaptureEvent> {
         &self.receiver
     }
 
-    /// Consume the handle and return the receiver. The stream thread
+    /// Consume the handle and return the raw receiver. The stream thread
     /// will be signaled to stop and joined.
+    ///
+    /// **Note:** `buffer_fill` will no longer be updated after this call.
     pub fn into_receiver(mut self) -> mpsc::Receiver<CaptureEvent> {
         self.stop_flag.store(true, Ordering::Release);
         if let Some(handle) = self.join_handle.take() {
@@ -194,6 +200,37 @@ impl StreamHandle {
         }
         let this = std::mem::ManuallyDrop::new(self);
         unsafe { std::ptr::read(&this.receiver) }
+    }
+
+    /// Receive the next capture event, blocking until one is available
+    /// or the channel disconnects. Automatically updates `buffer_fill`
+    /// when a `Frame` event is consumed.
+    pub fn recv(&self) -> Result<CaptureEvent, mpsc::RecvError> {
+        let event = self.receiver.recv()?;
+        if matches!(&event, CaptureEvent::Frame(_)) {
+            self.stats.buffer_fill.fetch_sub(1, Ordering::Release);
+        }
+        Ok(event)
+    }
+
+    /// Try to receive a capture event without blocking. Automatically
+    /// updates `buffer_fill` when a `Frame` event is consumed.
+    pub fn try_recv(&self) -> Result<CaptureEvent, mpsc::TryRecvError> {
+        let event = self.receiver.try_recv()?;
+        if matches!(&event, CaptureEvent::Frame(_)) {
+            self.stats.buffer_fill.fetch_sub(1, Ordering::Release);
+        }
+        Ok(event)
+    }
+
+    /// Receive a capture event with a timeout. Automatically updates
+    /// `buffer_fill` when a `Frame` event is consumed.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<CaptureEvent, mpsc::RecvTimeoutError> {
+        let event = self.receiver.recv_timeout(timeout)?;
+        if matches!(&event, CaptureEvent::Frame(_)) {
+            self.stats.buffer_fill.fetch_sub(1, Ordering::Release);
+        }
+        Ok(event)
     }
 
     /// Signal the stream thread to stop. Non-blocking — the thread will
@@ -312,10 +349,9 @@ fn stream_loop(
     let mut latency_avg_ns: f64 = 0.0;
     const LATENCY_ALPHA: f64 = 0.1;
 
-    // Buffer fill tracking — incremented on send, decremented is
-    // approximated by (captured - dropped - fill_at_last_update).
-    // We track in-flight count directly.
-    let mut in_flight: u64 = 0;
+    // Buffer fill tracking — stats.buffer_fill is the shared atomic
+    // counter. The producer (this loop) increments on successful send,
+    // and the consumer decrements via StreamHandle::recv* methods.
 
     // FPS measurement.
     let mut fps_counter: u64 = 0;
@@ -403,8 +439,7 @@ fn stream_loop(
 
                 match tx.try_send(CaptureEvent::Frame(frame)) {
                     Ok(()) => {
-                        in_flight = in_flight.saturating_add(1);
-                        stats.buffer_fill.store(in_flight, Ordering::Relaxed);
+                        stats.buffer_fill.fetch_add(1, Ordering::Release);
 
                         // Adaptive pacing: smooth EWMA-based approach.
                         window_total += 1;
@@ -431,8 +466,8 @@ fn stream_loop(
                     }
                     Err(mpsc::TrySendError::Full(CaptureEvent::Frame(dropped))) => {
                         stats.frames_dropped.fetch_add(1, Ordering::Relaxed);
-                        in_flight = in_flight.saturating_sub(1);
-                        stats.buffer_fill.store(in_flight, Ordering::Relaxed);
+                        // Frame never entered the channel, so buffer_fill
+                        // is unchanged.
                         // Notify receiver about the drop.
                         let _ = tx.try_send(CaptureEvent::FrameDropped { sequence: seq });
                         reuse_frame = Some(dropped);
@@ -566,14 +601,21 @@ impl AsyncStreamHandle {
         let (async_tx, async_rx) = tokio::sync::mpsc::channel::<CaptureEvent>(32);
 
         let bridge_stop = stop_flag.clone();
+        let bridge_stats = stats.clone();
         let bridge_handle = std::thread::Builder::new()
             .name("snow-capture-async-bridge".to_string())
             .spawn(move || {
                 loop {
                     match sync_rx.recv_timeout(Duration::from_millis(100)) {
                         Ok(event) => {
+                            let is_frame = matches!(&event, CaptureEvent::Frame(_));
                             if async_tx.blocking_send(event).is_err() {
                                 break;
+                            }
+                            // Decrement buffer_fill after successfully
+                            // pulling a frame out of the sync channel.
+                            if is_frame {
+                                bridge_stats.buffer_fill.fetch_sub(1, Ordering::Release);
                             }
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {

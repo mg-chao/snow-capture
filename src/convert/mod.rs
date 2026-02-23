@@ -18,9 +18,29 @@ pub fn warmup() {
     // Force kernel selection OnceLocks
     let _ = bgra_kernel();
     let _ = bgra_kernel_nt();
+    let _ = bgra_kernel_nt_nofence();
     let _ = f16_kernel();
     let _ = f16_kernel_nt();
+    let _ = f16_kernel_nt_nofence();
     let _ = f16_hdr_kernel();
+}
+
+#[inline]
+pub(crate) fn with_conversion_pool<F>(max_workers: usize, job: F)
+where
+    F: FnOnce() + Send,
+{
+    install_conversion_pool(max_workers, job);
+}
+
+#[inline(always)]
+pub(crate) fn should_parallelize_work(
+    pixel_count: usize,
+    min_pixels: usize,
+    min_chunk_pixels: usize,
+    max_workers: usize,
+) -> bool {
+    should_parallelize(pixel_count, min_pixels, min_chunk_pixels, max_workers)
 }
 
 const BGRA_PARALLEL_MIN_PIXELS: usize = 524_288;
@@ -237,7 +257,164 @@ struct SurfaceFormatPlan {
     /// Non-temporal row kernel for non-overlapping buffers where the
     /// destination won't be read back before the next capture.
     row_kernel_nt: PixelKernel,
+    /// Non-temporal row kernel variant that defers `_mm_sfence` to the
+    /// caller so multi-row conversions can issue one fence per chunk
+    /// instead of one fence per row.
+    row_kernel_nt_nofence: PixelKernel,
     parallel: ParallelConfig,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SurfaceRowConverter {
+    format: SurfacePixelFormat,
+    plan: SurfaceFormatPlan,
+    hdr_params: Option<HdrToSdrParams>,
+}
+
+impl SurfaceRowConverter {
+    #[inline]
+    pub(crate) fn new(format: SurfacePixelFormat, options: SurfaceConversionOptions) -> Self {
+        let hdr_params = if format == SurfacePixelFormat::Rgba16Float {
+            options.hdr_to_sdr.map(HdrToSdrParams::sanitized)
+        } else {
+            None
+        };
+        Self {
+            format,
+            plan: surface_format_plan(format),
+            hdr_params,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn convert_rows_unchecked(
+        self,
+        src: *const u8,
+        src_pitch: usize,
+        dst: *mut u8,
+        dst_pitch: usize,
+        width: usize,
+        height: usize,
+    ) {
+        unsafe {
+            self.convert_rows_impl(src, src_pitch, dst, dst_pitch, width, height, false);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn convert_rows_maybe_parallel_unchecked(
+        self,
+        src: *const u8,
+        src_pitch: usize,
+        dst: *mut u8,
+        dst_pitch: usize,
+        width: usize,
+        height: usize,
+    ) {
+        unsafe {
+            self.convert_rows_impl(src, src_pitch, dst, dst_pitch, width, height, true);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn convert_rows_impl(
+        self,
+        src: *const u8,
+        src_pitch: usize,
+        dst: *mut u8,
+        dst_pitch: usize,
+        width: usize,
+        height: usize,
+        allow_parallel: bool,
+    ) {
+        let layout = SurfaceLayout::new(src, src_pitch, dst, dst_pitch, width, height);
+        if layout.is_empty() {
+            return;
+        }
+
+        if self.format == SurfacePixelFormat::Rgba16Float
+            && let Some(params) = self.hdr_params
+        {
+            let _ = layout.assert_pitches(self.plan.src_bytes_per_pixel);
+            let total_pixels = layout.total_pixels();
+            let kernel = f16_hdr_kernel();
+            if allow_parallel
+                && let Some(chunks) =
+                    maybe_parallel_row_chunks(layout, self.plan.parallel, total_pixels)
+            {
+                unsafe {
+                    run_rows_parallel_with(
+                        layout,
+                        chunks,
+                        self.plan.parallel.max_workers,
+                        move |row_src, row_dst, row_width| {
+                            kernel(row_src, row_dst, row_width, params);
+                        },
+                    );
+                }
+                return;
+            }
+            unsafe {
+                run_rows_serial_with(layout, move |row_src, row_dst, row_width| {
+                    kernel(row_src, row_dst, row_width, params);
+                });
+            }
+            return;
+        }
+
+        let _ = layout.assert_pitches(self.plan.src_bytes_per_pixel);
+        let total_pixels = layout.total_pixels();
+        let bgra_row_nt_kernel = if self.format == SurfacePixelFormat::Bgra8 {
+            bgra_nt_kernel_for_rows(layout.dst as *const u8, layout.dst_pitch)
+        } else {
+            None
+        };
+        let use_nt = layout.allow_parallel_rows()
+            && total_pixels >= NT_STORE_MIN_PIXELS
+            && match self.format {
+                SurfacePixelFormat::Bgra8 => bgra_row_nt_kernel.is_some(),
+                SurfacePixelFormat::Rgba8 => {
+                    nt_rows_are_aligned(layout.dst as *const u8, layout.dst_pitch)
+                }
+                SurfacePixelFormat::Rgba16Float => {
+                    nt_rows_are_aligned(layout.dst as *const u8, layout.dst_pitch)
+                        && f16_nt_supported()
+                }
+            };
+
+        if allow_parallel
+            && let Some(chunks) =
+                maybe_parallel_row_chunks(layout, self.plan.parallel, total_pixels)
+        {
+            let kernel = if use_nt {
+                bgra_row_nt_kernel.unwrap_or(self.plan.row_kernel_nt)
+            } else {
+                self.plan.row_kernel
+            };
+            unsafe {
+                run_rows_parallel(layout, kernel, chunks, self.plan.parallel.max_workers);
+            }
+            return;
+        }
+
+        let bgra_row_nt_kernel_nofence = if self.format == SurfacePixelFormat::Bgra8 {
+            bgra_nt_kernel_for_rows_nofence(layout.dst as *const u8, layout.dst_pitch)
+        } else {
+            None
+        };
+        let kernel = if use_nt {
+            bgra_row_nt_kernel_nofence.unwrap_or(self.plan.row_kernel_nt_nofence)
+        } else {
+            self.plan.row_kernel
+        };
+        unsafe {
+            if use_nt {
+                run_rows_serial_nt(layout, kernel);
+            } else {
+                run_rows_serial(layout, kernel);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -309,6 +486,84 @@ pub fn convert_row_to_rgba_with_options(
     }
 }
 
+/// Convert a 2D surface with arbitrary source/destination pitch into RGBA8.
+///
+/// This mirrors the conversion path used by DXGI staging readback, where
+/// `src_pitch` is often padded beyond `width * bytes_per_pixel`.
+pub fn convert_surface_to_rgba(
+    format: SurfacePixelFormat,
+    src: &[u8],
+    src_pitch: usize,
+    dst: &mut [u8],
+    dst_pitch: usize,
+    width: usize,
+    height: usize,
+    options: SurfaceConversionOptions,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let src_bpp = match format {
+        SurfacePixelFormat::Bgra8 | SurfacePixelFormat::Rgba8 => 4usize,
+        SurfacePixelFormat::Rgba16Float => 8usize,
+    };
+    let src_row_bytes = width
+        .checked_mul(src_bpp)
+        .expect("width overflow while validating source surface");
+    let dst_row_bytes = width
+        .checked_mul(4)
+        .expect("width overflow while validating destination surface");
+    assert!(
+        src_pitch >= src_row_bytes,
+        "source pitch too small: pitch={}, required={}",
+        src_pitch,
+        src_row_bytes
+    );
+    assert!(
+        dst_pitch >= dst_row_bytes,
+        "destination pitch too small: pitch={}, required={}",
+        dst_pitch,
+        dst_row_bytes
+    );
+
+    let src_required = src_pitch
+        .checked_mul(height.saturating_sub(1))
+        .and_then(|base| base.checked_add(src_row_bytes))
+        .expect("source surface size overflow");
+    let dst_required = dst_pitch
+        .checked_mul(height.saturating_sub(1))
+        .and_then(|base| base.checked_add(dst_row_bytes))
+        .expect("destination surface size overflow");
+    assert!(
+        src.len() >= src_required,
+        "source surface buffer too small: got {}, need at least {} bytes",
+        src.len(),
+        src_required
+    );
+    assert!(
+        dst.len() >= dst_required,
+        "destination surface buffer too small: got {}, need at least {} bytes",
+        dst.len(),
+        dst_required
+    );
+
+    unsafe {
+        convert_surface_to_rgba_unchecked(
+            format,
+            SurfaceLayout::new(
+                src.as_ptr(),
+                src_pitch,
+                dst.as_mut_ptr(),
+                dst_pitch,
+                width,
+                height,
+            ),
+            options,
+        );
+    }
+}
+
 fn surface_format_plan(format: SurfacePixelFormat) -> SurfaceFormatPlan {
     match format {
         SurfacePixelFormat::Bgra8 => SurfaceFormatPlan {
@@ -316,6 +571,7 @@ fn surface_format_plan(format: SurfacePixelFormat) -> SurfaceFormatPlan {
             contiguous_kernel: convert_bgra_to_rgba_unchecked,
             row_kernel: bgra_kernel(),
             row_kernel_nt: bgra_kernel_nt(),
+            row_kernel_nt_nofence: bgra_kernel_nt_nofence(),
             parallel: ParallelConfig {
                 min_pixels: BGRA_PARALLEL_MIN_PIXELS,
                 min_chunk_pixels: BGRA_PARALLEL_MIN_CHUNK_PIXELS,
@@ -327,6 +583,7 @@ fn surface_format_plan(format: SurfacePixelFormat) -> SurfaceFormatPlan {
             contiguous_kernel: memcpy_rgba_unchecked,
             row_kernel: memcpy_rgba_unchecked,
             row_kernel_nt: memcpy_rgba_nt_unchecked,
+            row_kernel_nt_nofence: memcpy_rgba_nt_nofence_unchecked,
             parallel: ParallelConfig {
                 min_pixels: usize::MAX, // never parallelise a plain memcpy
                 min_chunk_pixels: usize::MAX,
@@ -338,6 +595,7 @@ fn surface_format_plan(format: SurfacePixelFormat) -> SurfaceFormatPlan {
             contiguous_kernel: convert_f16_rgba_to_srgb_unchecked,
             row_kernel: f16_kernel(),
             row_kernel_nt: f16_kernel_nt(),
+            row_kernel_nt_nofence: f16_kernel_nt_nofence(),
             parallel: ParallelConfig {
                 min_pixels: F16_PARALLEL_MIN_PIXELS,
                 min_chunk_pixels: F16_PARALLEL_MIN_CHUNK_PIXELS,
@@ -444,6 +702,21 @@ unsafe fn run_rows_parallel(
     }
 }
 
+#[inline(always)]
+fn nt_store_sfence() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_sfence();
+    }
+}
+
+unsafe fn run_rows_serial_nt(layout: SurfaceLayout, kernel: PixelKernel) {
+    unsafe {
+        run_rows_serial(layout, kernel);
+    }
+    nt_store_sfence();
+}
+
 /// Minimum pixel count for non-temporal stores to be beneficial.
 /// Below this threshold the destination buffer likely fits in L3 cache
 /// and temporal stores are faster (avoids write-combine overhead).
@@ -490,7 +763,227 @@ fn nt_destination_is_aligned(dst: *const u8) -> bool {
 #[inline(always)]
 fn nt_rows_are_aligned(dst: *const u8, dst_pitch: usize) -> bool {
     let alignment = nt_store_alignment_bytes();
-    alignment <= 1 || (ptr_is_aligned(dst, alignment) && dst_pitch % alignment == 0)
+    alignment <= 1 || (ptr_is_aligned(dst, alignment) && dst_pitch.is_multiple_of(alignment))
+}
+
+#[inline(always)]
+fn f16_nt_supported() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        (std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("f16c"))
+            || (std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("f16c"))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+struct BgraNtKernelSet {
+    avx512: Option<PixelKernel>,
+    avx2: Option<PixelKernel>,
+    ssse3: Option<PixelKernel>,
+    avx512_nofence: Option<PixelKernel>,
+    avx2_nofence: Option<PixelKernel>,
+    ssse3_nofence: Option<PixelKernel>,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn bgra_nt_kernel_set() -> &'static BgraNtKernelSet {
+    static KERNELS: OnceLock<BgraNtKernelSet> = OnceLock::new();
+    KERNELS.get_or_init(|| BgraNtKernelSet {
+        avx512: if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+        {
+            Some(simd_x86::convert_bgra_to_rgba_avx512_nt_unchecked)
+        } else {
+            None
+        },
+        avx2: if std::arch::is_x86_feature_detected!("avx2") {
+            Some(simd_x86::convert_bgra_to_rgba_avx2_nt_unchecked)
+        } else {
+            None
+        },
+        ssse3: if std::arch::is_x86_feature_detected!("ssse3") {
+            Some(simd_x86::convert_bgra_to_rgba_ssse3_nt_unchecked)
+        } else {
+            None
+        },
+        avx512_nofence: if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+        {
+            Some(simd_x86::convert_bgra_to_rgba_avx512_nt_nofence_unchecked)
+        } else {
+            None
+        },
+        avx2_nofence: if std::arch::is_x86_feature_detected!("avx2") {
+            Some(simd_x86::convert_bgra_to_rgba_avx2_nt_nofence_unchecked)
+        } else {
+            None
+        },
+        ssse3_nofence: if std::arch::is_x86_feature_detected!("ssse3") {
+            Some(simd_x86::convert_bgra_to_rgba_ssse3_nt_nofence_unchecked)
+        } else {
+            None
+        },
+    })
+}
+
+#[inline(always)]
+fn bgra_nt_kernel_for_destination(dst: *const u8) -> Option<PixelKernel> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = dst;
+        let kernels = bgra_nt_kernel_set();
+        if let Some(kernel) = kernels.avx512 {
+            return Some(kernel);
+        }
+        if let Some(kernel) = kernels.avx2 {
+            return Some(kernel);
+        }
+        if let Some(kernel) = kernels.ssse3 {
+            return Some(kernel);
+        }
+        None
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = dst;
+        None
+    }
+}
+
+#[inline(always)]
+fn bgra_nt_kernel_for_rows(dst: *const u8, dst_pitch: usize) -> Option<PixelKernel> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = (dst, dst_pitch);
+        let kernels = bgra_nt_kernel_set();
+        if let Some(kernel) = kernels.avx512 {
+            return Some(kernel);
+        }
+        if let Some(kernel) = kernels.avx2 {
+            return Some(kernel);
+        }
+        if let Some(kernel) = kernels.ssse3 {
+            return Some(kernel);
+        }
+        None
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (dst, dst_pitch);
+        None
+    }
+}
+
+#[inline(always)]
+fn bgra_nt_kernel_for_rows_nofence(dst: *const u8, dst_pitch: usize) -> Option<PixelKernel> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = (dst, dst_pitch);
+        let kernels = bgra_nt_kernel_set();
+        if let Some(kernel) = kernels.avx512_nofence {
+            return Some(kernel);
+        }
+        if let Some(kernel) = kernels.avx2_nofence {
+            return Some(kernel);
+        }
+        if let Some(kernel) = kernels.ssse3_nofence {
+            return Some(kernel);
+        }
+        None
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (dst, dst_pitch);
+        None
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BgraDirtyRectKernel {
+    kernel: PixelKernel,
+    needs_post_fence: bool,
+}
+
+impl BgraDirtyRectKernel {
+    #[inline(always)]
+    fn run(self, src: *const u8, dst: *mut u8, pixel_count: usize) {
+        unsafe {
+            (self.kernel)(src, dst, pixel_count);
+        }
+    }
+
+    #[inline(always)]
+    fn needs_post_fence(self) -> bool {
+        self.needs_post_fence
+    }
+}
+
+#[inline]
+pub(crate) fn select_bgra_dirty_rect_kernel(
+    dst: *const u8,
+    dst_pitch: usize,
+    total_pixels: usize,
+    defer_nt_fence: bool,
+) -> BgraDirtyRectKernel {
+    if total_pixels >= NT_STORE_MIN_PIXELS {
+        let nt_kernel = bgra_nt_kernel_for_rows(dst, dst_pitch);
+        if let Some(kernel) = nt_kernel {
+            if defer_nt_fence
+                && let Some(nofence_kernel) = bgra_nt_kernel_for_rows_nofence(dst, dst_pitch)
+            {
+                return BgraDirtyRectKernel {
+                    kernel: nofence_kernel,
+                    needs_post_fence: true,
+                };
+            }
+            return BgraDirtyRectKernel {
+                kernel,
+                needs_post_fence: false,
+            };
+        }
+    }
+
+    BgraDirtyRectKernel {
+        kernel: bgra_kernel(),
+        needs_post_fence: false,
+    }
+}
+
+#[inline(always)]
+pub(crate) unsafe fn convert_bgra_rows_with_kernel_unchecked(
+    kernel: BgraDirtyRectKernel,
+    src: *const u8,
+    src_pitch: usize,
+    dst: *mut u8,
+    dst_pitch: usize,
+    width: usize,
+    height: usize,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    for row in 0..height {
+        let row_src = unsafe { src.add(row * src_pitch) };
+        let row_dst = unsafe { dst.add(row * dst_pitch) };
+        kernel.run(row_src, row_dst, width);
+    }
+}
+
+#[inline(always)]
+pub(crate) fn finalize_bgra_dirty_rect_kernel(kernel: BgraDirtyRectKernel) {
+    if kernel.needs_post_fence() {
+        nt_store_sfence();
+    }
 }
 
 pub(crate) unsafe fn convert_surface_to_rgba_unchecked(
@@ -527,7 +1020,15 @@ pub(crate) unsafe fn convert_surface_to_rgba_unchecked(
         // surfaces the regular (temporal) path is faster.
         let use_nt = non_overlapping
             && total_pixels >= NT_STORE_MIN_PIXELS
-            && nt_destination_is_aligned(layout.dst as *const u8);
+            && match format {
+                SurfacePixelFormat::Bgra8 => {
+                    bgra_nt_kernel_for_destination(layout.dst as *const u8).is_some()
+                }
+                SurfacePixelFormat::Rgba8 => nt_destination_is_aligned(layout.dst as *const u8),
+                SurfacePixelFormat::Rgba16Float => {
+                    nt_destination_is_aligned(layout.dst as *const u8) && f16_nt_supported()
+                }
+            };
         if use_nt {
             if format == SurfacePixelFormat::Bgra8 {
                 unsafe {
@@ -549,14 +1050,25 @@ pub(crate) unsafe fn convert_surface_to_rgba_unchecked(
     }
 
     if let Some(chunks) = maybe_parallel_row_chunks(layout, plan.parallel, total_pixels) {
-        // Use NT row kernel when buffers don't overlap and the surface
-        // is large enough — avoids cache pollution from write-allocate
-        // traffic in the row-based path (common for padded staging textures).
+        let bgra_row_nt_kernel = if format == SurfacePixelFormat::Bgra8 {
+            bgra_nt_kernel_for_rows(layout.dst as *const u8, layout.dst_pitch)
+        } else {
+            None
+        };
         let use_nt = layout.allow_parallel_rows()
             && total_pixels >= NT_STORE_MIN_PIXELS
-            && nt_rows_are_aligned(layout.dst as *const u8, layout.dst_pitch);
+            && match format {
+                SurfacePixelFormat::Bgra8 => bgra_row_nt_kernel.is_some(),
+                SurfacePixelFormat::Rgba8 => {
+                    nt_rows_are_aligned(layout.dst as *const u8, layout.dst_pitch)
+                }
+                SurfacePixelFormat::Rgba16Float => {
+                    nt_rows_are_aligned(layout.dst as *const u8, layout.dst_pitch)
+                        && f16_nt_supported()
+                }
+            };
         let kernel = if use_nt {
-            plan.row_kernel_nt
+            bgra_row_nt_kernel.unwrap_or(plan.row_kernel_nt)
         } else {
             plan.row_kernel
         };
@@ -566,17 +1078,38 @@ pub(crate) unsafe fn convert_surface_to_rgba_unchecked(
         return;
     }
 
-    // Serial row path — use NT stores when non-overlapping and large enough.
+    let bgra_row_nt_kernel = if format == SurfacePixelFormat::Bgra8 {
+        bgra_nt_kernel_for_rows(layout.dst as *const u8, layout.dst_pitch)
+    } else {
+        None
+    };
+    let bgra_row_nt_kernel_nofence = if format == SurfacePixelFormat::Bgra8 {
+        bgra_nt_kernel_for_rows_nofence(layout.dst as *const u8, layout.dst_pitch)
+    } else {
+        None
+    };
     let use_nt = layout.allow_parallel_rows()
         && total_pixels >= NT_STORE_MIN_PIXELS
-        && nt_rows_are_aligned(layout.dst as *const u8, layout.dst_pitch);
+        && match format {
+            SurfacePixelFormat::Bgra8 => bgra_row_nt_kernel.is_some(),
+            SurfacePixelFormat::Rgba8 => {
+                nt_rows_are_aligned(layout.dst as *const u8, layout.dst_pitch)
+            }
+            SurfacePixelFormat::Rgba16Float => {
+                nt_rows_are_aligned(layout.dst as *const u8, layout.dst_pitch) && f16_nt_supported()
+            }
+        };
     let kernel = if use_nt {
-        plan.row_kernel_nt
+        bgra_row_nt_kernel_nofence.unwrap_or(plan.row_kernel_nt_nofence)
     } else {
         plan.row_kernel
     };
     unsafe {
-        run_rows_serial(layout, kernel);
+        if use_nt {
+            run_rows_serial_nt(layout, kernel);
+        } else {
+            run_rows_serial(layout, kernel);
+        }
     }
 }
 
@@ -631,6 +1164,18 @@ unsafe fn memcpy_rgba_unchecked(src: *const u8, dst: *mut u8, pixel_count: usize
 /// to avoid polluting the cache when the destination won't be read back
 /// before the next capture (staging→frame path).
 unsafe fn memcpy_rgba_nt_unchecked(src: *const u8, dst: *mut u8, pixel_count: usize) {
+    unsafe {
+        memcpy_rgba_nt_impl(src, dst, pixel_count, true);
+    }
+}
+
+unsafe fn memcpy_rgba_nt_nofence_unchecked(src: *const u8, dst: *mut u8, pixel_count: usize) {
+    unsafe {
+        memcpy_rgba_nt_impl(src, dst, pixel_count, false);
+    }
+}
+
+unsafe fn memcpy_rgba_nt_impl(src: *const u8, dst: *mut u8, pixel_count: usize, fence: bool) {
     if !nt_destination_is_aligned(dst as *const u8) {
         unsafe {
             std::ptr::copy_nonoverlapping(src, dst, pixel_count * 4);
@@ -641,13 +1186,13 @@ unsafe fn memcpy_rgba_nt_unchecked(src: *const u8, dst: *mut u8, pixel_count: us
     {
         if std::arch::is_x86_feature_detected!("avx2") {
             unsafe {
-                memcpy_rgba_nt_avx2(src, dst, pixel_count);
+                memcpy_rgba_nt_avx2(src, dst, pixel_count, fence);
             }
             return;
         }
         if std::arch::is_x86_feature_detected!("sse2") {
             unsafe {
-                memcpy_rgba_nt_sse2(src, dst, pixel_count);
+                memcpy_rgba_nt_sse2(src, dst, pixel_count, fence);
             }
             return;
         }
@@ -660,7 +1205,7 @@ unsafe fn memcpy_rgba_nt_unchecked(src: *const u8, dst: *mut u8, pixel_count: us
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn memcpy_rgba_nt_avx2(src: *const u8, dst: *mut u8, pixel_count: usize) {
+unsafe fn memcpy_rgba_nt_avx2(src: *const u8, dst: *mut u8, pixel_count: usize, fence: bool) {
     use std::arch::x86_64::{__m256i, _mm_sfence, _mm256_loadu_si256, _mm256_stream_si256};
     let total_bytes = pixel_count * 4;
     let mut offset = 0usize;
@@ -671,8 +1216,9 @@ unsafe fn memcpy_rgba_nt_avx2(src: *const u8, dst: *mut u8, pixel_count: usize) 
         }
         offset += 32;
     }
-    unsafe { _mm_sfence() };
-    // Copy remaining bytes
+    if fence {
+        _mm_sfence();
+    }
     if offset < total_bytes {
         unsafe {
             std::ptr::copy_nonoverlapping(src.add(offset), dst.add(offset), total_bytes - offset);
@@ -682,7 +1228,7 @@ unsafe fn memcpy_rgba_nt_avx2(src: *const u8, dst: *mut u8, pixel_count: usize) 
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn memcpy_rgba_nt_sse2(src: *const u8, dst: *mut u8, pixel_count: usize) {
+unsafe fn memcpy_rgba_nt_sse2(src: *const u8, dst: *mut u8, pixel_count: usize, fence: bool) {
     use std::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_sfence, _mm_stream_si128};
     let total_bytes = pixel_count * 4;
     let mut offset = 0usize;
@@ -693,7 +1239,9 @@ unsafe fn memcpy_rgba_nt_sse2(src: *const u8, dst: *mut u8, pixel_count: usize) 
         }
         offset += 16;
     }
-    unsafe { _mm_sfence() };
+    if fence {
+        _mm_sfence();
+    }
     if offset < total_bytes {
         unsafe {
             std::ptr::copy_nonoverlapping(src.add(offset), dst.add(offset), total_bytes - offset);
@@ -760,6 +1308,12 @@ fn bgra_kernel_nt() -> PixelKernel {
     *KERNEL.get_or_init(select_bgra_kernel_nt)
 }
 
+#[inline(always)]
+fn bgra_kernel_nt_nofence() -> PixelKernel {
+    static KERNEL: OnceLock<PixelKernel> = OnceLock::new();
+    *KERNEL.get_or_init(select_bgra_kernel_nt_nofence)
+}
+
 /// Best-available F16→sRGB kernel (SIMD when possible, scalar fallback).
 #[inline(always)]
 fn f16_kernel() -> PixelKernel {
@@ -773,6 +1327,12 @@ fn f16_kernel() -> PixelKernel {
 fn f16_kernel_nt() -> PixelKernel {
     static KERNEL: OnceLock<PixelKernel> = OnceLock::new();
     *KERNEL.get_or_init(select_f16_kernel_nt)
+}
+
+#[inline(always)]
+fn f16_kernel_nt_nofence() -> PixelKernel {
+    static KERNEL: OnceLock<PixelKernel> = OnceLock::new();
+    *KERNEL.get_or_init(select_f16_kernel_nt_nofence)
 }
 
 fn select_f16_kernel() -> PixelKernel {
@@ -807,6 +1367,26 @@ fn select_f16_kernel_nt() -> PixelKernel {
             && std::arch::is_x86_feature_detected!("f16c")
         {
             return simd_x86::convert_f16_rgba_to_srgb_f16c_nt_unchecked;
+        }
+    }
+
+    // Scalar path has no NT variant; fall back to the regular kernel.
+    f16::convert_f16_rgba_to_srgb_scalar_unchecked
+}
+
+fn select_f16_kernel_nt_nofence() -> PixelKernel {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("f16c")
+        {
+            return simd_x86::convert_f16_rgba_to_srgb_avx512_nt_nofence_unchecked;
+        }
+        if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("f16c")
+        {
+            return simd_x86::convert_f16_rgba_to_srgb_f16c_nt_nofence_unchecked;
         }
     }
 
@@ -879,6 +1459,26 @@ fn select_bgra_kernel_nt() -> PixelKernel {
     scalar::convert_bgra_to_rgba_scalar_unchecked
 }
 
+fn select_bgra_kernel_nt_nofence() -> PixelKernel {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+        {
+            return simd_x86::convert_bgra_to_rgba_avx512_nt_nofence_unchecked;
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return simd_x86::convert_bgra_to_rgba_avx2_nt_nofence_unchecked;
+        }
+        if std::arch::is_x86_feature_detected!("ssse3") {
+            return simd_x86::convert_bgra_to_rgba_ssse3_nt_nofence_unchecked;
+        }
+    }
+
+    // Scalar path has no NT variant; fall back to the regular kernel.
+    scalar::convert_bgra_to_rgba_scalar_unchecked
+}
+
 pub(crate) unsafe fn convert_bgra_to_rgba_unchecked(
     src: *const u8,
     dst: *mut u8,
@@ -918,12 +1518,12 @@ pub(crate) unsafe fn convert_bgra_to_rgba_nt_unchecked(
     dst: *mut u8,
     pixel_count: usize,
 ) {
-    if !nt_destination_is_aligned(dst as *const u8) {
+    let Some(nt_kernel) = bgra_nt_kernel_for_destination(dst as *const u8) else {
         unsafe {
             convert_bgra_to_rgba_unchecked(src, dst, pixel_count);
         }
         return;
-    }
+    };
 
     if should_parallelize(
         pixel_count,
@@ -938,6 +1538,7 @@ pub(crate) unsafe fn convert_bgra_to_rgba_nt_unchecked(
                 pixel_count,
                 BGRA_NT_PARALLEL_MIN_CHUNK_PIXELS,
                 BGRA_PARALLEL_MAX_WORKERS,
+                Some(nt_kernel),
             );
         }
         return;
@@ -945,7 +1546,7 @@ pub(crate) unsafe fn convert_bgra_to_rgba_nt_unchecked(
     // Serial path — still use NT stores since src != dst is guaranteed
     // by the caller and the working set far exceeds the cache.
     unsafe {
-        bgra_kernel_nt()(src, dst, pixel_count);
+        nt_kernel(src, dst, pixel_count);
     }
 }
 
@@ -1012,6 +1613,7 @@ pub(crate) unsafe fn convert_f16_rgba_to_srgb_nt_unchecked(
 }
 
 unsafe fn convert_bgra_to_rgba_parallel(src: *const u8, dst: *mut u8, pixel_count: usize) {
+    let nt_kernel = bgra_nt_kernel_for_destination(dst as *const u8);
     unsafe {
         convert_bgra_to_rgba_parallel_inner(
             src,
@@ -1019,6 +1621,7 @@ unsafe fn convert_bgra_to_rgba_parallel(src: *const u8, dst: *mut u8, pixel_coun
             pixel_count,
             BGRA_PARALLEL_MIN_CHUNK_PIXELS,
             BGRA_PARALLEL_MAX_WORKERS,
+            nt_kernel,
         );
     }
 }
@@ -1029,10 +1632,17 @@ unsafe fn convert_bgra_to_rgba_parallel_inner(
     pixel_count: usize,
     min_chunk_pixels: usize,
     max_workers: usize,
+    nt_kernel: Option<PixelKernel>,
 ) {
     let Some(chunk_pixels) = parallel_chunk_pixels(pixel_count, min_chunk_pixels, max_workers)
     else {
-        unsafe { bgra_kernel_nt()(src, dst, pixel_count) };
+        unsafe {
+            if let Some(kernel) = nt_kernel {
+                kernel(src, dst, pixel_count);
+            } else {
+                bgra_kernel()(src, dst, pixel_count);
+            }
+        };
         return;
     };
 
@@ -1048,7 +1658,7 @@ unsafe fn convert_bgra_to_rgba_parallel_inner(
     // Use non-temporal stores in the parallel path — each chunk is large
     // enough that the destination lines won't be read back before the
     // full conversion completes, so bypassing the cache is a net win.
-    let kernel = bgra_kernel_nt();
+    let kernel = nt_kernel.unwrap_or_else(bgra_kernel);
     let src_addr = src as usize;
     let dst_addr = dst as usize;
 
@@ -1136,6 +1746,143 @@ mod tests {
             assert_eq!(dst[idx + 1], src[idx + 1]);
             assert_eq!(dst[idx + 2], src[idx]);
             assert_eq!(dst[idx + 3], 0x2A);
+        }
+    }
+
+    #[test]
+    fn convert_surface_to_rgba_handles_pitched_bgra() {
+        let width = 7usize;
+        let height = 5usize;
+        let src_pitch = 36usize;
+        let dst_pitch = width * 4;
+        let src_row_bytes = width * 4;
+        let src_len = src_pitch * (height - 1) + src_row_bytes;
+        let dst_len = dst_pitch * (height - 1) + dst_pitch;
+
+        let mut src = vec![0u8; src_len];
+        for y in 0..height {
+            for x in 0..width {
+                let i = y * src_pitch + x * 4;
+                src[i] = (x * 3 + y * 5) as u8; // B
+                src[i + 1] = (x * 11 + y) as u8; // G
+                src[i + 2] = (x + y * 13) as u8; // R
+                src[i + 3] = 0x40 + (x as u8); // A
+            }
+        }
+
+        let mut dst = vec![0u8; dst_len];
+        convert_surface_to_rgba(
+            SurfacePixelFormat::Bgra8,
+            &src,
+            src_pitch,
+            &mut dst,
+            dst_pitch,
+            width,
+            height,
+            SurfaceConversionOptions::default(),
+        );
+
+        for y in 0..height {
+            for x in 0..width {
+                let src_i = y * src_pitch + x * 4;
+                let dst_i = y * dst_pitch + x * 4;
+                assert_eq!(dst[dst_i], src[src_i + 2]); // R
+                assert_eq!(dst[dst_i + 1], src[src_i + 1]); // G
+                assert_eq!(dst[dst_i + 2], src[src_i]); // B
+                assert_eq!(dst[dst_i + 3], src[src_i + 3]); // A
+            }
+        }
+    }
+
+    #[test]
+    fn convert_surface_to_rgba_handles_pitched_rgba_passthrough() {
+        let width = 9usize;
+        let height = 4usize;
+        let src_pitch = 44usize;
+        let dst_pitch = 44usize;
+        let row_bytes = width * 4;
+        let len = src_pitch * (height - 1) + row_bytes;
+
+        let mut src = vec![0u8; len];
+        for y in 0..height {
+            for x in 0..width {
+                let i = y * src_pitch + x * 4;
+                src[i] = (x + y) as u8;
+                src[i + 1] = (x * 2 + y * 3) as u8;
+                src[i + 2] = (x * 7 + y * 5) as u8;
+                src[i + 3] = 0x80;
+            }
+        }
+
+        let mut dst = vec![0u8; len];
+        convert_surface_to_rgba(
+            SurfacePixelFormat::Rgba8,
+            &src,
+            src_pitch,
+            &mut dst,
+            dst_pitch,
+            width,
+            height,
+            SurfaceConversionOptions::default(),
+        );
+
+        for y in 0..height {
+            let src_row = &src[y * src_pitch..y * src_pitch + row_bytes];
+            let dst_row = &dst[y * dst_pitch..y * dst_pitch + row_bytes];
+            assert_eq!(dst_row, src_row);
+        }
+    }
+
+    #[test]
+    fn convert_surface_to_rgba_handles_pitched_rgba16f() {
+        let width = 7usize;
+        let height = 3usize;
+        let src_pitch = 64usize;
+        let dst_pitch = 40usize;
+        let src_row_bytes = width * 8;
+        let dst_row_bytes = width * 4;
+        let src_len = src_pitch * (height - 1) + src_row_bytes;
+        let dst_len = dst_pitch * (height - 1) + dst_row_bytes;
+
+        let mut src = vec![0u8; src_len];
+        for (idx, byte) in src.iter_mut().enumerate() {
+            *byte = (idx.wrapping_mul(17).wrapping_add(31) & 0xFF) as u8;
+        }
+
+        let mut dst = vec![0xCDu8; dst_len];
+        convert_surface_to_rgba(
+            SurfacePixelFormat::Rgba16Float,
+            &src,
+            src_pitch,
+            &mut dst,
+            dst_pitch,
+            width,
+            height,
+            SurfaceConversionOptions::default(),
+        );
+
+        let mut expected = vec![0xCDu8; dst_len];
+        for y in 0..height {
+            let src_row = &src[y * src_pitch..y * src_pitch + src_row_bytes];
+            let dst_row = &mut expected[y * dst_pitch..y * dst_pitch + dst_row_bytes];
+            convert_row_to_rgba_with_options(
+                SurfacePixelFormat::Rgba16Float,
+                src_row,
+                dst_row,
+                width,
+                SurfaceConversionOptions::default(),
+            );
+        }
+
+        for y in 0..height {
+            let row_start = y * dst_pitch;
+            let row_end = row_start + dst_row_bytes;
+            assert_eq!(&dst[row_start..row_end], &expected[row_start..row_end]);
+
+            let pad_end = ((y + 1) * dst_pitch).min(dst.len());
+            if row_end < pad_end {
+                assert!(dst[row_end..pad_end].iter().all(|&v| v == 0xCD));
+            }
         }
     }
 }

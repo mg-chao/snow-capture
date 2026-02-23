@@ -1,10 +1,12 @@
 pub(crate) mod com;
 pub(crate) mod d3d11;
+pub(crate) mod dirty_rect;
 pub(crate) mod display_change;
 pub(crate) mod duplication;
 pub(crate) mod gdi;
 pub(crate) mod gpu_tonemap;
 pub(crate) mod monitor;
+pub(crate) mod region_pipeline;
 pub(crate) mod surface;
 pub(crate) mod wgc;
 
@@ -72,9 +74,7 @@ impl WindowsBackend {
             CaptureBackendKind::WindowsGraphicsCapture => {
                 Ok(Box::new(wgc::WindowsWindowCapturer::new(window)?))
             }
-            CaptureBackendKind::Gdi => {
-                Ok(Box::new(gdi::WindowsWindowCapturer::new(window)?))
-            }
+            CaptureBackendKind::Gdi => Ok(Box::new(gdi::WindowsWindowCapturer::new(window)?)),
         }
     }
 

@@ -169,8 +169,6 @@ fn duration_saturating_sub_clamped(base: Duration, delta: Duration, min: Duratio
     base.saturating_sub(delta).max(min)
 }
 
-
-
 fn dirty_region_mode_supported(mode: GraphicsCaptureDirtyRegionMode) -> bool {
     mode == GraphicsCaptureDirtyRegionMode::ReportOnly
         || mode == GraphicsCaptureDirtyRegionMode::ReportAndRender
@@ -754,7 +752,6 @@ impl RegionStagingSlotAccess for WgcStagingSlot {
         self.dirty_gpu_copy_preferred
     }
 }
-
 
 /// WGC FrameArrived stores the system-relative time alongside the frame.
 #[derive(Default)]
@@ -2562,11 +2559,22 @@ impl WindowsGraphicsCaptureCapturer {
             return;
         }
         self.capture_mode = mode;
-        if mode == CaptureMode::ScreenRecording {
-            let _ = self.session.SetIsBorderRequired(false);
-            let _ = self
-                .session
-                .SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportAndRender);
+        match mode {
+            CaptureMode::ScreenRecording => {
+                let _ = self.session.SetIsBorderRequired(false);
+                let _ = self
+                    .session
+                    .SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportAndRender);
+                self.stale_timeout_config = active_stale_timeout_config();
+            }
+            CaptureMode::Screenshot => {
+                // Screenshot paths do not rely on stale-return loops; favor the
+                // lighter legacy timeout profile and report-only dirty mode.
+                let _ = self
+                    .session
+                    .SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly);
+                self.stale_timeout_config = stale_timeout_config(false);
+            }
         }
         self.reset_staging_pipeline();
     }

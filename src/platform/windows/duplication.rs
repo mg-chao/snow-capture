@@ -163,8 +163,6 @@ impl RegionStagingSlotAccess for RegionStagingSlot {
     }
 }
 
-
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct MoveRect {
     src_x: u32,
@@ -1662,6 +1660,31 @@ impl OutputCapturer {
         Ok(())
     }
 
+    /// Screenshot mode prioritizes low memory footprint over preserving
+    /// recording-oriented scratch capacity.
+    fn trim_recording_scratch_for_screenshot(&mut self) {
+        self.pending_dirty_rects.clear();
+        self.pending_dirty_rects.shrink_to_fit();
+        self.dxgi_rect_buffer.clear();
+        self.dxgi_rect_buffer.shrink_to_fit();
+        self.dxgi_move_rect_buffer.clear();
+        self.dxgi_move_rect_buffer.shrink_to_fit();
+        self.source_dirty_rects_scratch.clear();
+        self.source_dirty_rects_scratch.shrink_to_fit();
+        self.source_move_rects_scratch.clear();
+        self.source_move_rects_scratch.shrink_to_fit();
+        self.region_dirty_rects_scratch.clear();
+        self.region_dirty_rects_scratch.shrink_to_fit();
+        self.region_move_rects_scratch.clear();
+        self.region_move_rects_scratch.shrink_to_fit();
+        for slot in &mut self.region.slots {
+            slot.dirty_rects.clear();
+            slot.dirty_rects.shrink_to_fit();
+            slot.move_rects.clear();
+            slot.move_rects.shrink_to_fit();
+        }
+    }
+
     fn set_capture_mode(&mut self, mode: CaptureMode) {
         if self.capture_mode == mode {
             return;
@@ -1677,8 +1700,16 @@ impl OutputCapturer {
         self.monitor_low_latency_dirty_gpu_active = false;
         self.monitor_low_latency_dirty_gpu_primed = false;
         self.monitor_low_latency_dirty_gpu_desc = None;
-        self.staging_ring.reset_pipeline();
-        self.region.reset();
+        if mode == CaptureMode::Screenshot {
+            // Screenshot captures use single-shot paths; drop recording buffers.
+            self.staging_ring.invalidate();
+            self.region.invalidate();
+            self.trim_recording_scratch_for_screenshot();
+        } else {
+            // Recording mode keeps runtime state warm for sustained throughput.
+            self.staging_ring.reset_pipeline();
+            self.region.reset();
+        }
     }
 
     fn effective_source(
@@ -3981,7 +4012,8 @@ mod tests {
                 width,
                 height,
             };
-            let Some(clamped) = dirty_rect::clamp_dirty_rect(dirty, source_width, source_height) else {
+            let Some(clamped) = dirty_rect::clamp_dirty_rect(dirty, source_width, source_height)
+            else {
                 continue;
             };
 

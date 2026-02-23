@@ -2381,6 +2381,32 @@ impl GdiResources {
         self.dirty_row_spans.clear();
         self.dirty_span_runs.clear();
     }
+
+    /// Screenshot mode does not use incremental-history state.
+    /// Drop recording-only buffers to reduce steady-state memory footprint.
+    fn trim_incremental_history_for_screenshot(&mut self) {
+        if let Some(history_bitmap) = self.history_bitmap.take() {
+            unsafe {
+                let _ = DeleteObject(history_bitmap);
+            }
+        }
+        self.history_bits = null_mut();
+        self.history_surface_valid = false;
+        self.incremental_duplicate_hint = false;
+        self.incremental_too_dirty_hint = false;
+        self.parallel_span_mode_hint = None;
+
+        self.bgra_history.clear();
+        self.bgra_history.shrink_to_fit();
+        self.dirty_row_flags.clear();
+        self.dirty_row_flags.shrink_to_fit();
+        self.dirty_row_runs.clear();
+        self.dirty_row_runs.shrink_to_fit();
+        self.dirty_row_spans.clear();
+        self.dirty_row_spans.shrink_to_fit();
+        self.dirty_span_runs.clear();
+        self.dirty_span_runs.shrink_to_fit();
+    }
 }
 
 impl Drop for GdiResources {
@@ -2554,6 +2580,9 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
     }
 
     fn set_capture_mode(&mut self, mode: CaptureMode) {
+        if self.capture_mode != mode && mode == CaptureMode::Screenshot {
+            self.resources.trim_incremental_history_for_screenshot();
+        }
         self.capture_mode = mode;
     }
 }
@@ -2731,6 +2760,9 @@ impl MonitorCapturer for WindowsWindowCapturer {
         if self.capture_mode != mode {
             self.preferred_path = None;
             self.invalidate_window_state_cache();
+            if mode == CaptureMode::Screenshot {
+                self.resources.trim_incremental_history_for_screenshot();
+            }
         }
         self.capture_mode = mode;
     }

@@ -170,7 +170,17 @@ struct GpuParams {
     _pad2: u32,
 }
 
-pub(crate) struct GpuTonemapper {
+/// Threshold below which we use the 1D dispatch path.
+/// For textures smaller than 512px on either axis, the 16×16 thread
+/// groups waste significant threads on boundary tiles.
+const SMALL_TEXTURE_THRESHOLD: u32 = 512;
+
+/// Shared GPU compute-shader pass infrastructure.
+///
+/// Encapsulates the D3D11 resources and caching logic common to both
+/// HDR tonemapping and F16→sRGB conversion: shader objects, output
+/// texture/UAV management, SRV caching, and the dispatch call.
+struct GpuComputePass {
     cs: ID3D11ComputeShader,
     /// 1D compute shader for small textures (256×1 thread groups).
     cs_1d: Option<ID3D11ComputeShader>,
@@ -184,35 +194,28 @@ pub(crate) struct GpuTonemapper {
     cached_srv_source: usize, // raw COM pointer of the texture the SRV was created for
     cached_width: u32,
     cached_height: u32,
-    /// Combined cache of tonemap params and dimensions written to the
-    /// constant buffer — skip the update when neither has changed.
-    /// Single Option avoids a double comparison on every frame.
-    cached_cbuf_state: Option<(HdrToSdrParams, u32, u32)>,
 }
 
-/// Threshold below which we use the 1D dispatch path.
-/// For textures smaller than 512px on either axis, the 16×16 thread
-/// groups waste significant threads on boundary tiles.
-const SMALL_TEXTURE_THRESHOLD: u32 = 512;
-
-impl GpuTonemapper {
-    pub(crate) fn new(device: &ID3D11Device) -> CaptureResult<Self> {
-        let bytecode = cached_bytecode().as_ref().map_err(|e| {
-            CaptureError::Platform(anyhow::anyhow!("shader compilation failed: {e}"))
-        })?;
-
+impl GpuComputePass {
+    /// Creates a new compute pass from the given shader bytecodes.
+    /// `bytecode_1d` failure is non-fatal (falls back to 2D dispatch).
+    fn new(
+        device: &ID3D11Device,
+        bytecode: &[u8],
+        bytecode_1d: Option<&[u8]>,
+        label: &str,
+    ) -> CaptureResult<Self> {
         let mut cs: Option<ID3D11ComputeShader> = None;
         unsafe { device.CreateComputeShader(bytecode, None, Some(&mut cs)) }
-            .context("CreateComputeShader failed")
+            .context(format!("CreateComputeShader ({label}) failed"))
             .map_err(CaptureError::Platform)?;
         let cs = cs
-            .context("CreateComputeShader returned None")
+            .context(format!("CreateComputeShader ({label}) returned None"))
             .map_err(CaptureError::Platform)?;
 
-        // Try to create the 1D shader — non-fatal if it fails.
-        let cs_1d = cached_bytecode_1d().as_ref().ok().and_then(|bytecode_1d| {
+        let cs_1d = bytecode_1d.and_then(|bc| {
             let mut shader: Option<ID3D11ComputeShader> = None;
-            unsafe { device.CreateComputeShader(bytecode_1d, None, Some(&mut shader)) }.ok()?;
+            unsafe { device.CreateComputeShader(bc, None, Some(&mut shader)) }.ok()?;
             shader
         });
 
@@ -225,10 +228,10 @@ impl GpuTonemapper {
         };
         let mut cbuf: Option<ID3D11Buffer> = None;
         unsafe { device.CreateBuffer(&cbuf_desc, None, Some(&mut cbuf)) }
-            .context("CreateBuffer for constant buffer failed")
+            .context(format!("CreateBuffer ({label}) for constant buffer failed"))
             .map_err(CaptureError::Platform)?;
         let cbuf = cbuf
-            .context("CreateBuffer returned None")
+            .context(format!("CreateBuffer ({label}) returned None"))
             .map_err(CaptureError::Platform)?;
 
         Ok(Self {
@@ -241,7 +244,6 @@ impl GpuTonemapper {
             cached_srv_source: 0,
             cached_width: 0,
             cached_height: 0,
-            cached_cbuf_state: None,
         })
     }
 
@@ -272,7 +274,7 @@ impl GpuTonemapper {
 
         let mut tex: Option<ID3D11Texture2D> = None;
         unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }
-            .context("CreateTexture2D for tonemap output failed")
+            .context("CreateTexture2D for compute output failed")
             .map_err(CaptureError::Platform)?;
         let tex = tex
             .context("CreateTexture2D returned None")
@@ -299,7 +301,6 @@ impl GpuTonemapper {
         device: &ID3D11Device,
         source: &ID3D11Texture2D,
     ) -> CaptureResult<ID3D11ShaderResourceView> {
-        // Compare raw COM interface pointer to detect same texture object.
         let source_ptr = source.as_raw() as usize;
         if source_ptr == self.cached_srv_source {
             if let Some(ref srv) = self.cached_srv {
@@ -309,7 +310,7 @@ impl GpuTonemapper {
 
         let mut srv: Option<ID3D11ShaderResourceView> = None;
         unsafe { device.CreateShaderResourceView(source, None, Some(&mut srv)) }
-            .context("CreateShaderResourceView for HDR source failed")
+            .context("CreateShaderResourceView for source failed")
             .map_err(CaptureError::Platform)?;
         let srv = srv
             .context("CreateShaderResourceView returned None")
@@ -318,6 +319,92 @@ impl GpuTonemapper {
         self.cached_srv = Some(srv.clone());
         self.cached_srv_source = source_ptr;
         Ok(srv)
+    }
+
+    /// Uploads `gpu_params` to the constant buffer via Map/Unmap.
+    fn update_cbuf(
+        &self,
+        context: &ID3D11DeviceContext,
+        gpu_params: &GpuParams,
+    ) -> CaptureResult<()> {
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe { context.Map(&self.cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped)) }
+            .context("Map constant buffer failed")
+            .map_err(CaptureError::Platform)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                gpu_params as *const GpuParams as *const u8,
+                mapped.pData as *mut u8,
+                std::mem::size_of::<GpuParams>(),
+            );
+            context.Unmap(&self.cbuf, 0);
+        }
+        Ok(())
+    }
+
+    /// Binds resources, dispatches the compute shader, and unbinds.
+    fn dispatch(
+        &self,
+        context: &ID3D11DeviceContext,
+        srv: ID3D11ShaderResourceView,
+        width: u32,
+        height: u32,
+    ) {
+        let uav = self.output_uav.as_ref().unwrap();
+
+        unsafe {
+            let use_1d = (width < SMALL_TEXTURE_THRESHOLD || height < SMALL_TEXTURE_THRESHOLD)
+                && self.cs_1d.is_some();
+
+            if use_1d {
+                context.CSSetShader(self.cs_1d.as_ref().unwrap(), None);
+            } else {
+                context.CSSetShader(&self.cs, None);
+            }
+            context.CSSetConstantBuffers(0, Some(&[Some(self.cbuf.clone())]));
+            context.CSSetShaderResources(0, Some(&[Some(srv)]));
+            context.CSSetUnorderedAccessViews(0, 1, Some(&Some(uav.clone()) as *const _), None);
+
+            if use_1d {
+                let groups_x = (width + 255) / 256;
+                context.Dispatch(groups_x, height, 1);
+            } else {
+                let groups_x = (width + 15) / 16;
+                let groups_y = (height + 15) / 16;
+                context.Dispatch(groups_x, groups_y, 1);
+            }
+
+            // Unbind resources
+            let no_srv: Option<ID3D11ShaderResourceView> = None;
+            context.CSSetShaderResources(0, Some(&[no_srv]));
+            context.CSSetUnorderedAccessViews(0, 1, Some(&None as *const _), None);
+        }
+    }
+
+    fn output_tex(&self) -> &ID3D11Texture2D {
+        self.output_tex.as_ref().unwrap()
+    }
+}
+
+pub(crate) struct GpuTonemapper {
+    pass: GpuComputePass,
+    /// Combined cache of tonemap params and dimensions written to the
+    /// constant buffer — skip the update when neither has changed.
+    cached_cbuf_state: Option<(HdrToSdrParams, u32, u32)>,
+}
+
+impl GpuTonemapper {
+    pub(crate) fn new(device: &ID3D11Device) -> CaptureResult<Self> {
+        let bytecode = cached_bytecode().as_ref().map_err(|e| {
+            CaptureError::Platform(anyhow::anyhow!("shader compilation failed: {e}"))
+        })?;
+        let bytecode_1d = cached_bytecode_1d().as_ref().ok().map(|v| v.as_slice());
+
+        let pass = GpuComputePass::new(device, bytecode, bytecode_1d, "tonemap")?;
+        Ok(Self {
+            pass,
+            cached_cbuf_state: None,
+        })
     }
 
     /// Runs the HDR-to-SDR compute shader on the GPU.
@@ -333,7 +420,7 @@ impl GpuTonemapper {
     ) -> CaptureResult<&ID3D11Texture2D> {
         let width = source_desc.Width;
         let height = source_desc.Height;
-        self.ensure_output(device, width, height)?;
+        self.pass.ensure_output(device, width, height)?;
 
         // Update the constant buffer when params or dimensions have changed.
         let needs_cbuf_update = self
@@ -350,61 +437,13 @@ impl GpuTonemapper {
                 _pad1: 0,
                 _pad2: 0,
             };
-            // Use Map(WRITE_DISCARD) on the dynamic buffer instead of
-            // UpdateSubresource — this lets the driver internally double-
-            // buffer the constant data and avoids a potential pipeline
-            // stall if the GPU is still reading the previous params.
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            unsafe { context.Map(&self.cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped)) }
-                .context("Map constant buffer failed")
-                .map_err(CaptureError::Platform)?;
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    &gpu_params as *const GpuParams as *const u8,
-                    mapped.pData as *mut u8,
-                    std::mem::size_of::<GpuParams>(),
-                );
-                context.Unmap(&self.cbuf, 0);
-            }
+            self.pass.update_cbuf(context, &gpu_params)?;
             self.cached_cbuf_state = Some((params, width, height));
         }
 
-        let srv = self.get_or_create_srv(device, source)?;
-        let uav = self.output_uav.as_ref().unwrap();
-
-        unsafe {
-            // Choose dispatch strategy based on texture size.
-            // For small textures, use 1D dispatch (256×1 thread groups)
-            // to avoid wasting threads on partially-filled 16×16 tiles.
-            let use_1d = (width < SMALL_TEXTURE_THRESHOLD || height < SMALL_TEXTURE_THRESHOLD)
-                && self.cs_1d.is_some();
-
-            if use_1d {
-                context.CSSetShader(self.cs_1d.as_ref().unwrap(), None);
-            } else {
-                context.CSSetShader(&self.cs, None);
-            }
-            context.CSSetConstantBuffers(0, Some(&[Some(self.cbuf.clone())]));
-            context.CSSetShaderResources(0, Some(&[Some(srv)]));
-            context.CSSetUnorderedAccessViews(0, 1, Some(&Some(uav.clone()) as *const _), None);
-
-            if use_1d {
-                // 1D dispatch: (ceil(width/256), height, 1)
-                let groups_x = (width + 255) / 256;
-                context.Dispatch(groups_x, height, 1);
-            } else {
-                let groups_x = (width + 15) / 16;
-                let groups_y = (height + 15) / 16;
-                context.Dispatch(groups_x, groups_y, 1);
-            }
-
-            // Unbind resources
-            let no_srv: Option<ID3D11ShaderResourceView> = None;
-            context.CSSetShaderResources(0, Some(&[no_srv]));
-            context.CSSetUnorderedAccessViews(0, 1, Some(&None as *const _), None);
-        }
-
-        Ok(self.output_tex.as_ref().unwrap())
+        let srv = self.pass.get_or_create_srv(device, source)?;
+        self.pass.dispatch(context, srv, width, height);
+        Ok(self.pass.output_tex())
     }
 }
 
@@ -414,15 +453,7 @@ impl GpuTonemapper {
 /// Converts linear light values directly to sRGB gamma on the GPU, so the
 /// CPU readback path only needs to handle RGBA8 (a simple memcpy-equivalent).
 pub(crate) struct GpuF16Converter {
-    cs: ID3D11ComputeShader,
-    cs_1d: Option<ID3D11ComputeShader>,
-    cbuf: ID3D11Buffer,
-    output_tex: Option<ID3D11Texture2D>,
-    output_uav: Option<ID3D11UnorderedAccessView>,
-    cached_srv: Option<ID3D11ShaderResourceView>,
-    cached_srv_source: usize,
-    cached_width: u32,
-    cached_height: u32,
+    pass: GpuComputePass,
 }
 
 impl GpuF16Converter {
@@ -430,123 +461,10 @@ impl GpuF16Converter {
         let bytecode = cached_bytecode_f16().as_ref().map_err(|e| {
             CaptureError::Platform(anyhow::anyhow!("F16 shader compilation failed: {e}"))
         })?;
+        let bytecode_1d = cached_bytecode_f16_1d().as_ref().ok().map(|v| v.as_slice());
 
-        let mut cs: Option<ID3D11ComputeShader> = None;
-        unsafe { device.CreateComputeShader(bytecode, None, Some(&mut cs)) }
-            .context("CreateComputeShader (F16) failed")
-            .map_err(CaptureError::Platform)?;
-        let cs = cs
-            .context("CreateComputeShader (F16) returned None")
-            .map_err(CaptureError::Platform)?;
-
-        let cs_1d = cached_bytecode_f16_1d().as_ref().ok().and_then(|bc| {
-            let mut shader: Option<ID3D11ComputeShader> = None;
-            unsafe { device.CreateComputeShader(bc, None, Some(&mut shader)) }.ok()?;
-            shader
-        });
-
-        // Minimal constant buffer — only needs tex_width/tex_height.
-        // Reuse the same GpuParams layout for simplicity (the HDR fields
-        // are ignored by the F16 shader).
-        let cbuf_desc = D3D11_BUFFER_DESC {
-            ByteWidth: std::mem::size_of::<GpuParams>() as u32,
-            Usage: D3D11_USAGE_DYNAMIC,
-            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
-            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
-            ..Default::default()
-        };
-        let mut cbuf: Option<ID3D11Buffer> = None;
-        unsafe { device.CreateBuffer(&cbuf_desc, None, Some(&mut cbuf)) }
-            .context("CreateBuffer for F16 constant buffer failed")
-            .map_err(CaptureError::Platform)?;
-        let cbuf = cbuf
-            .context("CreateBuffer (F16) returned None")
-            .map_err(CaptureError::Platform)?;
-
-        Ok(Self {
-            cs,
-            cs_1d,
-            cbuf,
-            output_tex: None,
-            output_uav: None,
-            cached_srv: None,
-            cached_srv_source: 0,
-            cached_width: 0,
-            cached_height: 0,
-        })
-    }
-
-    fn ensure_output(
-        &mut self,
-        device: &ID3D11Device,
-        width: u32,
-        height: u32,
-    ) -> CaptureResult<()> {
-        if self.cached_width == width && self.cached_height == height && self.output_tex.is_some() {
-            return Ok(());
-        }
-
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: width,
-            Height: height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_UNORDERED_ACCESS.0 as u32,
-            ..Default::default()
-        };
-
-        let mut tex: Option<ID3D11Texture2D> = None;
-        unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }
-            .context("CreateTexture2D for F16 output failed")
-            .map_err(CaptureError::Platform)?;
-        let tex = tex
-            .context("CreateTexture2D (F16) returned None")
-            .map_err(CaptureError::Platform)?;
-
-        let mut uav: Option<ID3D11UnorderedAccessView> = None;
-        unsafe { device.CreateUnorderedAccessView(&tex, None, Some(&mut uav)) }
-            .context("CreateUnorderedAccessView (F16) failed")
-            .map_err(CaptureError::Platform)?;
-        let uav = uav
-            .context("CreateUnorderedAccessView (F16) returned None")
-            .map_err(CaptureError::Platform)?;
-
-        self.output_tex = Some(tex);
-        self.output_uav = Some(uav);
-        self.cached_width = width;
-        self.cached_height = height;
-        Ok(())
-    }
-
-    fn get_or_create_srv(
-        &mut self,
-        device: &ID3D11Device,
-        source: &ID3D11Texture2D,
-    ) -> CaptureResult<ID3D11ShaderResourceView> {
-        let source_ptr = source.as_raw() as usize;
-        if source_ptr == self.cached_srv_source {
-            if let Some(ref srv) = self.cached_srv {
-                return Ok(srv.clone());
-            }
-        }
-
-        let mut srv: Option<ID3D11ShaderResourceView> = None;
-        unsafe { device.CreateShaderResourceView(source, None, Some(&mut srv)) }
-            .context("CreateShaderResourceView for F16 source failed")
-            .map_err(CaptureError::Platform)?;
-        let srv = srv
-            .context("CreateShaderResourceView (F16) returned None")
-            .map_err(CaptureError::Platform)?;
-
-        self.cached_srv = Some(srv.clone());
-        self.cached_srv_source = source_ptr;
-        Ok(srv)
+        let pass = GpuComputePass::new(device, bytecode, bytecode_1d, "F16")?;
+        Ok(Self { pass })
     }
 
     /// Converts an F16 linear texture to RGBA8 sRGB on the GPU.
@@ -560,9 +478,9 @@ impl GpuF16Converter {
     ) -> CaptureResult<&ID3D11Texture2D> {
         let width = source_desc.Width;
         let height = source_desc.Height;
-        self.ensure_output(device, width, height)?;
+        self.pass.ensure_output(device, width, height)?;
 
-        // Update constant buffer with dimensions.
+        // F16 converter only needs dimensions — HDR fields are zeroed.
         let gpu_params = GpuParams {
             hdr_paper_white_nits: 0.0,
             hdr_maximum_nits: 0.0,
@@ -573,49 +491,10 @@ impl GpuF16Converter {
             _pad1: 0,
             _pad2: 0,
         };
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe { context.Map(&self.cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped)) }
-            .context("Map F16 constant buffer failed")
-            .map_err(CaptureError::Platform)?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                &gpu_params as *const GpuParams as *const u8,
-                mapped.pData as *mut u8,
-                std::mem::size_of::<GpuParams>(),
-            );
-            context.Unmap(&self.cbuf, 0);
-        }
+        self.pass.update_cbuf(context, &gpu_params)?;
 
-        let srv = self.get_or_create_srv(device, source)?;
-        let uav = self.output_uav.as_ref().unwrap();
-
-        unsafe {
-            let use_1d = (width < SMALL_TEXTURE_THRESHOLD || height < SMALL_TEXTURE_THRESHOLD)
-                && self.cs_1d.is_some();
-
-            if use_1d {
-                context.CSSetShader(self.cs_1d.as_ref().unwrap(), None);
-            } else {
-                context.CSSetShader(&self.cs, None);
-            }
-            context.CSSetConstantBuffers(0, Some(&[Some(self.cbuf.clone())]));
-            context.CSSetShaderResources(0, Some(&[Some(srv)]));
-            context.CSSetUnorderedAccessViews(0, 1, Some(&Some(uav.clone()) as *const _), None);
-
-            if use_1d {
-                let groups_x = (width + 255) / 256;
-                context.Dispatch(groups_x, height, 1);
-            } else {
-                let groups_x = (width + 15) / 16;
-                let groups_y = (height + 15) / 16;
-                context.Dispatch(groups_x, groups_y, 1);
-            }
-
-            let no_srv: Option<ID3D11ShaderResourceView> = None;
-            context.CSSetShaderResources(0, Some(&[no_srv]));
-            context.CSSetUnorderedAccessViews(0, 1, Some(&None as *const _), None);
-        }
-
-        Ok(self.output_tex.as_ref().unwrap())
+        let srv = self.pass.get_or_create_srv(device, source)?;
+        self.pass.dispatch(context, srv, width, height);
+        Ok(self.pass.output_tex())
     }
 }

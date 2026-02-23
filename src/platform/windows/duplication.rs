@@ -1386,6 +1386,15 @@ fn should_skip_screenrecord_submit_copy(
     fastpath_enabled && has_pending_submission && (source_is_duplicate || source_unchanged)
 }
 
+#[inline(always)]
+fn should_short_circuit_screenshot_readback(
+    capture_mode: CaptureMode,
+    output_matches_source: bool,
+    frame_pixels_unchanged: bool,
+) -> bool {
+    capture_mode == CaptureMode::Screenshot && output_matches_source && frame_pixels_unchanged
+}
+
 fn convert_cursor_shape_bgra_to_rgba(
     shape_buf: &[u8],
     shape_info: &DXGI_OUTDUPL_POINTER_SHAPE_INFO,
@@ -1638,15 +1647,7 @@ impl OutputCapturer {
 
     fn recreate_duplication(&mut self) -> CaptureResult<()> {
         self.staging_ring.invalidate();
-        self.pending_desc = None;
-        self.pending_hdr = None;
-        self.pending_is_duplicate = false;
-        self.pending_dirty_rects.clear();
-        self.pending_dirty_cpu_copy_preferred = false;
-        self.pending_dirty_total_pixels = 0;
-        self.monitor_low_latency_dirty_gpu_active = false;
-        self.monitor_low_latency_dirty_gpu_primed = false;
-        self.monitor_low_latency_dirty_gpu_desc = None;
+        self.clear_full_frame_pipeline_state();
         self.cached_src_desc = None;
         self.region.invalidate();
         self.dxgi_rect_buffer.clear();
@@ -1663,6 +1664,7 @@ impl OutputCapturer {
     /// Screenshot mode prioritizes low memory footprint over preserving
     /// recording-oriented scratch capacity.
     fn trim_recording_scratch_for_screenshot(&mut self) {
+        self.spare_frame = None;
         self.pending_dirty_rects.clear();
         self.pending_dirty_rects.shrink_to_fit();
         self.dxgi_rect_buffer.clear();
@@ -1685,12 +1687,26 @@ impl OutputCapturer {
         }
     }
 
-    fn set_capture_mode(&mut self, mode: CaptureMode) {
-        if self.capture_mode == mode {
-            return;
+    fn warm_recording_scratch(&mut self) {
+        self.pending_dirty_rects.reserve(DXGI_DIRTY_COPY_MAX_RECTS);
+        self.dxgi_rect_buffer.reserve(DXGI_DIRTY_COPY_MAX_RECTS);
+        self.dxgi_move_rect_buffer
+            .reserve(DXGI_REGION_MOVE_TRACK_MAX_RECTS);
+        self.source_dirty_rects_scratch
+            .reserve(DXGI_DIRTY_COPY_MAX_RECTS);
+        self.source_move_rects_scratch
+            .reserve(DXGI_REGION_MOVE_TRACK_MAX_RECTS);
+        self.region_dirty_rects_scratch
+            .reserve(DXGI_REGION_DIRTY_TRACK_MAX_RECTS);
+        self.region_move_rects_scratch
+            .reserve(DXGI_REGION_MOVE_TRACK_MAX_RECTS);
+        for slot in &mut self.region.slots {
+            slot.dirty_rects.reserve(DXGI_REGION_DIRTY_TRACK_MAX_RECTS);
+            slot.move_rects.reserve(DXGI_REGION_MOVE_TRACK_MAX_RECTS);
         }
-        self.capture_mode = mode;
-        // Drop any in-flight pipeline state when switching modes.
+    }
+
+    fn clear_full_frame_pipeline_state(&mut self) {
         self.pending_desc = None;
         self.pending_hdr = None;
         self.pending_is_duplicate = false;
@@ -1700,6 +1716,15 @@ impl OutputCapturer {
         self.monitor_low_latency_dirty_gpu_active = false;
         self.monitor_low_latency_dirty_gpu_primed = false;
         self.monitor_low_latency_dirty_gpu_desc = None;
+    }
+
+    fn set_capture_mode(&mut self, mode: CaptureMode) {
+        if self.capture_mode == mode {
+            return;
+        }
+        self.capture_mode = mode;
+        // Drop any in-flight pipeline state when switching modes.
+        self.clear_full_frame_pipeline_state();
         if mode == CaptureMode::Screenshot {
             // Screenshot captures use single-shot paths; drop recording buffers.
             self.staging_ring.invalidate();
@@ -1709,6 +1734,7 @@ impl OutputCapturer {
             // Recording mode keeps runtime state warm for sustained throughput.
             self.staging_ring.reset_pipeline();
             self.region.reset();
+            self.warm_recording_scratch();
         }
     }
 
@@ -2384,7 +2410,8 @@ impl OutputCapturer {
         let mut normalized_dirty_rects = std::mem::take(&mut self.source_dirty_rects_scratch);
         normalized_dirty_rects.clear();
         let mut current_dirty_strategy = DirtyCopyStrategy::default();
-        if !single_shot_screenshot
+        if self.capture_mode == CaptureMode::ScreenRecording
+            && !single_shot_screenshot
             && !frame_pixels_unchanged
             && !frame.metadata.dirty_rects.is_empty()
             && frame.metadata.dirty_rects.len() <= DXGI_DIRTY_COPY_MAX_RECTS
@@ -2403,6 +2430,16 @@ impl OutputCapturer {
         }
 
         let convert_result = (|| -> CaptureResult<()> {
+            if should_short_circuit_screenshot_readback(
+                self.capture_mode,
+                output_matches_source,
+                frame_pixels_unchanged,
+            ) {
+                self.clear_full_frame_pipeline_state();
+                frame.metadata.is_duplicate = true;
+                return Ok(());
+            }
+
             if self.capture_mode == CaptureMode::ScreenRecording {
                 let use_monitor_low_latency_dirty_gpu =
                     should_use_monitor_low_latency_dirty_gpu_mode(
@@ -2588,7 +2625,6 @@ impl OutputCapturer {
                 self.monitor_low_latency_dirty_gpu_active = false;
                 self.monitor_low_latency_dirty_gpu_primed = false;
                 self.monitor_low_latency_dirty_gpu_desc = None;
-                self.staging_ring.reset_pipeline();
                 self.staging_ring.copy_and_read(
                     &self.context,
                     &effective_source,
@@ -3061,6 +3097,34 @@ mod tests {
     fn skip_submit_copy_triggers_for_empty_dirty_updates() {
         assert!(should_skip_screenrecord_submit_copy(
             true, true, false, true
+        ));
+    }
+
+    #[test]
+    fn screenshot_readback_short_circuit_requires_screenshot_mode() {
+        assert!(!should_short_circuit_screenshot_readback(
+            CaptureMode::ScreenRecording,
+            true,
+            true
+        ));
+        assert!(!should_short_circuit_screenshot_readback(
+            CaptureMode::Screenshot,
+            false,
+            true
+        ));
+        assert!(!should_short_circuit_screenshot_readback(
+            CaptureMode::Screenshot,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn screenshot_readback_short_circuit_triggers_for_unchanged_output() {
+        assert!(should_short_circuit_screenshot_readback(
+            CaptureMode::Screenshot,
+            true,
+            true
         ));
     }
 

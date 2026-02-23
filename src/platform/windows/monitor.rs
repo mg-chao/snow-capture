@@ -24,6 +24,7 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint};
 use windows::core::Interface;
 
+use crate::convert::HdrToSdrParams;
 use crate::error::{CaptureError, CaptureResult};
 use crate::monitor::{MonitorId, MonitorKey};
 
@@ -386,4 +387,22 @@ pub(crate) fn enumerate_resolved() -> CaptureResult<Vec<ResolvedMonitor>> {
     }
 
     Ok(monitors)
+}
+pub(crate) fn hdr_to_sdr_params(hdr: HdrMonitorMetadata) -> Option<HdrToSdrParams> {
+    if !hdr.advanced_color_enabled {
+        return None;
+    }
+
+    if !hdr.hdr_enabled {
+        return None;
+    }
+
+    let sdr_white_level_nits = hdr.sdr_white_level_nits.unwrap_or(80.0);
+    let hdr_paper_white_nits = hdr.hdr_paper_white_nits.unwrap_or(80.0);
+
+    Some(HdrToSdrParams {
+        hdr_paper_white_nits,
+        hdr_maximum_nits: hdr.hdr_maximum_nits.unwrap_or(1000.0),
+        sdr_white_level_nits,
+    })
 }

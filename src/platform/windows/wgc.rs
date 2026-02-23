@@ -38,7 +38,7 @@ use super::dirty_rect::{
     self, DirtyCopyStrategy, DirtyCopyThresholds, DirtyRectDenseMergeThresholds,
 };
 use super::gpu_tonemap::{GpuF16Converter, GpuTonemapper};
-use super::monitor::{HdrMonitorMetadata, MonitorResolver};
+use super::monitor::{HdrMonitorMetadata, MonitorResolver, hdr_to_sdr_params};
 use super::surface::{self, StagingSampleDesc};
 
 const WGC_FRAME_TIMEOUT: Duration = Duration::from_millis(250);
@@ -166,25 +166,6 @@ fn duration_saturating_add_clamped(base: Duration, delta: Duration, max: Duratio
 #[inline(always)]
 fn duration_saturating_sub_clamped(base: Duration, delta: Duration, min: Duration) -> Duration {
     base.saturating_sub(delta).max(min)
-}
-
-fn hdr_to_sdr_params(hdr: HdrMonitorMetadata) -> Option<HdrToSdrParams> {
-    if !hdr.advanced_color_enabled {
-        return None;
-    }
-
-    if !hdr.hdr_enabled {
-        return None;
-    }
-
-    let sdr_white_level_nits = hdr.sdr_white_level_nits.unwrap_or(80.0);
-    let hdr_paper_white_nits = hdr.hdr_paper_white_nits.unwrap_or(80.0);
-
-    Some(HdrToSdrParams {
-        hdr_paper_white_nits,
-        hdr_maximum_nits: hdr.hdr_maximum_nits.unwrap_or(1000.0),
-        sdr_white_level_nits,
-    })
 }
 
 fn clamp_dirty_rect(rect: DirtyRect, width: u32, height: u32) -> Option<DirtyRect> {

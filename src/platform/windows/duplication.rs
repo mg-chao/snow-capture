@@ -30,6 +30,7 @@ use super::dirty_rect::{
 };
 use super::gpu_tonemap::{GpuF16Converter, GpuTonemapper};
 use super::monitor::{MonitorResolver, ResolvedMonitor, hdr_to_sdr_params};
+use super::region_pipeline::{RegionPipelineState, RegionSlot};
 use super::surface::{self, StagingSampleDesc};
 
 enum AcquireResult {
@@ -128,6 +129,15 @@ impl RegionStagingSlot {
         self.staging_key = None;
         self.query = None;
         self.reset_runtime_state();
+    }
+}
+
+impl RegionSlot for RegionStagingSlot {
+    fn soft_reset(&mut self) {
+        self.reset_runtime_state();
+    }
+    fn hard_reset(&mut self) {
+        self.invalidate();
     }
 }
 
@@ -1533,11 +1543,7 @@ struct OutputCapturer {
     spare_frame: Option<Frame>,
     /// Dedicated staging ring for sub-rect readback (window/region capture).
     /// Keeps window/region capture fully pipelined in screen-recording mode.
-    region_slots: [RegionStagingSlot; DXGI_REGION_STAGING_SLOTS],
-    region_pending_slot: Option<usize>,
-    region_next_write_slot: usize,
-    region_adaptive_spin_polls: u32,
-    region_blit: Option<CaptureBlitRegion>,
+    region: RegionPipelineState<RegionStagingSlot, DXGI_REGION_STAGING_SLOTS>,
     /// Scratch buffers reused for dirty-rect extraction to avoid per-frame allocations.
     dxgi_rect_buffer: Vec<RECT>,
     dxgi_move_rect_buffer: Vec<DXGI_OUTDUPL_MOVE_RECT>,
@@ -1592,11 +1598,7 @@ impl OutputCapturer {
             monitor_low_latency_dirty_gpu_desc: None,
             cached_src_desc: None,
             spare_frame: None,
-            region_slots: std::array::from_fn(|_| RegionStagingSlot::default()),
-            region_pending_slot: None,
-            region_next_write_slot: 0,
-            region_adaptive_spin_polls: StagingRing::INITIAL_SPIN_POLLS,
-            region_blit: None,
+            region: RegionPipelineState::new(),
             dxgi_rect_buffer: Vec::new(),
             dxgi_move_rect_buffer: Vec::new(),
             source_dirty_rects_scratch: Vec::new(),
@@ -1626,7 +1628,7 @@ impl OutputCapturer {
         self.monitor_low_latency_dirty_gpu_primed = false;
         self.monitor_low_latency_dirty_gpu_desc = None;
         self.cached_src_desc = None;
-        self.invalidate_region_pipeline();
+        self.region.invalidate();
         self.dxgi_rect_buffer.clear();
         self.dxgi_move_rect_buffer.clear();
         self.source_dirty_rects_scratch.clear();
@@ -1654,7 +1656,7 @@ impl OutputCapturer {
         self.monitor_low_latency_dirty_gpu_primed = false;
         self.monitor_low_latency_dirty_gpu_desc = None;
         self.staging_ring.reset_pipeline();
-        self.reset_region_pipeline();
+        self.region.reset();
     }
 
     fn effective_source(
@@ -1694,40 +1696,12 @@ impl OutputCapturer {
         Ok((desktop_texture.clone(), src_desc, self.hdr_to_sdr))
     }
 
-    fn reset_region_pipeline(&mut self) {
-        self.region_pending_slot = None;
-        self.region_next_write_slot = 0;
-        self.region_adaptive_spin_polls = StagingRing::INITIAL_SPIN_POLLS;
-        self.region_blit = None;
-        for slot in &mut self.region_slots {
-            slot.reset_runtime_state();
-        }
-    }
-
-    fn invalidate_region_pipeline(&mut self) {
-        self.region_pending_slot = None;
-        self.region_next_write_slot = 0;
-        self.region_adaptive_spin_polls = StagingRing::INITIAL_SPIN_POLLS;
-        self.region_blit = None;
-        for slot in &mut self.region_slots {
-            slot.invalidate();
-        }
-    }
-
-    fn ensure_region_pipeline_for_blit(&mut self, blit: CaptureBlitRegion) {
-        if self.region_blit == Some(blit) {
-            return;
-        }
-        self.reset_region_pipeline();
-        self.region_blit = Some(blit);
-    }
-
     fn ensure_region_slot(
         &mut self,
         slot_idx: usize,
         region_desc: &D3D11_TEXTURE2D_DESC,
     ) -> CaptureResult<()> {
-        let slot = &mut self.region_slots[slot_idx];
+        let slot = &mut self.region.slots[slot_idx];
         let key = (region_desc.Width, region_desc.Height, region_desc.Format);
         let slot_ready = slot.staging_key == Some(key)
             && slot.staging.is_some()
@@ -1779,7 +1753,7 @@ impl OutputCapturer {
 
     fn region_slot_query_completed(&self, slot_idx: usize) -> bool {
         const DO_NOT_FLUSH: u32 = 0x1;
-        let Some(query) = self.region_slots[slot_idx].query.as_ref() else {
+        let Some(query) = self.region.slots[slot_idx].query.as_ref() else {
             return false;
         };
         self.query_signaled(query, DO_NOT_FLUSH)
@@ -1795,12 +1769,12 @@ impl OutputCapturer {
 
     fn wait_for_region_slot_copy(&mut self, slot_idx: usize) {
         const DO_NOT_FLUSH: u32 = 0x1;
-        let Some(query) = self.region_slots[slot_idx].query.as_ref() else {
+        let Some(query) = self.region.slots[slot_idx].query.as_ref() else {
             return;
         };
 
         let mut completed_in_spin = false;
-        for _ in 0..self.region_adaptive_spin_polls {
+        for _ in 0..self.region.adaptive_spin_polls {
             if self.query_signaled(query, DO_NOT_FLUSH) {
                 completed_in_spin = true;
                 break;
@@ -1809,13 +1783,13 @@ impl OutputCapturer {
         }
 
         if completed_in_spin {
-            self.region_adaptive_spin_polls = self
-                .region_adaptive_spin_polls
+            self.region.adaptive_spin_polls = self
+                .region.adaptive_spin_polls
                 .saturating_sub(1)
                 .max(StagingRing::MIN_SPIN_POLLS);
         } else {
-            self.region_adaptive_spin_polls = self
-                .region_adaptive_spin_polls
+            self.region.adaptive_spin_polls = self
+                .region.adaptive_spin_polls
                 .saturating_add(StagingRing::SPIN_INCREASE_STEP)
                 .min(StagingRing::MAX_SPIN_POLLS);
         }
@@ -1828,7 +1802,7 @@ impl OutputCapturer {
         blit: CaptureBlitRegion,
         can_use_dirty_gpu_copy: bool,
     ) -> CaptureResult<()> {
-        let slot = &self.region_slots[slot_idx];
+        let slot = &self.region.slots[slot_idx];
         let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
             CaptureError::Platform(anyhow::anyhow!(
                 "DXGI region slot missing staging resource after initialization"
@@ -1930,11 +1904,11 @@ impl OutputCapturer {
         destination_has_history: bool,
         blit: CaptureBlitRegion,
     ) -> CaptureResult<CaptureSampleMetadata> {
-        if !self.region_slots[slot_idx].populated {
+        if !self.region.slots[slot_idx].populated {
             return Err(CaptureError::Timeout);
         }
 
-        let slot = &self.region_slots[slot_idx];
+        let slot = &self.region.slots[slot_idx];
         let source_desc = slot.source_desc.ok_or_else(|| {
             CaptureError::Platform(anyhow::anyhow!(
                 "DXGI region slot is populated but missing source descriptor"
@@ -1951,7 +1925,7 @@ impl OutputCapturer {
         };
 
         let moves_only = {
-            let slot = &self.region_slots[slot_idx];
+            let slot = &self.region.slots[slot_idx];
             let has_moves =
                 destination_has_history && slot.move_mode_available && !slot.move_rects.is_empty();
             if has_moves {
@@ -1969,7 +1943,7 @@ impl OutputCapturer {
 
         self.wait_for_region_slot_copy(slot_idx);
 
-        let slot = &self.region_slots[slot_idx];
+        let slot = &self.region.slots[slot_idx];
         let staging = slot.staging.as_ref().ok_or_else(|| {
             CaptureError::Platform(anyhow::anyhow!(
                 "DXGI region slot is populated but missing staging texture"
@@ -2101,13 +2075,13 @@ impl OutputCapturer {
         self.staging_ring.reset_pipeline();
 
         let mut destination_has_history = destination_has_history;
-        if self.region_blit != Some(blit) {
+        if self.region.blit != Some(blit) {
             // Callers may reuse a frame across different window/region targets.
             // Even if dimensions match, the previous pixels are stale when the
             // source blit changes or the region pipeline was reset.
             destination_has_history = false;
         }
-        self.ensure_region_pipeline_for_blit(blit);
+        self.region.ensure_blit(blit);
 
         let capture_time = Instant::now();
         let single_shot_screenshot =
@@ -2118,7 +2092,7 @@ impl OutputCapturer {
                 AcquireResult::AccessLost => {
                     self.recreate_duplication()?;
                     destination_has_history = false;
-                    self.ensure_region_pipeline_for_blit(blit);
+                    self.region.ensure_blit(blit);
                     match acquire_frame(&self.duplication, self.needs_presented_first_frame)? {
                         AcquireResult::Ok(texture, info) => (texture, info),
                         AcquireResult::AccessLost => return Err(CaptureError::AccessLost),
@@ -2167,7 +2141,7 @@ impl OutputCapturer {
                 let write_slot = 0usize;
                 self.ensure_region_slot(write_slot, &region_desc)?;
                 {
-                    let slot = &mut self.region_slots[write_slot];
+                    let slot = &mut self.region.slots[write_slot];
                     slot.capture_time = Some(capture_time);
                     slot.present_time_qpc = source_present_time_qpc;
                     slot.is_duplicate = source_is_duplicate;
@@ -2187,8 +2161,8 @@ impl OutputCapturer {
                 self.maybe_flush_region_after_submit(write_slot, write_slot);
                 let sample =
                     self.read_region_slot_into_output(write_slot, destination, false, blit)?;
-                self.region_pending_slot = None;
-                self.region_next_write_slot = 0;
+                self.region.pending_slot = None;
+                self.region.next_write_slot = 0;
                 return Ok(sample);
             }
 
@@ -2287,27 +2261,27 @@ impl OutputCapturer {
                 low_latency_dirty_gpu_preferred,
             );
             let write_slot = if low_latency_recording {
-                self.region_pending_slot.unwrap_or(0)
+                self.region.pending_slot.unwrap_or(0)
             } else if recording_mode {
-                self.region_next_write_slot % DXGI_REGION_STAGING_SLOTS
+                self.region.next_write_slot % DXGI_REGION_STAGING_SLOTS
             } else {
                 0
             };
             let read_slot = if low_latency_recording {
                 write_slot
             } else if recording_mode {
-                self.region_pending_slot.unwrap_or(write_slot)
+                self.region.pending_slot.unwrap_or(write_slot)
             } else {
                 write_slot
             };
 
             let skip_submit_copy = recording_mode
-                && self.region_pending_slot.is_some()
+                && self.region.pending_slot.is_some()
                 && (source_is_duplicate || region_unchanged);
 
             let read_slot = if skip_submit_copy {
-                let slot_idx = self.region_pending_slot.unwrap_or(read_slot);
-                let slot = &mut self.region_slots[slot_idx];
+                let slot_idx = self.region.pending_slot.unwrap_or(read_slot);
+                let slot = &mut self.region.slots[slot_idx];
                 slot.capture_time = Some(capture_time);
                 slot.present_time_qpc = source_present_time_qpc;
                 slot.is_duplicate = true;
@@ -2327,7 +2301,7 @@ impl OutputCapturer {
                 let can_use_dirty_gpu_copy = destination_has_history
                     && (self.capture_mode != CaptureMode::ScreenRecording || low_latency_recording);
                 {
-                    let slot = &mut self.region_slots[write_slot];
+                    let slot = &mut self.region.slots[write_slot];
                     slot.capture_time = Some(capture_time);
                     slot.present_time_qpc = source_present_time_qpc;
                     slot.is_duplicate = source_is_duplicate || region_unchanged;
@@ -2370,16 +2344,16 @@ impl OutputCapturer {
 
             if recording_mode {
                 if !skip_submit_copy {
-                    self.region_pending_slot = Some(write_slot);
+                    self.region.pending_slot = Some(write_slot);
                     if low_latency_recording {
-                        self.region_next_write_slot = write_slot;
+                        self.region.next_write_slot = write_slot;
                     } else {
-                        self.region_next_write_slot = (write_slot + 1) % DXGI_REGION_STAGING_SLOTS;
+                        self.region.next_write_slot = (write_slot + 1) % DXGI_REGION_STAGING_SLOTS;
                     }
                 }
             } else {
-                self.region_pending_slot = None;
-                self.region_next_write_slot = 0;
+                self.region.pending_slot = None;
+                self.region.next_write_slot = 0;
             }
 
             Ok(sample)
@@ -2396,7 +2370,7 @@ impl OutputCapturer {
         self.needs_presented_first_frame = false;
 
         if capture_result.is_err() {
-            self.reset_region_pipeline();
+            self.region.reset();
         }
 
         capture_result
@@ -2406,8 +2380,8 @@ impl OutputCapturer {
         // Full-frame capture and region/window capture keep independent
         // pipelines. Reset region state when callers switch back to full
         // monitor capture to avoid consuming stale region slots later.
-        if self.region_blit.is_some() || self.region_pending_slot.is_some() {
-            self.reset_region_pipeline();
+        if self.region.blit.is_some() || self.region.pending_slot.is_some() {
+            self.region.reset();
         }
 
         // Reuse caller-provided frame, or fall back to our internal spare,

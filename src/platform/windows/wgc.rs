@@ -39,6 +39,7 @@ use super::dirty_rect::{
 };
 use super::gpu_tonemap::{GpuF16Converter, GpuTonemapper};
 use super::monitor::{HdrMonitorMetadata, MonitorResolver, hdr_to_sdr_params};
+use super::region_pipeline::{RegionPipelineState, RegionSlot};
 use super::surface::{self, StagingSampleDesc};
 
 const WGC_FRAME_TIMEOUT: Duration = Duration::from_millis(250);
@@ -723,6 +724,16 @@ impl WgcStagingSlot {
     }
 }
 
+impl RegionSlot for WgcStagingSlot {
+    fn soft_reset(&mut self) {
+        self.invalidate();
+    }
+    fn hard_reset(&mut self) {
+        self.invalidate();
+    }
+}
+
+
 /// WGC FrameArrived stores the system-relative time alongside the frame.
 #[derive(Default)]
 struct FrameState {
@@ -820,9 +831,7 @@ struct WindowsGraphicsCaptureCapturer {
     /// Most recent submitted slot. In recording mode this is read on the
     /// following capture call so GPU copy and CPU conversion overlap.
     pending_slot: Option<usize>,
-    region_slots: [WgcStagingSlot; WGC_STAGING_SLOTS],
-    region_next_write_slot: usize,
-    region_pending_slot: Option<usize>,
+    region: RegionPipelineState<WgcStagingSlot, WGC_STAGING_SLOTS>,
     cached_src_desc: Option<D3D11_TEXTURE2D_DESC>,
     /// Last system-relative time, used for duplicate detection.
     last_present_time: i64,
@@ -832,7 +841,6 @@ struct WindowsGraphicsCaptureCapturer {
     stale_timeout_config: WgcStaleTimeoutConfig,
     stale_frame_timeout: Duration,
     adaptive_spin_polls: u32,
-    region_adaptive_spin_polls: u32,
     capture_mode: CaptureMode,
     /// HDR-to-SDR tonemap parameters, `Some` when the monitor has HDR enabled.
     hdr_to_sdr: Option<HdrToSdrParams>,
@@ -840,7 +848,6 @@ struct WindowsGraphicsCaptureCapturer {
     gpu_tonemapper: Option<GpuTonemapper>,
     /// GPU F16->sRGB converter for when source is F16 but no HDR tonemap needed.
     gpu_f16_converter: Option<GpuF16Converter>,
-    region_blit: Option<CaptureBlitRegion>,
     cursor_config: CursorCaptureConfig,
     has_frame_history: bool,
     source_dirty_rects_scratch: Vec<DirtyRect>,
@@ -992,9 +999,7 @@ impl WindowsGraphicsCaptureCapturer {
             staging_slots: std::array::from_fn(|_| WgcStagingSlot::default()),
             next_write_slot: 0,
             pending_slot: None,
-            region_slots: std::array::from_fn(|_| WgcStagingSlot::default()),
-            region_next_write_slot: 0,
-            region_pending_slot: None,
+            region: RegionPipelineState::new(),
             cached_src_desc: None,
             last_present_time: 0,
             last_emitted_present_time: 0,
@@ -1002,12 +1007,10 @@ impl WindowsGraphicsCaptureCapturer {
             stale_timeout_config,
             stale_frame_timeout: stale_timeout_config.initial,
             adaptive_spin_polls: WGC_QUERY_SPIN_INITIAL_POLLS,
-            region_adaptive_spin_polls: WGC_QUERY_SPIN_INITIAL_POLLS,
             capture_mode: CaptureMode::Screenshot,
             hdr_to_sdr,
             gpu_tonemapper,
             gpu_f16_converter,
-            region_blit: None,
             cursor_config,
             has_frame_history: false,
             source_dirty_rects_scratch: Vec::new(),
@@ -1151,7 +1154,7 @@ impl WindowsGraphicsCaptureCapturer {
     ) -> CaptureResult<Option<(Direct3D11CaptureFrame, i64)>> {
         if allow_stale_return {
             // Mirror the full-frame low-latency path for region capture.
-            if self.region_pending_slot.is_some() {
+            if self.region.pending_slot.is_some() {
                 if let Some(fresh) = self.try_take_latest_frame()? {
                     self.relax_stale_timeout();
                     return Ok(Some(fresh));
@@ -1247,32 +1250,14 @@ impl WindowsGraphicsCaptureCapturer {
         }
         self.pending_slot = None;
         self.next_write_slot = 0;
-        self.reset_region_pipeline();
+        self.region.reset();
         self.has_frame_history = false;
         self.last_emitted_present_time = 0;
         self.stale_poll_spins = WGC_STALE_POLL_SPIN_INITIAL;
         self.stale_frame_timeout = self.stale_timeout_config.initial;
         self.adaptive_spin_polls = WGC_QUERY_SPIN_INITIAL_POLLS;
         self.source_dirty_rects_scratch.clear();
-    }
-
-    fn reset_region_pipeline(&mut self) {
-        for slot in &mut self.region_slots {
-            slot.invalidate();
-        }
-        self.region_pending_slot = None;
-        self.region_next_write_slot = 0;
-        self.region_adaptive_spin_polls = WGC_QUERY_SPIN_INITIAL_POLLS;
-        self.region_blit = None;
         self.region_dirty_rects_scratch.clear();
-    }
-
-    fn ensure_region_pipeline_for_blit(&mut self, blit: CaptureBlitRegion) {
-        if self.region_blit == Some(blit) {
-            return;
-        }
-        self.reset_region_pipeline();
-        self.region_blit = Some(blit);
     }
 
     fn ensure_staging_slot(
@@ -1327,7 +1312,7 @@ impl WindowsGraphicsCaptureCapturer {
         slot_idx: usize,
         desc: &D3D11_TEXTURE2D_DESC,
     ) -> CaptureResult<()> {
-        let slot = &mut self.region_slots[slot_idx];
+        let slot = &mut self.region.slots[slot_idx];
         let needs_recreate = slot.source_desc.is_none_or(|cached| {
             cached.Width != desc.Width
                 || cached.Height != desc.Height
@@ -1378,7 +1363,7 @@ impl WindowsGraphicsCaptureCapturer {
     ) -> CaptureResult<()> {
         let mut used_dirty_copy = false;
         {
-            let slot = &self.region_slots[slot_idx];
+            let slot = &self.region.slots[slot_idx];
             let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
                 CaptureError::Platform(anyhow::anyhow!(
                     "failed to resolve WGC region staging resource for slot {}",
@@ -1464,7 +1449,7 @@ impl WindowsGraphicsCaptureCapturer {
                 }
             }
         }
-        self.region_slots[slot_idx].populated = true;
+        self.region.slots[slot_idx].populated = true;
         Ok(())
     }
 
@@ -1593,7 +1578,7 @@ impl WindowsGraphicsCaptureCapturer {
 
     fn region_slot_query_completed(&self, slot_idx: usize) -> bool {
         const DO_NOT_FLUSH: u32 = 0x1;
-        let Some(query) = self.region_slots[slot_idx].query.as_ref() else {
+        let Some(query) = self.region.slots[slot_idx].query.as_ref() else {
             return false;
         };
         self.query_signaled(query, DO_NOT_FLUSH)
@@ -1609,12 +1594,12 @@ impl WindowsGraphicsCaptureCapturer {
 
     fn wait_for_region_slot_copy(&mut self, slot_idx: usize) {
         const DO_NOT_FLUSH: u32 = 0x1;
-        let Some(query) = self.region_slots[slot_idx].query.as_ref() else {
+        let Some(query) = self.region.slots[slot_idx].query.as_ref() else {
             return;
         };
 
         let mut completed_in_spin = false;
-        for _ in 0..self.region_adaptive_spin_polls {
+        for _ in 0..self.region.adaptive_spin_polls {
             if self.query_signaled(query, DO_NOT_FLUSH) {
                 completed_in_spin = true;
                 break;
@@ -1623,13 +1608,13 @@ impl WindowsGraphicsCaptureCapturer {
         }
 
         if completed_in_spin {
-            self.region_adaptive_spin_polls = self
-                .region_adaptive_spin_polls
+            self.region.adaptive_spin_polls = self
+                .region.adaptive_spin_polls
                 .saturating_sub(1)
                 .max(WGC_QUERY_SPIN_MIN_POLLS);
         } else {
-            self.region_adaptive_spin_polls = self
-                .region_adaptive_spin_polls
+            self.region.adaptive_spin_polls = self
+                .region.adaptive_spin_polls
                 .saturating_add(WGC_QUERY_SPIN_INCREASE_STEP)
                 .min(WGC_QUERY_SPIN_MAX_POLLS);
         }
@@ -1642,11 +1627,11 @@ impl WindowsGraphicsCaptureCapturer {
         destination_has_history: bool,
         blit: CaptureBlitRegion,
     ) -> CaptureResult<CaptureSampleMetadata> {
-        if !self.region_slots[slot_idx].populated {
+        if !self.region.slots[slot_idx].populated {
             return Err(CaptureError::Timeout);
         }
 
-        let slot = &self.region_slots[slot_idx];
+        let slot = &self.region.slots[slot_idx];
         let source_desc = slot.source_desc.ok_or_else(|| {
             CaptureError::Platform(anyhow::anyhow!(
                 "WGC region slot is populated but missing source descriptor"
@@ -1678,7 +1663,7 @@ impl WindowsGraphicsCaptureCapturer {
         self.wait_for_region_slot_copy(slot_idx);
 
         let map_result = (|| -> CaptureResult<()> {
-            let slot = &self.region_slots[slot_idx];
+            let slot = &self.region.slots[slot_idx];
             let staging = slot.staging.as_ref().ok_or_else(|| {
                 CaptureError::Platform(anyhow::anyhow!(
                     "WGC region slot is populated but missing staging texture"
@@ -1798,10 +1783,10 @@ impl WindowsGraphicsCaptureCapturer {
         capture_time: Instant,
         present_time_ticks: i64,
     ) -> Option<CaptureSampleMetadata> {
-        let Some(slot_idx) = self.region_pending_slot else {
+        let Some(slot_idx) = self.region.pending_slot else {
             return None;
         };
-        if !self.region_slots[slot_idx].populated {
+        if !self.region.slots[slot_idx].populated {
             return None;
         }
 
@@ -2003,7 +1988,7 @@ impl WindowsGraphicsCaptureCapturer {
         // and region capture cannot consume stale pending slots.
         self.pending_slot = None;
         self.next_write_slot = 0;
-        self.ensure_region_pipeline_for_blit(blit);
+        self.region.ensure_blit(blit);
 
         let allow_stale_return =
             self.capture_mode == CaptureMode::ScreenRecording && destination_has_history;
@@ -2014,7 +1999,7 @@ impl WindowsGraphicsCaptureCapturer {
         let maybe_capture = self.acquire_next_frame_or_stale_region(allow_stale_return)?;
         let (capture_frame, time_ticks) = if let Some(capture) = maybe_capture {
             capture
-        } else if let Some(slot_idx) = self.region_pending_slot {
+        } else if let Some(slot_idx) = self.region.pending_slot {
             match self.read_region_slot_into_output(slot_idx, out, destination_has_history, blit) {
                 Ok(mut sample) => {
                     sample.capture_time = Some(capture_time);
@@ -2023,7 +2008,7 @@ impl WindowsGraphicsCaptureCapturer {
                     return Ok(sample);
                 }
                 Err(_) => {
-                    self.reset_region_pipeline();
+                    self.region.reset();
                     self.has_frame_history = false;
                     return Ok(CaptureSampleMetadata {
                         capture_time: Some(capture_time),
@@ -2050,7 +2035,7 @@ impl WindowsGraphicsCaptureCapturer {
             self.capture_mode,
             destination_has_history,
             source_is_duplicate,
-            self.region_pending_slot.is_some(),
+            self.region.pending_slot.is_some(),
         ) {
             if let Some(sample) = self.try_short_circuit_region_duplicate(capture_time, time_ticks)
             {
@@ -2135,7 +2120,7 @@ impl WindowsGraphicsCaptureCapturer {
                 let write_slot = 0usize;
                 self.ensure_region_slot(write_slot, &region_desc)?;
                 {
-                    let slot = &self.region_slots[write_slot];
+                    let slot = &self.region.slots[write_slot];
                     let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
                         CaptureError::Platform(anyhow::anyhow!(
                             "failed to resolve WGC region staging resource for screenshot fast path"
@@ -2173,7 +2158,7 @@ impl WindowsGraphicsCaptureCapturer {
                     self.context.Flush();
                 }
                 {
-                    let slot = &self.region_slots[write_slot];
+                    let slot = &self.region.slots[write_slot];
                     let staging = slot.staging.as_ref().ok_or_else(|| {
                         CaptureError::Platform(anyhow::anyhow!(
                             "failed to resolve WGC region staging texture for screenshot fast path"
@@ -2198,8 +2183,8 @@ impl WindowsGraphicsCaptureCapturer {
                     },
                     is_duplicate: source_is_duplicate,
                 };
-                self.region_pending_slot = None;
-                self.region_next_write_slot = 0;
+                self.region.pending_slot = None;
+                self.region.next_write_slot = 0;
                 return Ok(sample);
             }
             let region_dirty_extraction = if source_is_duplicate {
@@ -2252,24 +2237,24 @@ impl WindowsGraphicsCaptureCapturer {
                 )
             };
             let write_slot = if recording_mode {
-                self.region_next_write_slot % WGC_STAGING_SLOTS
+                self.region.next_write_slot % WGC_STAGING_SLOTS
             } else {
                 0
             };
             let read_slot = if recording_mode {
-                self.region_pending_slot.unwrap_or(write_slot)
+                self.region.pending_slot.unwrap_or(write_slot)
             } else {
                 write_slot
             };
 
             let skip_submit_copy = recording_mode
                 && destination_has_history
-                && self.region_pending_slot.is_some()
+                && self.region.pending_slot.is_some()
                 && (source_is_duplicate || region_unchanged);
 
             let read_slot = if skip_submit_copy {
-                let slot_idx = self.region_pending_slot.unwrap_or(read_slot);
-                let slot = &mut self.region_slots[slot_idx];
+                let slot_idx = self.region.pending_slot.unwrap_or(read_slot);
+                let slot = &mut self.region.slots[slot_idx];
                 slot.capture_time = Some(capture_time);
                 slot.present_time_ticks = time_ticks;
                 slot.is_duplicate = true;
@@ -2283,13 +2268,13 @@ impl WindowsGraphicsCaptureCapturer {
             } else {
                 self.ensure_region_slot(write_slot, &region_desc)?;
                 let can_use_dirty_gpu_copy = destination_has_history && {
-                    let slot = &self.region_slots[write_slot];
+                    let slot = &self.region.slots[write_slot];
                     slot.populated
                         && slot.present_time_ticks != 0
                         && slot.present_time_ticks == previous_present_time
                 };
                 {
-                    let slot = &mut self.region_slots[write_slot];
+                    let slot = &mut self.region.slots[write_slot];
                     slot.capture_time = Some(capture_time);
                     slot.present_time_ticks = time_ticks;
                     slot.is_duplicate = source_is_duplicate || region_unchanged;
@@ -2327,12 +2312,12 @@ impl WindowsGraphicsCaptureCapturer {
 
             if recording_mode {
                 if !skip_submit_copy {
-                    self.region_pending_slot = Some(write_slot);
-                    self.region_next_write_slot = (write_slot + 1) % WGC_STAGING_SLOTS;
+                    self.region.pending_slot = Some(write_slot);
+                    self.region.next_write_slot = (write_slot + 1) % WGC_STAGING_SLOTS;
                 }
             } else {
-                self.region_pending_slot = None;
-                self.region_next_write_slot = 0;
+                self.region.pending_slot = None;
+                self.region.next_write_slot = 0;
             }
 
             Ok(sample)
@@ -2348,7 +2333,7 @@ impl WindowsGraphicsCaptureCapturer {
                 Ok(sample)
             }
             Err(err) => {
-                self.reset_region_pipeline();
+                self.region.reset();
                 self.has_frame_history = false;
                 Err(err)
             }
@@ -2356,9 +2341,9 @@ impl WindowsGraphicsCaptureCapturer {
     }
 
     fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
-        self.region_pending_slot = None;
-        self.region_next_write_slot = 0;
-        self.region_blit = None;
+        self.region.pending_slot = None;
+        self.region.next_write_slot = 0;
+        self.region.blit = None;
 
         let mut out = reuse.unwrap_or_else(Frame::empty);
         let destination_has_history =

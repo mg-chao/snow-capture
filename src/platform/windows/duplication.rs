@@ -55,7 +55,6 @@ const DXGI_DIRTY_GPU_COPY_MAX_AREA_PERCENT: u64 = 45;
 const DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_RECTS: usize = 8;
 const DXGI_DIRTY_GPU_COPY_LOW_LATENCY_MAX_AREA_PERCENT: u64 = 18;
 const DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS_DEFAULT: u64 = 1_048_576;
-const DXGI_REGION_LOW_LATENCY_MAX_PIXELS_DEFAULT: u64 = 1_048_576;
 const DXGI_REGION_STAGING_SLOTS: usize = 3;
 const DXGI_REGION_DIRTY_TRACK_MAX_RECTS: usize = DXGI_DIRTY_COPY_MAX_RECTS + 1;
 const DXGI_REGION_MOVE_TRACK_MAX_RECTS: usize = DXGI_REGION_DIRTY_TRACK_MAX_RECTS;
@@ -204,65 +203,6 @@ impl RegionDirtyBounds {
             region_right,
             region_bottom,
         })
-    }
-}
-
-#[inline(always)]
-fn clip_and_rebase_region_dirty_rect(
-    rect: DirtyRect,
-    bounds: RegionDirtyBounds,
-) -> Option<DirtyRect> {
-    let x = rect.x.min(bounds.source_width);
-    let y = rect.y.min(bounds.source_height);
-    if x >= bounds.source_width || y >= bounds.source_height {
-        return None;
-    }
-
-    let right = x.saturating_add(rect.width).min(bounds.source_width);
-    let bottom = y.saturating_add(rect.height).min(bounds.source_height);
-    if right <= x || bottom <= y {
-        return None;
-    }
-
-    if right <= bounds.region_x
-        || x >= bounds.region_right
-        || bottom <= bounds.region_y
-        || y >= bounds.region_bottom
-    {
-        return None;
-    }
-
-    let clipped_x = x.max(bounds.region_x);
-    let clipped_y = y.max(bounds.region_y);
-    let clipped_right = right.min(bounds.region_right);
-    let clipped_bottom = bottom.min(bounds.region_bottom);
-    if clipped_right <= clipped_x || clipped_bottom <= clipped_y {
-        return None;
-    }
-
-    Some(DirtyRect {
-        x: clipped_x.saturating_sub(bounds.region_x),
-        y: clipped_y.saturating_sub(bounds.region_y),
-        width: clipped_right.saturating_sub(clipped_x),
-        height: clipped_bottom.saturating_sub(clipped_y),
-    })
-}
-
-#[inline(always)]
-fn extract_region_dirty_rects_from_dirty_slice(
-    source_dirty_rects: &[DirtyRect],
-    bounds: RegionDirtyBounds,
-    out: &mut Vec<DirtyRect>,
-) {
-    out.clear();
-    let max_rects = DXGI_REGION_DIRTY_TRACK_MAX_RECTS;
-    for rect in source_dirty_rects {
-        if out.len() == max_rects {
-            break;
-        }
-        if let Some(clipped) = clip_and_rebase_region_dirty_rect(*rect, bounds) {
-            out.push(clipped);
-        }
     }
 }
 
@@ -653,22 +593,6 @@ fn normalize_dirty_rects_reference_in_place(rects: &mut Vec<DirtyRect>, width: u
             .unwrap_or_else(|pos| pos);
         rects.insert(insert_at, candidate);
     }
-}
-
-fn extract_region_dirty_rects(
-    source_dirty_rects: &[DirtyRect],
-    source_width: u32,
-    source_height: u32,
-    blit: CaptureBlitRegion,
-    out: &mut Vec<DirtyRect>,
-) -> bool {
-    let Some(bounds) = RegionDirtyBounds::from_source_and_blit(source_width, source_height, blit)
-    else {
-        out.clear();
-        return false;
-    };
-    extract_region_dirty_rects_from_dirty_slice(source_dirty_rects, bounds, out);
-    true
 }
 
 fn extract_region_dirty_rects_direct(
@@ -1515,26 +1439,6 @@ fn should_use_window_low_latency_region_path(
         blit,
         low_latency_dirty_gpu_preferred,
     )
-}
-
-#[inline(always)]
-fn choose_monitor_region_low_latency_mode(
-    capture_mode: CaptureMode,
-    low_latency_enabled: bool,
-    force_low_latency: bool,
-    max_low_latency_pixels: u64,
-    blit: CaptureBlitRegion,
-) -> bool {
-    if capture_mode != CaptureMode::ScreenRecording || !low_latency_enabled {
-        return false;
-    }
-
-    if force_low_latency {
-        return true;
-    }
-
-    let region_pixels = u64::from(blit.width).saturating_mul(u64::from(blit.height));
-    region_pixels > 0 && region_pixels <= max_low_latency_pixels
 }
 
 #[inline(always)]
@@ -3586,57 +3490,6 @@ mod tests {
     }
 
     #[test]
-    fn monitor_low_latency_mode_prefers_small_regions() {
-        assert!(choose_monitor_region_low_latency_mode(
-            CaptureMode::ScreenRecording,
-            true,
-            false,
-            1_048_576,
-            test_blit(1280, 720),
-        ));
-    }
-
-    #[test]
-    fn monitor_low_latency_mode_requires_recording_and_enablement() {
-        assert!(!choose_monitor_region_low_latency_mode(
-            CaptureMode::Screenshot,
-            true,
-            true,
-            DXGI_REGION_LOW_LATENCY_MAX_PIXELS_DEFAULT,
-            test_blit(1280, 720),
-        ));
-        assert!(!choose_monitor_region_low_latency_mode(
-            CaptureMode::ScreenRecording,
-            false,
-            true,
-            DXGI_REGION_LOW_LATENCY_MAX_PIXELS_DEFAULT,
-            test_blit(1280, 720),
-        ));
-    }
-
-    #[test]
-    fn monitor_low_latency_mode_rejects_zero_sized_regions_without_force() {
-        assert!(!choose_monitor_region_low_latency_mode(
-            CaptureMode::ScreenRecording,
-            true,
-            false,
-            DXGI_REGION_LOW_LATENCY_MAX_PIXELS_DEFAULT,
-            test_blit(0, 720),
-        ));
-    }
-
-    #[test]
-    fn monitor_low_latency_mode_force_flag_overrides_thresholds() {
-        assert!(choose_monitor_region_low_latency_mode(
-            CaptureMode::ScreenRecording,
-            true,
-            true,
-            1,
-            test_blit(3840, 2160),
-        ));
-    }
-
-    #[test]
     fn normalize_dirty_rects_merges_touching_spans() {
         let mut rects = vec![
             DirtyRect {
@@ -3906,130 +3759,6 @@ mod tests {
                 0x60, 0x50, 0x40, 0xBB, 0, 0, 0, 0
             ]
         );
-    }
-
-    #[test]
-    fn region_dirty_rects_intersect_and_rebase() {
-        let source = vec![
-            DirtyRect {
-                x: 10,
-                y: 10,
-                width: 30,
-                height: 20,
-            },
-            DirtyRect {
-                x: 60,
-                y: 40,
-                width: 20,
-                height: 20,
-            },
-        ];
-        let blit = CaptureBlitRegion {
-            src_x: 20,
-            src_y: 15,
-            width: 50,
-            height: 40,
-            dst_x: 0,
-            dst_y: 0,
-        };
-        let mut out = Vec::new();
-        assert!(extract_region_dirty_rects(
-            &source, 1920, 1080, blit, &mut out
-        ));
-        assert_eq!(
-            out,
-            vec![
-                DirtyRect {
-                    x: 0,
-                    y: 0,
-                    width: 20,
-                    height: 15,
-                },
-                DirtyRect {
-                    x: 40,
-                    y: 25,
-                    width: 10,
-                    height: 15,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn region_dirty_rects_detect_unchanged_region() {
-        let source = vec![DirtyRect {
-            x: 0,
-            y: 0,
-            width: 10,
-            height: 10,
-        }];
-        let blit = CaptureBlitRegion {
-            src_x: 100,
-            src_y: 100,
-            width: 80,
-            height: 60,
-            dst_x: 0,
-            dst_y: 0,
-        };
-        let mut out = Vec::new();
-        assert!(extract_region_dirty_rects(
-            &source, 1920, 1080, blit, &mut out
-        ));
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn region_dirty_rects_reject_invalid_blit() {
-        let source = vec![DirtyRect {
-            x: 100,
-            y: 100,
-            width: 30,
-            height: 30,
-        }];
-        let blit = CaptureBlitRegion {
-            src_x: 3000,
-            src_y: 2000,
-            width: 40,
-            height: 40,
-            dst_x: 0,
-            dst_y: 0,
-        };
-        let mut out = vec![DirtyRect {
-            x: 1,
-            y: 1,
-            width: 1,
-            height: 1,
-        }];
-        assert!(!extract_region_dirty_rects(
-            &source, 1920, 1080, blit, &mut out
-        ));
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn region_dirty_rects_cap_tracked_output() {
-        let source = vec![
-            DirtyRect {
-                x: 0,
-                y: 0,
-                width: 4,
-                height: 4,
-            };
-            DXGI_REGION_DIRTY_TRACK_MAX_RECTS + 32
-        ];
-        let blit = CaptureBlitRegion {
-            src_x: 0,
-            src_y: 0,
-            width: 1920,
-            height: 1080,
-            dst_x: 0,
-            dst_y: 0,
-        };
-        let mut out = Vec::new();
-        assert!(extract_region_dirty_rects(
-            &source, 1920, 1080, blit, &mut out
-        ));
-        assert_eq!(out.len(), DXGI_REGION_DIRTY_TRACK_MAX_RECTS);
     }
 
     #[test]

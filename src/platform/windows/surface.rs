@@ -189,43 +189,6 @@ fn work_items_non_overlapping(work_items: &[DirtyRectWorkItem]) -> bool {
     true
 }
 
-#[inline(always)]
-fn dirty_rects_overlap(a: DirtyRect, b: DirtyRect) -> bool {
-    if a.width == 0 || a.height == 0 || b.width == 0 || b.height == 0 {
-        return false;
-    }
-
-    let Some(a_right) = a.x.checked_add(a.width) else {
-        return true;
-    };
-    let Some(a_bottom) = a.y.checked_add(a.height) else {
-        return true;
-    };
-    let Some(b_right) = b.x.checked_add(b.width) else {
-        return true;
-    };
-    let Some(b_bottom) = b.y.checked_add(b.height) else {
-        return true;
-    };
-
-    a.x < b_right && b.x < a_right && a.y < b_bottom && b.y < a_bottom
-}
-
-fn dirty_rects_non_overlapping_checked(dirty_rects: &[DirtyRect]) -> bool {
-    if dirty_rects.len() <= 1 {
-        return true;
-    }
-
-    for i in 0..dirty_rects.len() {
-        for j in (i + 1)..dirty_rects.len() {
-            if dirty_rects_overlap(dirty_rects[i], dirty_rects[j]) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 fn map_spin_poll_count() -> usize {
     D3D11_MAP_SPIN_POLLS_DEFAULT.clamp(D3D11_MAP_SPIN_POLLS_MIN, D3D11_MAP_SPIN_POLLS_MAX)
 }
@@ -1205,50 +1168,6 @@ mod tests {
     fn work_items_non_overlapping_accepts_disjoint_list() {
         let work_items = vec![item(0, 0, 16, 16), item(20, 0, 12, 16), item(0, 20, 8, 8)];
         assert!(work_items_non_overlapping(&work_items));
-    }
-
-    #[test]
-    fn dirty_rects_non_overlapping_checked_detects_overlap() {
-        let dirty_rects = vec![
-            DirtyRect {
-                x: 4,
-                y: 8,
-                width: 16,
-                height: 12,
-            },
-            DirtyRect {
-                x: 12,
-                y: 10,
-                width: 8,
-                height: 8,
-            },
-        ];
-        assert!(!dirty_rects_non_overlapping_checked(&dirty_rects));
-    }
-
-    #[test]
-    fn dirty_rects_non_overlapping_checked_ignores_zero_sized_rects() {
-        let dirty_rects = vec![
-            DirtyRect {
-                x: 2,
-                y: 2,
-                width: 24,
-                height: 8,
-            },
-            DirtyRect {
-                x: 10,
-                y: 4,
-                width: 0,
-                height: 8,
-            },
-            DirtyRect {
-                x: 30,
-                y: 2,
-                width: 12,
-                height: 8,
-            },
-        ];
-        assert!(dirty_rects_non_overlapping_checked(&dirty_rects));
     }
 
     #[test]

@@ -168,9 +168,7 @@ fn duration_saturating_sub_clamped(base: Duration, delta: Duration, min: Duratio
     base.saturating_sub(delta).max(min)
 }
 
-fn clamp_dirty_rect(rect: DirtyRect, width: u32, height: u32) -> Option<DirtyRect> {
-    dirty_rect::clamp_dirty_rect(rect, width, height)
-}
+
 
 fn dirty_region_mode_supported(mode: GraphicsCaptureDirtyRegionMode) -> bool {
     mode == GraphicsCaptureDirtyRegionMode::ReportOnly
@@ -516,7 +514,7 @@ fn normalize_dirty_rects_reference_in_place(rects: &mut Vec<DirtyRect>, width: u
     let mut pending = std::mem::take(rects);
     let mut write = 0usize;
     for read in 0..pending.len() {
-        if let Some(clamped) = clamp_dirty_rect(pending[read], width, height) {
+        if let Some(clamped) = dirty_rect::clamp_dirty_rect(pending[read], width, height) {
             pending[write] = clamped;
             write += 1;
         }
@@ -588,7 +586,7 @@ fn extract_region_dirty_rects(
     out: &mut Vec<DirtyRect>,
 ) -> RegionDirtyRectExtraction {
     out.clear();
-    let Some(region_bounds) = clamp_dirty_rect(
+    let Some(region_bounds) = dirty_rect::clamp_dirty_rect(
         DirtyRect {
             x: blit.src_x,
             y: blit.src_y,
@@ -3397,7 +3395,7 @@ mod tests {
         let y = raw.Y.max(0) as u32;
         let rect_width = raw.Width as u32;
         let rect_height = raw.Height as u32;
-        clamp_dirty_rect(
+        dirty_rect::clamp_dirty_rect(
             DirtyRect {
                 x,
                 y,
@@ -3452,7 +3450,7 @@ mod tests {
         out: &mut Vec<DirtyRect>,
     ) -> RegionDirtyRectExtraction {
         out.clear();
-        let Some(region_bounds) = clamp_dirty_rect(
+        let Some(region_bounds) = dirty_rect::clamp_dirty_rect(
             DirtyRect {
                 x: blit.src_x,
                 y: blit.src_y,
@@ -3499,7 +3497,7 @@ mod tests {
         out: &mut Vec<DirtyRect>,
     ) -> RegionDirtyRectExtraction {
         out.clear();
-        let Some(region_bounds) = clamp_dirty_rect(
+        let Some(region_bounds) = dirty_rect::clamp_dirty_rect(
             DirtyRect {
                 x: blit.src_x,
                 y: blit.src_y,

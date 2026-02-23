@@ -151,9 +151,7 @@ impl RegionStagingSlot {
     }
 }
 
-fn clamp_dirty_rect(rect: DirtyRect, width: u32, height: u32) -> Option<DirtyRect> {
-    dirty_rect::clamp_dirty_rect(rect, width, height)
-}
+
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct MoveRect {
@@ -182,7 +180,7 @@ impl RegionDirtyBounds {
         source_height: u32,
         blit: CaptureBlitRegion,
     ) -> Option<Self> {
-        let region = clamp_dirty_rect(
+        let region = dirty_rect::clamp_dirty_rect(
             DirtyRect {
                 x: blit.src_x,
                 y: blit.src_y,
@@ -532,7 +530,7 @@ fn normalize_dirty_rects_reference_in_place(rects: &mut Vec<DirtyRect>, width: u
     let mut pending = std::mem::take(rects);
     let mut write = 0usize;
     for read in 0..pending.len() {
-        if let Some(clamped) = clamp_dirty_rect(pending[read], width, height) {
+        if let Some(clamped) = dirty_rect::clamp_dirty_rect(pending[read], width, height) {
             pending[write] = clamped;
             write += 1;
         }
@@ -4189,7 +4187,7 @@ mod tests {
     ) -> bool {
         out.clear();
 
-        let Some(region_bounds) = clamp_dirty_rect(
+        let Some(region_bounds) = dirty_rect::clamp_dirty_rect(
             DirtyRect {
                 x: blit.src_x,
                 y: blit.src_y,
@@ -4221,7 +4219,7 @@ mod tests {
                 width,
                 height,
             };
-            let Some(clamped) = clamp_dirty_rect(dirty, source_width, source_height) else {
+            let Some(clamped) = dirty_rect::clamp_dirty_rect(dirty, source_width, source_height) else {
                 continue;
             };
 

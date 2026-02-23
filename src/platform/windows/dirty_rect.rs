@@ -407,3 +407,81 @@ pub(crate) fn evaluate_dirty_copy_strategy(
         dirty_pixels,
     }
 }
+
+#[cfg(test)]
+pub(crate) fn normalize_dirty_rects_reference_in_place(
+    rects: &mut Vec<DirtyRect>,
+    width: u32,
+    height: u32,
+    dense_thresholds: DirtyRectDenseMergeThresholds,
+) {
+    if rects.is_empty() {
+        return;
+    }
+
+    let mut pending = std::mem::take(rects);
+    let mut write = 0usize;
+    for read in 0..pending.len() {
+        if let Some(clamped) = clamp_dirty_rect(pending[read], width, height) {
+            pending[write] = clamped;
+            write += 1;
+        }
+    }
+    pending.truncate(write);
+    if pending.len() <= 1 {
+        *rects = pending;
+        return;
+    }
+
+    if should_use_legacy_dense_merge(&pending, dense_thresholds) {
+        *rects = pending;
+        normalize_dirty_rects_legacy_after_clamp(rects);
+        return;
+    }
+
+    pending.sort_unstable_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
+
+    rects.reserve(pending.len());
+    for rect in pending {
+        let mut candidate = rect;
+        loop {
+            let mut merged_any = false;
+            let candidate_bottom = candidate.y.saturating_add(candidate.height);
+            let mut idx = 0usize;
+            while idx < rects.len() {
+                let existing = rects[idx];
+                let existing_bottom = existing.y.saturating_add(existing.height);
+                if existing_bottom < candidate.y {
+                    idx += 1;
+                    continue;
+                }
+                if existing.y > candidate_bottom {
+                    break;
+                }
+
+                if dirty_rects_can_merge(candidate, existing) {
+                    candidate = merge_dirty_rects(candidate, existing);
+                    rects.remove(idx);
+                    merged_any = true;
+                } else {
+                    idx += 1;
+                }
+            }
+
+            if !merged_any {
+                break;
+            }
+        }
+
+        let insert_at = rects
+            .binary_search_by(|probe| {
+                probe
+                    .y
+                    .cmp(&candidate.y)
+                    .then_with(|| probe.x.cmp(&candidate.x))
+            })
+            .unwrap_or_else(|pos| pos);
+        rects.insert(insert_at, candidate);
+    }
+}
+

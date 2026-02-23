@@ -588,6 +588,22 @@ pub(crate) fn ensure_staging_texture<'a>(
 
     Ok(staging.as_ref().unwrap())
 }
+/// Build a `D3D11_TEXTURE2D_DESC` sized for a region blit, inheriting format
+/// and other properties from the full-frame source descriptor.
+pub(crate) fn region_desc_for_blit(
+    source_desc: &D3D11_TEXTURE2D_DESC,
+    blit: CaptureBlitRegion,
+) -> D3D11_TEXTURE2D_DESC {
+    let mut region_desc = *source_desc;
+    region_desc.Width = blit.width;
+    region_desc.Height = blit.height;
+    region_desc.MipLevels = 1;
+    region_desc.ArraySize = 1;
+    region_desc.SampleDesc.Count = 1;
+    region_desc.SampleDesc.Quality = 0;
+    region_desc
+}
+
 
 pub(crate) fn copy_mapped_surface_to_frame(
     frame: &mut Frame,

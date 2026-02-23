@@ -1322,20 +1322,6 @@ impl WindowsGraphicsCaptureCapturer {
         Ok(())
     }
 
-    fn region_desc_for_blit(
-        source_desc: &D3D11_TEXTURE2D_DESC,
-        blit: CaptureBlitRegion,
-    ) -> D3D11_TEXTURE2D_DESC {
-        let mut region_desc = *source_desc;
-        region_desc.Width = blit.width;
-        region_desc.Height = blit.height;
-        region_desc.MipLevels = 1;
-        region_desc.ArraySize = 1;
-        region_desc.SampleDesc.Count = 1;
-        region_desc.SampleDesc.Quality = 0;
-        region_desc
-    }
-
     fn ensure_region_slot(
         &mut self,
         slot_idx: usize,
@@ -2144,7 +2130,7 @@ impl WindowsGraphicsCaptureCapturer {
                 return Err(CaptureError::BufferOverflow);
             }
 
-            let region_desc = Self::region_desc_for_blit(&effective_desc, blit);
+            let region_desc = surface::region_desc_for_blit(&effective_desc, blit);
             if single_shot_screenshot {
                 let write_slot = 0usize;
                 self.ensure_region_slot(write_slot, &region_desc)?;

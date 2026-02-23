@@ -28,7 +28,6 @@ fn main() -> Result<()> {
         )
         .context("failed to start streaming")?;
 
-    let rx = stream.receiver();
     let stats = stream.stats().clone();
     let start = Instant::now();
     let run_duration = Duration::from_secs(5);
@@ -39,7 +38,7 @@ fn main() -> Result<()> {
     println!("Streaming for {run_duration:?} at 60 fps (adaptive)...");
 
     while start.elapsed() < run_duration {
-        match rx.recv_timeout(Duration::from_millis(500)) {
+        match stream.recv_timeout(Duration::from_millis(500)) {
             Ok(CaptureEvent::Frame(frame)) => {
                 frame_count += 1;
                 if frame.metadata.is_duplicate {

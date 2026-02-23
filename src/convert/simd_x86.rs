@@ -153,7 +153,7 @@ unsafe fn avx512_bgra_core(
     }
 
     if nontemporal && fence {
-        unsafe { _mm_sfence() };
+        _mm_sfence();
     }
 
     if x < pixel_count {
@@ -276,7 +276,7 @@ unsafe fn avx2_bgra_core(
     }
 
     if nontemporal && fence {
-        unsafe { _mm_sfence() };
+        _mm_sfence();
     }
 
     if x < pixel_count {
@@ -386,7 +386,7 @@ unsafe fn ssse3_bgra_core(
     }
 
     if nontemporal && fence {
-        unsafe { _mm_sfence() };
+        _mm_sfence();
     }
 
     if x < pixel_count {

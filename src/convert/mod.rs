@@ -1274,7 +1274,7 @@ unsafe fn memcpy_rgba_nt_avx2(src: *const u8, dst: *mut u8, pixel_count: usize, 
         offset += 32;
     }
     if fence {
-        unsafe { _mm_sfence() };
+        _mm_sfence();
     }
     if offset < total_bytes {
         unsafe {
@@ -1297,7 +1297,7 @@ unsafe fn memcpy_rgba_nt_sse2(src: *const u8, dst: *mut u8, pixel_count: usize, 
         offset += 16;
     }
     if fence {
-        unsafe { _mm_sfence() };
+        _mm_sfence();
     }
     if offset < total_bytes {
         unsafe {

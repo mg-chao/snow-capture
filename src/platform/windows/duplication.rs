@@ -84,26 +84,6 @@ fn region_full_slot_map_fastpath_enabled() -> bool {
     true
 }
 
-#[inline(always)]
-fn with_texture_resource<T>(
-    texture: &ID3D11Texture2D,
-    cast_context: &'static str,
-    f: impl FnOnce(&ID3D11Resource) -> CaptureResult<T>,
-) -> CaptureResult<T> {
-    let raw = texture.as_raw();
-    // SAFETY: ID3D11Texture2D inherits from ID3D11Resource, so the
-    // COM pointer is valid when viewed through the base interface.
-    if let Some(resource) = unsafe { ID3D11Resource::from_raw_borrowed(&raw) } {
-        return f(resource);
-    }
-
-    let owned_resource: ID3D11Resource = texture
-        .cast()
-        .context(cast_context)
-        .map_err(CaptureError::Platform)?;
-    f(&owned_resource)
-}
-
 #[derive(Default)]
 struct RegionStagingSlot {
     staging: Option<ID3D11Texture2D>,
@@ -973,7 +953,7 @@ impl StagingRing {
         use_dirty_gpu_copy: bool,
     ) -> CaptureResult<()> {
         let staging_res = self.slot_resources[slot].as_ref().unwrap();
-        with_texture_resource(
+        d3d11::with_texture_resource(
             source,
             "failed to cast DXGI source texture to ID3D11Resource",
             |source_res| {
@@ -1930,7 +1910,7 @@ impl OutputCapturer {
                 "DXGI region slot missing staging resource after initialization"
             ))
         })?;
-        with_texture_resource(
+        d3d11::with_texture_resource(
             source,
             "failed to cast region source texture to ID3D11Resource",
             |source_resource| {

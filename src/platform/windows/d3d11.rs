@@ -4,9 +4,12 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_SINGLETHREADED, D3D11_SDK_VERSION,
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIAdapter;
+use windows::core::Interface;
+
+use crate::error::{CaptureError, CaptureResult};
 
 /// Create a D3D11 device on the given adapter.
 ///
@@ -66,3 +69,26 @@ fn create_d3d11_device(
     let context = context.context("D3D11CreateDevice did not return a device context")?;
     Ok((device, context))
 }
+
+/// Cast an `ID3D11Texture2D` to its base `ID3D11Resource` interface and
+/// pass it to `f`.  Tries a zero-cost `from_raw_borrowed` first, falling
+/// back to a COM `QueryInterface` cast.
+pub(crate) fn with_texture_resource<T>(
+    texture: &ID3D11Texture2D,
+    cast_context: &'static str,
+    f: impl FnOnce(&ID3D11Resource) -> CaptureResult<T>,
+) -> CaptureResult<T> {
+    let raw = texture.as_raw();
+    // SAFETY: ID3D11Texture2D inherits from ID3D11Resource, so the raw
+    // COM pointer is valid when viewed through the base interface.
+    if let Some(resource) = unsafe { ID3D11Resource::from_raw_borrowed(&raw) } {
+        return f(resource);
+    }
+
+    let owned_resource: ID3D11Resource = texture
+        .cast()
+        .context(cast_context)
+        .map_err(CaptureError::Platform)?;
+    f(&owned_resource)
+}
+

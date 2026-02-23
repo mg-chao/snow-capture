@@ -817,26 +817,6 @@ fn map_platform_error(error: windows::core::Error, context: &str) -> CaptureErro
     CaptureError::Platform(anyhow::Error::from(error).context(context.to_string()))
 }
 
-#[inline(always)]
-fn with_texture_resource<T>(
-    texture: &ID3D11Texture2D,
-    cast_context: &'static str,
-    f: impl FnOnce(&ID3D11Resource) -> CaptureResult<T>,
-) -> CaptureResult<T> {
-    let raw = texture.as_raw();
-    // SAFETY: ID3D11Texture2D inherits from ID3D11Resource, so the raw
-    // COM pointer is valid when viewed through the base interface.
-    if let Some(resource) = unsafe { ID3D11Resource::from_raw_borrowed(&raw) } {
-        return f(resource);
-    }
-
-    let owned_resource: ID3D11Resource = texture
-        .cast()
-        .context(cast_context)
-        .map_err(CaptureError::Platform)?;
-    f(&owned_resource)
-}
-
 fn create_winrt_device(device: &ID3D11Device) -> CaptureResult<IDirect3DDevice> {
     let dxgi_device: IDXGIDevice = device
         .cast()
@@ -2246,7 +2226,7 @@ impl WindowsGraphicsCaptureCapturer {
                         bottom: src_bottom,
                         back: 1,
                     };
-                    with_texture_resource(
+                    d3d11::with_texture_resource(
                         &effective_source,
                         "failed to cast WGC region source texture to ID3D11Resource",
                         |source_resource| {
@@ -2403,7 +2383,7 @@ impl WindowsGraphicsCaptureCapturer {
                     slot.populated = true;
                 }
 
-                with_texture_resource(
+                d3d11::with_texture_resource(
                     &effective_source,
                     "failed to cast WGC region source texture to ID3D11Resource",
                     |source_resource| {
@@ -2582,7 +2562,7 @@ impl WindowsGraphicsCaptureCapturer {
                             "failed to resolve WGC staging resource for screenshot fast path"
                         ))
                     })?;
-                    with_texture_resource(
+                    d3d11::with_texture_resource(
                         &effective_source,
                         "failed to cast WGC frame texture to ID3D11Resource",
                         |source_resource| {
@@ -2728,7 +2708,7 @@ impl WindowsGraphicsCaptureCapturer {
                     slot.populated = true;
                 }
 
-                with_texture_resource(
+                d3d11::with_texture_resource(
                     &effective_source,
                     "failed to cast WGC frame texture to ID3D11Resource",
                     |source_resource| {

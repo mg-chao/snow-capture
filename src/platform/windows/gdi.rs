@@ -16,6 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic, IsWindow,
 
 use crate::backend::{CaptureBlitRegion, CaptureMode, CaptureSampleMetadata};
 use crate::convert;
+use crate::env_config::{self, define_env_flag};
 use crate::error::{CaptureError, CaptureResult};
 use crate::frame::Frame;
 use crate::monitor::MonitorId;
@@ -92,271 +93,30 @@ const WINDOW_CAPTURE_ORDER_RECORDING: [WindowCapturePath; 4] = [
     WindowCapturePath::PrintWindow(PRINT_WINDOW_EXPERIMENTAL),
 ];
 
-#[inline]
-fn gdi_direct_region_capture_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_GDI_DIRECT_REGION")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
-    })
-}
-
-#[inline]
-fn gdi_desktop_direct_region_capture_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_GDI_DESKTOP_REGION_DIRECT")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
-    })
-}
-
-#[inline]
-fn gdi_window_state_cache_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_GDI_WINDOW_STATE_CACHE")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
-    })
-}
+define_env_flag!(enabled_unless(gdi_direct_region_capture_enabled, "SNOW_CAPTURE_DISABLE_GDI_DIRECT_REGION"));
+define_env_flag!(enabled_unless(gdi_desktop_direct_region_capture_enabled, "SNOW_CAPTURE_DISABLE_GDI_DESKTOP_REGION_DIRECT"));
+define_env_flag!(enabled_unless(gdi_window_state_cache_enabled, "SNOW_CAPTURE_DISABLE_GDI_WINDOW_STATE_CACHE"));
+define_env_flag!(enabled_unless(gdi_incremental_convert_enabled, "SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_CONVERT"));
+define_env_flag!(enabled_unless(gdi_incremental_span_convert_enabled, "SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_SPAN_CONVERT"));
+define_env_flag!(enabled_unless(gdi_incremental_span_single_scan_enabled, "SNOW_CAPTURE_DISABLE_GDI_SPAN_SINGLE_SCAN"));
+define_env_flag!(enabled_unless(gdi_swap_history_surfaces_enabled, "SNOW_CAPTURE_DISABLE_GDI_HISTORY_SURFACE_SWAP"));
+define_env_flag!(enabled_unless(gdi_row_compare_unroll_enabled, "SNOW_CAPTURE_DISABLE_GDI_ROW_COMPARE_UNROLL"));
+define_env_flag!(enabled_unless(gdi_row_compare_bidirectional_enabled, "SNOW_CAPTURE_DISABLE_GDI_ROW_COMPARE_BIDIRECTIONAL"));
+define_env_flag!(enabled_unless(gdi_row_diff_simd_enabled, "SNOW_CAPTURE_DISABLE_GDI_ROW_DIFF_SIMD"));
+define_env_flag!(enabled_unless(gdi_incremental_too_dirty_probe_enabled, "SNOW_CAPTURE_DISABLE_GDI_TOO_DIRTY_PROBE"));
+define_env_flag!(enabled_unless(gdi_parallel_row_scan_enabled, "SNOW_CAPTURE_DISABLE_GDI_PARALLEL_ROW_SCAN"));
+define_env_flag!(enabled_unless(gdi_parallel_span_scan_enabled, "SNOW_CAPTURE_DISABLE_GDI_PARALLEL_SPAN_SCAN"));
+define_env_flag!(enabled_unless(gdi_parallel_span_mode_history_enabled, "SNOW_CAPTURE_DISABLE_GDI_PARALLEL_SPAN_MODE_HISTORY"));
+define_env_flag!(enabled_unless(gdi_incremental_duplicate_probe_enabled, "SNOW_CAPTURE_DISABLE_GDI_DUPLICATE_PROBE"));
 
 #[inline]
 fn gdi_window_state_refresh_interval_frames() -> u32 {
     use std::sync::OnceLock;
     static INTERVAL: OnceLock<u32> = OnceLock::new();
     *INTERVAL.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_GDI_WINDOW_STATE_REFRESH_FRAMES")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<u32>().ok())
-            .map(|value| value.max(1))
+        env_config::env_var_positive_u64("SNOW_CAPTURE_GDI_WINDOW_STATE_REFRESH_FRAMES")
+            .map(|v| (v as u32).max(1))
             .unwrap_or(8)
-    })
-}
-
-#[inline]
-fn gdi_incremental_convert_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_CONVERT")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
-    })
-}
-
-#[inline]
-fn gdi_incremental_span_convert_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_SPAN_CONVERT")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
-    })
-}
-
-#[inline]
-fn gdi_incremental_span_single_scan_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_GDI_SPAN_SINGLE_SCAN")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
-    })
-}
-
-#[inline]
-fn gdi_swap_history_surfaces_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_GDI_HISTORY_SURFACE_SWAP")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
-    })
-}
-
-#[inline]
-fn gdi_row_compare_unroll_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_GDI_ROW_COMPARE_UNROLL")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
-    })
-}
-
-#[inline]
-fn gdi_row_compare_bidirectional_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_GDI_ROW_COMPARE_BIDIRECTIONAL")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
-    })
-}
-
-#[inline]
-fn gdi_row_diff_simd_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_GDI_ROW_DIFF_SIMD")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
-    })
-}
-
-#[inline]
-fn gdi_incremental_too_dirty_probe_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_GDI_TOO_DIRTY_PROBE")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
-    })
-}
-
-#[inline]
-fn gdi_parallel_row_scan_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_GDI_PARALLEL_ROW_SCAN")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
-    })
-}
-
-#[inline]
-fn gdi_parallel_span_scan_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_GDI_PARALLEL_SPAN_SCAN")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
-    })
-}
-
-#[inline]
-fn gdi_parallel_span_mode_history_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_GDI_PARALLEL_SPAN_MODE_HISTORY")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
-    })
-}
-
-#[inline]
-fn gdi_incremental_duplicate_probe_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_DISABLE_GDI_DUPLICATE_PROBE")
-            .map(|raw| {
-                let normalized = raw.trim().to_ascii_lowercase();
-                !(normalized == "1"
-                    || normalized == "true"
-                    || normalized == "yes"
-                    || normalized == "on")
-            })
-            .unwrap_or(true)
     })
 }
 

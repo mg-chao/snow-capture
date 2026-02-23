@@ -16,6 +16,7 @@ use crate::backend::CaptureBlitRegion;
 use crate::convert::{
     self, HdrToSdrParams, SurfaceConversionOptions, SurfaceLayout, SurfacePixelFormat,
 };
+use crate::env_config::{self, define_env_flag};
 use crate::error::{CaptureError, CaptureResult};
 use crate::frame::{DirtyRect, Frame};
 
@@ -242,58 +243,19 @@ fn dirty_rects_non_overlapping_checked(dirty_rects: &[DirtyRect]) -> bool {
     true
 }
 
-#[inline]
-fn env_var_truthy(var_name: &'static str) -> bool {
-    std::env::var(var_name)
-        .map(|raw| {
-            let normalized = raw.trim().to_ascii_lowercase();
-            normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
-        })
-        .unwrap_or(false)
-}
-
-fn dirty_rect_parallel_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_DIRTY_RECT_PARALLEL"))
-}
-
-fn dirty_rect_fastpath_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_DIRTY_RECT_FASTPATH"))
-}
-
-fn dirty_rect_non_overlap_shortcut_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_DIRTY_RECT_NON_OVERLAP_SHORTCUT"))
-}
-
-fn dirty_rect_trusted_fastpath_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_DIRTY_RECT_TRUSTED_FASTPATH"))
-}
-
-fn dirty_rect_trusted_direct_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_DIRTY_RECT_TRUSTED_DIRECT"))
-}
-
-fn dirty_rect_bgra_batch_kernel_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_DIRTY_RECT_BGRA_BATCH_KERNEL"))
-}
-
-fn map_spin_wait_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_D3D11_MAP_SPIN_WAIT"))
-}
+define_env_flag!(enabled_unless(dirty_rect_parallel_enabled, "SNOW_CAPTURE_DISABLE_DIRTY_RECT_PARALLEL"));
+define_env_flag!(enabled_unless(dirty_rect_fastpath_enabled, "SNOW_CAPTURE_DISABLE_DIRTY_RECT_FASTPATH"));
+define_env_flag!(enabled_unless(dirty_rect_non_overlap_shortcut_enabled, "SNOW_CAPTURE_DISABLE_DIRTY_RECT_NON_OVERLAP_SHORTCUT"));
+define_env_flag!(enabled_unless(dirty_rect_trusted_fastpath_enabled, "SNOW_CAPTURE_DISABLE_DIRTY_RECT_TRUSTED_FASTPATH"));
+define_env_flag!(enabled_unless(dirty_rect_trusted_direct_enabled, "SNOW_CAPTURE_DISABLE_DIRTY_RECT_TRUSTED_DIRECT"));
+define_env_flag!(enabled_unless(dirty_rect_bgra_batch_kernel_enabled, "SNOW_CAPTURE_DISABLE_DIRTY_RECT_BGRA_BATCH_KERNEL"));
+define_env_flag!(enabled_unless(map_spin_wait_enabled, "SNOW_CAPTURE_DISABLE_D3D11_MAP_SPIN_WAIT"));
 
 fn map_spin_poll_count() -> usize {
     static POLLS: OnceLock<usize> = OnceLock::new();
     *POLLS.get_or_init(|| {
-        std::env::var("SNOW_CAPTURE_D3D11_MAP_SPIN_POLLS")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .filter(|value| *value > 0)
+        env_config::env_var_positive_u64("SNOW_CAPTURE_D3D11_MAP_SPIN_POLLS")
+            .map(|v| v as usize)
             .unwrap_or(D3D11_MAP_SPIN_POLLS_DEFAULT)
             .clamp(D3D11_MAP_SPIN_POLLS_MIN, D3D11_MAP_SPIN_POLLS_MAX)
     })

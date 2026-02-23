@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod capture_session;
 pub mod convert;
+pub(crate) mod env_config;
 pub mod error;
 pub mod frame;
 pub mod monitor;

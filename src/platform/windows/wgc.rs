@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -40,6 +40,8 @@ use super::dirty_rect::{
 use super::gpu_tonemap::{GpuF16Converter, GpuTonemapper};
 use super::monitor::{HdrMonitorMetadata, MonitorResolver};
 use super::surface::{self, StagingSampleDesc};
+
+use crate::env_config::define_env_flag;
 
 const WGC_FRAME_TIMEOUT: Duration = Duration::from_millis(250);
 const WGC_STALE_FRAME_TIMEOUT_MIN: Duration = Duration::from_micros(400);
@@ -132,100 +134,20 @@ struct WgcStaleTimeoutConfig {
     increase_step: Duration,
 }
 
-#[inline]
-fn env_var_truthy(var_name: &'static str) -> bool {
-    std::env::var(var_name)
-        .map(|raw| {
-            let normalized = raw.trim().to_ascii_lowercase();
-            normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
-        })
-        .unwrap_or(false)
-}
-
-#[inline]
-fn region_dirty_gpu_copy_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_REGION_DIRTY_GPU_COPY"))
-}
-
-#[inline]
-fn duplicate_dirty_fastpath_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_DUPLICATE_DIRTY_FASTPATH"))
-}
-
-#[inline]
-fn immediate_stale_return_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_IMMEDIATE_STALE_RETURN"))
-}
-
-#[inline]
-fn region_duplicate_short_circuit_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED
-        .get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_REGION_DUPLICATE_SHORTCIRCUIT"))
-}
-
-#[inline]
-fn region_low_latency_slot_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_var_truthy("SNOW_CAPTURE_WGC_ENABLE_REGION_LOW_LATENCY_SLOT"))
-}
-
-#[inline]
-fn region_full_slot_map_fastpath_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_REGION_FULL_SLOT_MAP"))
-}
-
-#[inline]
-fn region_dirty_dense_fallback_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_REGION_DIRTY_DENSE_FALLBACK"))
-}
-
-#[inline]
-fn full_dirty_dense_fallback_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_FULL_DIRTY_DENSE_FALLBACK"))
-}
-
-#[inline]
-fn dirty_rect_conversion_hints_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_DIRTY_HINTS"))
-}
-
-#[inline]
-fn dirty_region_batch_fetch_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_DIRTY_REGION_BATCH_FETCH"))
-}
-
-#[inline]
-fn duplicate_short_circuit_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_DUPLICATE_SHORTCIRCUIT"))
-}
-
-#[inline]
-fn borrowed_source_resource_cast_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_BORROWED_SOURCE_RESOURCE"))
-}
-
-#[inline]
-fn borrowed_slot_resource_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_BORROWED_SLOT_RESOURCE"))
-}
-
-#[inline]
-fn aggressive_stale_timeout_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_WGC_DISABLE_AGGRESSIVE_STALE_TIMEOUT"))
-}
+define_env_flag!(enabled_unless(region_dirty_gpu_copy_enabled, "SNOW_CAPTURE_WGC_DISABLE_REGION_DIRTY_GPU_COPY"));
+define_env_flag!(enabled_unless(duplicate_dirty_fastpath_enabled, "SNOW_CAPTURE_WGC_DISABLE_DUPLICATE_DIRTY_FASTPATH"));
+define_env_flag!(enabled_unless(immediate_stale_return_enabled, "SNOW_CAPTURE_WGC_DISABLE_IMMEDIATE_STALE_RETURN"));
+define_env_flag!(enabled_unless(region_duplicate_short_circuit_enabled, "SNOW_CAPTURE_WGC_DISABLE_REGION_DUPLICATE_SHORTCIRCUIT"));
+define_env_flag!(enabled_when(region_low_latency_slot_enabled, "SNOW_CAPTURE_WGC_ENABLE_REGION_LOW_LATENCY_SLOT"));
+define_env_flag!(enabled_unless(region_full_slot_map_fastpath_enabled, "SNOW_CAPTURE_WGC_DISABLE_REGION_FULL_SLOT_MAP"));
+define_env_flag!(enabled_unless(region_dirty_dense_fallback_enabled, "SNOW_CAPTURE_WGC_DISABLE_REGION_DIRTY_DENSE_FALLBACK"));
+define_env_flag!(enabled_unless(full_dirty_dense_fallback_enabled, "SNOW_CAPTURE_WGC_DISABLE_FULL_DIRTY_DENSE_FALLBACK"));
+define_env_flag!(enabled_unless(dirty_rect_conversion_hints_enabled, "SNOW_CAPTURE_WGC_DISABLE_DIRTY_HINTS"));
+define_env_flag!(enabled_unless(dirty_region_batch_fetch_enabled, "SNOW_CAPTURE_WGC_DISABLE_DIRTY_REGION_BATCH_FETCH"));
+define_env_flag!(enabled_unless(duplicate_short_circuit_enabled, "SNOW_CAPTURE_WGC_DISABLE_DUPLICATE_SHORTCIRCUIT"));
+define_env_flag!(enabled_unless(borrowed_source_resource_cast_enabled, "SNOW_CAPTURE_WGC_DISABLE_BORROWED_SOURCE_RESOURCE"));
+define_env_flag!(enabled_unless(borrowed_slot_resource_enabled, "SNOW_CAPTURE_WGC_DISABLE_BORROWED_SLOT_RESOURCE"));
+define_env_flag!(enabled_unless(aggressive_stale_timeout_enabled, "SNOW_CAPTURE_WGC_DISABLE_AGGRESSIVE_STALE_TIMEOUT"));
 
 #[inline(always)]
 fn stale_timeout_config(aggressive: bool) -> WgcStaleTimeoutConfig {

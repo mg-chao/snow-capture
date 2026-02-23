@@ -32,6 +32,8 @@ use super::gpu_tonemap::{GpuF16Converter, GpuTonemapper};
 use super::monitor::{HdrMonitorMetadata, MonitorResolver, ResolvedMonitor};
 use super::surface::{self, StagingSampleDesc};
 
+use crate::env_config::{self, define_env_flag};
+
 enum AcquireResult {
     Ok(ID3D11Texture2D, DXGI_OUTDUPL_FRAME_INFO),
     AccessLost,
@@ -75,111 +77,34 @@ const DXGI_DIRTY_RECT_DENSE_MERGE_THRESHOLDS: DirtyRectDenseMergeThresholds =
         max_vertical_span: DXGI_DIRTY_RECT_DENSE_MERGE_LEGACY_MAX_VERTICAL_SPAN,
     };
 
-#[inline]
-fn env_var_truthy(var_name: &'static str) -> bool {
-    std::env::var(var_name)
-        .map(|raw| {
-            let normalized = raw.trim().to_ascii_lowercase();
-            normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
-        })
-        .unwrap_or(false)
-}
-
-#[inline]
-fn env_var_positive_u64(var_name: &'static str) -> Option<u64> {
-    std::env::var(var_name)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
-}
-
-#[inline]
-fn region_dirty_gpu_copy_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_GPU_COPY"))
-}
-
-#[inline]
-fn monitor_dirty_gpu_copy_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_MONITOR_DIRTY_GPU_COPY"))
-}
-
-#[inline]
-fn monitor_dirty_gpu_copy_force_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_var_truthy("SNOW_CAPTURE_DXGI_FORCE_MONITOR_DIRTY_GPU_COPY"))
-}
-
-#[inline]
-fn duplicate_dirty_fastpath_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_DUPLICATE_DIRTY_FASTPATH"))
-}
-
-#[inline]
-fn region_direct_dirty_extract_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED
-        .get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_DIRECT_EXTRACT"))
-}
-
-#[inline]
-fn region_move_reconstruct_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_REGION_MOVE_RECONSTRUCT"))
-}
-
-#[inline]
-fn optimized_dirty_merge_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_OPTIMIZED_DIRTY_MERGE"))
-}
-
-#[inline]
-fn window_monitor_cache_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_WINDOW_MONITOR_CACHE"))
-}
-
-#[inline]
-fn window_low_latency_region_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_WINDOW_LOW_LATENCY_REGION"))
-}
-
-#[inline]
-fn window_low_latency_force_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_var_truthy("SNOW_CAPTURE_DXGI_FORCE_WINDOW_LOW_LATENCY_REGION"))
-}
+define_env_flag!(enabled_unless(region_dirty_gpu_copy_enabled, "SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_GPU_COPY"));
+define_env_flag!(enabled_unless(monitor_dirty_gpu_copy_enabled, "SNOW_CAPTURE_DXGI_DISABLE_MONITOR_DIRTY_GPU_COPY"));
+define_env_flag!(enabled_when(monitor_dirty_gpu_copy_force_enabled, "SNOW_CAPTURE_DXGI_FORCE_MONITOR_DIRTY_GPU_COPY"));
+define_env_flag!(enabled_unless(duplicate_dirty_fastpath_enabled, "SNOW_CAPTURE_DXGI_DISABLE_DUPLICATE_DIRTY_FASTPATH"));
+define_env_flag!(enabled_unless(region_direct_dirty_extract_enabled, "SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_DIRECT_EXTRACT"));
+define_env_flag!(enabled_unless(region_move_reconstruct_enabled, "SNOW_CAPTURE_DXGI_DISABLE_REGION_MOVE_RECONSTRUCT"));
+define_env_flag!(enabled_unless(optimized_dirty_merge_enabled, "SNOW_CAPTURE_DXGI_DISABLE_OPTIMIZED_DIRTY_MERGE"));
+define_env_flag!(enabled_unless(window_monitor_cache_enabled, "SNOW_CAPTURE_DXGI_DISABLE_WINDOW_MONITOR_CACHE"));
+define_env_flag!(enabled_unless(window_low_latency_region_enabled, "SNOW_CAPTURE_DXGI_DISABLE_WINDOW_LOW_LATENCY_REGION"));
+define_env_flag!(enabled_when(window_low_latency_force_enabled, "SNOW_CAPTURE_DXGI_FORCE_WINDOW_LOW_LATENCY_REGION"));
+define_env_flag!(enabled_when(region_low_latency_enabled, "SNOW_CAPTURE_DXGI_ENABLE_REGION_LOW_LATENCY"));
+define_env_flag!(enabled_when(region_low_latency_force_enabled, "SNOW_CAPTURE_DXGI_FORCE_REGION_LOW_LATENCY"));
+define_env_flag!(enabled_unless(borrowed_source_resource_cast_enabled, "SNOW_CAPTURE_DXGI_DISABLE_BORROWED_SOURCE_RESOURCE"));
 
 #[inline]
 fn window_low_latency_max_pixels() -> u64 {
     static MAX_PIXELS: OnceLock<u64> = OnceLock::new();
     *MAX_PIXELS.get_or_init(|| {
-        env_var_positive_u64("SNOW_CAPTURE_DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS")
+        env_config::env_var_positive_u64("SNOW_CAPTURE_DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS")
             .unwrap_or(DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS_DEFAULT)
     })
-}
-
-#[inline]
-fn region_low_latency_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_var_truthy("SNOW_CAPTURE_DXGI_ENABLE_REGION_LOW_LATENCY"))
-}
-
-#[inline]
-fn region_low_latency_force_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_var_truthy("SNOW_CAPTURE_DXGI_FORCE_REGION_LOW_LATENCY"))
 }
 
 #[inline]
 fn region_low_latency_max_pixels() -> u64 {
     static MAX_PIXELS: OnceLock<u64> = OnceLock::new();
     *MAX_PIXELS.get_or_init(|| {
-        env_var_positive_u64("SNOW_CAPTURE_DXGI_REGION_LOW_LATENCY_MAX_PIXELS")
+        env_config::env_var_positive_u64("SNOW_CAPTURE_DXGI_REGION_LOW_LATENCY_MAX_PIXELS")
             .unwrap_or(DXGI_REGION_LOW_LATENCY_MAX_PIXELS_DEFAULT)
     })
 }
@@ -188,26 +113,18 @@ fn region_low_latency_max_pixels() -> u64 {
 fn region_full_slot_map_fastpath_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        if env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_REGION_FULL_SLOT_MAP_FASTPATH") {
+        if env_config::env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_REGION_FULL_SLOT_MAP_FASTPATH") {
             return false;
         }
         // Backward-compatible opt-in alias from older builds.
         // If explicitly set, honor the old truthy/falsey value.
-        if let Ok(raw) = std::env::var("SNOW_CAPTURE_DXGI_ENABLE_REGION_FULL_SLOT_MAP_FASTPATH") {
-            let normalized = raw.trim().to_ascii_lowercase();
-            return normalized == "1"
-                || normalized == "true"
-                || normalized == "yes"
-                || normalized == "on";
+        if let Ok(_) = std::env::var("SNOW_CAPTURE_DXGI_ENABLE_REGION_FULL_SLOT_MAP_FASTPATH") {
+            return env_config::env_var_truthy(
+                "SNOW_CAPTURE_DXGI_ENABLE_REGION_FULL_SLOT_MAP_FASTPATH",
+            );
         }
         true
     })
-}
-
-#[inline]
-fn borrowed_source_resource_cast_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DXGI_DISABLE_BORROWED_SOURCE_RESOURCE"))
 }
 
 #[inline(always)]

@@ -7,21 +7,9 @@ mod simd_x86;
 use parallel::{install_conversion_pool, parallel_chunk_pixels, should_parallelize};
 use std::sync::OnceLock;
 
-#[inline]
-fn env_var_truthy(var_name: &'static str) -> bool {
-    std::env::var(var_name)
-        .map(|raw| {
-            let normalized = raw.trim().to_ascii_lowercase();
-            normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
-        })
-        .unwrap_or(false)
-}
+use crate::env_config::define_env_flag;
 
-#[inline]
-fn batched_row_nt_fence_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !env_var_truthy("SNOW_CAPTURE_DISABLE_BATCHED_ROW_NT_FENCE"))
-}
+define_env_flag!(enabled_unless(batched_row_nt_fence_enabled, "SNOW_CAPTURE_DISABLE_BATCHED_ROW_NT_FENCE"));
 
 /// Pre-initialize expensive one-time resources (rayon thread pool, F16 LUT,
 /// SIMD kernel selection) so the first capture doesn't pay the cost.

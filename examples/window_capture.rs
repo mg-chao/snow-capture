@@ -3,9 +3,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use snow_capture::{
-    CaptureMode, CaptureSession, CaptureTarget, WindowId,
-    backend::CaptureBackendKind,
-    frame::Frame,
+    CaptureMode, CaptureSession, CaptureTarget, WindowId, backend::CaptureBackendKind, frame::Frame,
 };
 
 fn save_frame_png(frame: &Frame, path: &Path) -> anyhow::Result<()> {
@@ -40,11 +38,19 @@ fn window_under_cursor() -> Result<isize> {
     let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
     let handle = if root.0.is_null() { hwnd } else { root };
 
-    println!("Cursor at ({}, {}), window handle: {:?}", pt.x, pt.y, handle.0);
+    println!(
+        "Cursor at ({}, {}), window handle: {:?}",
+        pt.x, pt.y, handle.0
+    );
     Ok(handle.0 as isize)
 }
 
-fn capture_window_to_png(kind: CaptureBackendKind, label: &str, window: &WindowId, output_path: &str) -> Result<()> {
+fn capture_window_to_png(
+    kind: CaptureBackendKind,
+    label: &str,
+    window: &WindowId,
+    output_path: &str,
+) -> Result<()> {
     let target = CaptureTarget::Window(*window);
 
     let begin = Instant::now();

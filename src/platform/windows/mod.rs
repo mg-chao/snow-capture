@@ -1,5 +1,6 @@
 pub(crate) mod com;
 pub(crate) mod d3d11;
+pub(crate) mod dirty_rect;
 pub(crate) mod display_change;
 pub(crate) mod duplication;
 pub(crate) mod gdi;
@@ -72,9 +73,7 @@ impl WindowsBackend {
             CaptureBackendKind::WindowsGraphicsCapture => {
                 Ok(Box::new(wgc::WindowsWindowCapturer::new(window)?))
             }
-            CaptureBackendKind::Gdi => {
-                Ok(Box::new(gdi::WindowsWindowCapturer::new(window)?))
-            }
+            CaptureBackendKind::Gdi => Ok(Box::new(gdi::WindowsWindowCapturer::new(window)?)),
         }
     }
 

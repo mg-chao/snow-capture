@@ -129,7 +129,6 @@ impl MonitorLayout {
 #[cfg(target_os = "windows")]
 fn snapshot_windows_from_monitors(monitors: Vec<MonitorId>) -> CaptureResult<MonitorLayout> {
     use std::mem::size_of;
-    use std::ptr::null_mut;
     use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO, MONITORINFOEXW};
 
     if monitors.is_empty() {
@@ -139,7 +138,7 @@ fn snapshot_windows_from_monitors(monitors: Vec<MonitorId>) -> CaptureResult<Mon
     let mut geometries = Vec::with_capacity(monitors.len());
     for monitor in monitors {
         let hmon = HMONITOR(monitor.raw_handle() as *mut std::ffi::c_void);
-        if hmon.0 == null_mut() {
+        if hmon.0.is_null() {
             return Err(CaptureError::MonitorLost);
         }
 
@@ -151,8 +150,7 @@ fn snapshot_windows_from_monitors(monitors: Vec<MonitorId>) -> CaptureResult<Mon
             ..Default::default()
         };
 
-        if !unsafe { GetMonitorInfoW(hmon, (&mut info as *mut MONITORINFOEXW).cast()) }.as_bool()
-        {
+        if !unsafe { GetMonitorInfoW(hmon, (&mut info as *mut MONITORINFOEXW).cast()) }.as_bool() {
             return Err(CaptureError::MonitorLost);
         }
 

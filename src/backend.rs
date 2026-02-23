@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::error::CaptureError;
 use crate::error::CaptureResult;
@@ -88,8 +89,72 @@ pub struct CursorCaptureConfig {
     pub capture_cursor: bool,
 }
 
+/// Source/destination rectangle pair used for partial monitor capture writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureBlitRegion {
+    pub src_x: u32,
+    pub src_y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub dst_x: u32,
+    pub dst_y: u32,
+}
+
+/// Timing and duplicate metadata produced by a capture operation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CaptureSampleMetadata {
+    pub capture_time: Option<Instant>,
+    pub present_time_qpc: Option<i64>,
+    pub is_duplicate: bool,
+}
+
 pub trait MonitorCapturer: Send {
     fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame>;
+
+    /// Capture a frame with an explicit hint about whether `reuse`
+    /// contains the previous output from this same capture target.
+    ///
+    /// Backends can use this to safely enable incremental conversion
+    /// paths that only update changed rows/tiles.
+    fn capture_with_history_hint(
+        &mut self,
+        reuse: Option<Frame>,
+        _destination_has_history: bool,
+    ) -> CaptureResult<Frame> {
+        self.capture(reuse)
+    }
+
+    /// Optional accelerated path for writing only a source sub-rectangle
+    /// into an already-allocated destination frame.
+    ///
+    /// Returns `Ok(Some(..))` when the backend handled the partial write
+    /// directly, or `Ok(None)` to request the caller fall back to full-frame
+    /// capture plus CPU blit.
+    fn capture_region_into(
+        &mut self,
+        _blit: CaptureBlitRegion,
+        _destination: &mut Frame,
+        _destination_has_history: bool,
+    ) -> CaptureResult<Option<CaptureSampleMetadata>> {
+        Ok(None)
+    }
+
+    /// Optional accelerated path for capturing a desktop-space region
+    /// directly into an already-allocated destination frame.
+    ///
+    /// Coordinates are in virtual desktop space. The captured pixels are
+    /// written starting at destination origin (0,0) for `width x height`.
+    fn capture_desktop_region_into(
+        &mut self,
+        _x: i32,
+        _y: i32,
+        _width: u32,
+        _height: u32,
+        _destination: &mut Frame,
+        _destination_has_history: bool,
+    ) -> CaptureResult<Option<CaptureSampleMetadata>> {
+        Ok(None)
+    }
 
     /// Set capture mode so backends can tune buffering/conversion policy.
     fn set_capture_mode(&mut self, _mode: CaptureMode) {}

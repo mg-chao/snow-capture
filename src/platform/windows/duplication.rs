@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
@@ -31,8 +31,6 @@ use super::dirty_rect::{
 use super::gpu_tonemap::{GpuF16Converter, GpuTonemapper};
 use super::monitor::{HdrMonitorMetadata, MonitorResolver, ResolvedMonitor};
 use super::surface::{self, StagingSampleDesc};
-
-use crate::env_config::{self, define_env_flag};
 
 enum AcquireResult {
     Ok(ID3D11Texture2D, DXGI_OUTDUPL_FRAME_INFO),
@@ -77,36 +75,9 @@ const DXGI_DIRTY_RECT_DENSE_MERGE_THRESHOLDS: DirtyRectDenseMergeThresholds =
         max_vertical_span: DXGI_DIRTY_RECT_DENSE_MERGE_LEGACY_MAX_VERTICAL_SPAN,
     };
 
-define_env_flag!(enabled_unless(region_dirty_gpu_copy_enabled, "SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_GPU_COPY"));
-define_env_flag!(enabled_unless(monitor_dirty_gpu_copy_enabled, "SNOW_CAPTURE_DXGI_DISABLE_MONITOR_DIRTY_GPU_COPY"));
-define_env_flag!(enabled_when(monitor_dirty_gpu_copy_force_enabled, "SNOW_CAPTURE_DXGI_FORCE_MONITOR_DIRTY_GPU_COPY"));
-define_env_flag!(enabled_unless(duplicate_dirty_fastpath_enabled, "SNOW_CAPTURE_DXGI_DISABLE_DUPLICATE_DIRTY_FASTPATH"));
-define_env_flag!(enabled_unless(region_direct_dirty_extract_enabled, "SNOW_CAPTURE_DXGI_DISABLE_REGION_DIRTY_DIRECT_EXTRACT"));
-define_env_flag!(enabled_unless(region_move_reconstruct_enabled, "SNOW_CAPTURE_DXGI_DISABLE_REGION_MOVE_RECONSTRUCT"));
-define_env_flag!(enabled_unless(optimized_dirty_merge_enabled, "SNOW_CAPTURE_DXGI_DISABLE_OPTIMIZED_DIRTY_MERGE"));
-define_env_flag!(enabled_unless(window_monitor_cache_enabled, "SNOW_CAPTURE_DXGI_DISABLE_WINDOW_MONITOR_CACHE"));
-define_env_flag!(enabled_unless(window_low_latency_region_enabled, "SNOW_CAPTURE_DXGI_DISABLE_WINDOW_LOW_LATENCY_REGION"));
-define_env_flag!(enabled_when(window_low_latency_force_enabled, "SNOW_CAPTURE_DXGI_FORCE_WINDOW_LOW_LATENCY_REGION"));
-define_env_flag!(enabled_when(region_low_latency_enabled, "SNOW_CAPTURE_DXGI_ENABLE_REGION_LOW_LATENCY"));
-define_env_flag!(enabled_when(region_low_latency_force_enabled, "SNOW_CAPTURE_DXGI_FORCE_REGION_LOW_LATENCY"));
-define_env_flag!(enabled_unless(borrowed_source_resource_cast_enabled, "SNOW_CAPTURE_DXGI_DISABLE_BORROWED_SOURCE_RESOURCE"));
-
 #[inline]
 fn window_low_latency_max_pixels() -> u64 {
-    static MAX_PIXELS: OnceLock<u64> = OnceLock::new();
-    *MAX_PIXELS.get_or_init(|| {
-        env_config::env_var_positive_u64("SNOW_CAPTURE_DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS")
-            .unwrap_or(DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS_DEFAULT)
-    })
-}
-
-#[inline]
-fn region_low_latency_max_pixels() -> u64 {
-    static MAX_PIXELS: OnceLock<u64> = OnceLock::new();
-    *MAX_PIXELS.get_or_init(|| {
-        env_config::env_var_positive_u64("SNOW_CAPTURE_DXGI_REGION_LOW_LATENCY_MAX_PIXELS")
-            .unwrap_or(DXGI_REGION_LOW_LATENCY_MAX_PIXELS_DEFAULT)
-    })
+    DXGI_WINDOW_LOW_LATENCY_MAX_PIXELS_DEFAULT
 }
 
 #[inline]
@@ -120,13 +91,11 @@ fn with_texture_resource<T>(
     cast_context: &'static str,
     f: impl FnOnce(&ID3D11Resource) -> CaptureResult<T>,
 ) -> CaptureResult<T> {
-    if borrowed_source_resource_cast_enabled() {
-        let raw = texture.as_raw();
-        // SAFETY: ID3D11Texture2D inherits from ID3D11Resource, so the
-        // COM pointer is valid when viewed through the base interface.
-        if let Some(resource) = unsafe { ID3D11Resource::from_raw_borrowed(&raw) } {
-            return f(resource);
-        }
+    let raw = texture.as_raw();
+    // SAFETY: ID3D11Texture2D inherits from ID3D11Resource, so the
+    // COM pointer is valid when viewed through the base interface.
+    if let Some(resource) = unsafe { ID3D11Resource::from_raw_borrowed(&raw) } {
+        return f(resource);
     }
 
     let owned_resource: ID3D11Resource = texture
@@ -609,7 +578,7 @@ fn normalize_dirty_rects_in_place(rects: &mut Vec<DirtyRect>, width: u32, height
         height,
         false,
         DXGI_DIRTY_RECT_DENSE_MERGE_THRESHOLDS,
-        optimized_dirty_merge_enabled(),
+        true,
         &mut merge_scratch,
     );
 }
@@ -1494,8 +1463,8 @@ fn should_use_monitor_low_latency_dirty_gpu_mode(
 ) -> bool {
     choose_monitor_low_latency_dirty_gpu_mode(
         capture_mode == CaptureMode::ScreenRecording,
-        monitor_dirty_gpu_copy_enabled(),
-        monitor_dirty_gpu_copy_force_enabled(),
+        true,
+        false,
         mode_active,
         output_matches_source,
         frame_pixels_unchanged,
@@ -1540,8 +1509,8 @@ fn should_use_window_low_latency_region_path(
     choose_window_low_latency_region_mode(
         recording_mode,
         prefer_low_latency,
-        window_low_latency_region_enabled(),
-        window_low_latency_force_enabled(),
+        true,
+        false,
         window_low_latency_max_pixels(),
         blit,
         low_latency_dirty_gpu_preferred,
@@ -1570,16 +1539,10 @@ fn choose_monitor_region_low_latency_mode(
 
 #[inline(always)]
 fn should_prefer_monitor_region_low_latency(
-    capture_mode: CaptureMode,
-    blit: CaptureBlitRegion,
+    _capture_mode: CaptureMode,
+    _blit: CaptureBlitRegion,
 ) -> bool {
-    choose_monitor_region_low_latency_mode(
-        capture_mode,
-        region_low_latency_enabled(),
-        region_low_latency_force_enabled(),
-        region_low_latency_max_pixels(),
-        blit,
-    )
+    false
 }
 
 #[inline(always)]
@@ -2089,10 +2052,7 @@ impl OutputCapturer {
             "failed to cast region source texture to ID3D11Resource",
             |source_resource| {
                 let mut used_dirty_copy = false;
-                if can_use_dirty_gpu_copy
-                    && region_dirty_gpu_copy_enabled()
-                    && slot.dirty_gpu_copy_preferred
-                {
+                if can_use_dirty_gpu_copy && slot.dirty_gpu_copy_preferred {
                     for rect in &slot.dirty_rects {
                         let source_left = blit
                             .src_x
@@ -2205,10 +2165,8 @@ impl OutputCapturer {
 
         let moves_only = {
             let slot = &self.region_slots[slot_idx];
-            let has_moves = destination_has_history
-                && region_move_reconstruct_enabled()
-                && slot.move_mode_available
-                && !slot.move_rects.is_empty();
+            let has_moves =
+                destination_has_history && slot.move_mode_available && !slot.move_rects.is_empty();
             if has_moves {
                 apply_move_rects_to_frame(out, &slot.move_rects, blit.dst_x, blit.dst_y)?;
             }
@@ -2422,36 +2380,15 @@ impl OutputCapturer {
                     region_move_rects.clear();
                     (true, true, false, true)
                 } else {
-                    let region_dirty_available = if region_direct_dirty_extract_enabled() {
-                        extract_region_dirty_rects_direct(
-                            &self.duplication,
-                            &frame_info,
-                            &mut self.dxgi_rect_buffer,
-                            effective_desc.Width,
-                            effective_desc.Height,
-                            blit,
-                            &mut region_dirty_rects,
-                        )
-                    } else {
-                        let source_dirty_available = extract_dirty_rects(
-                            &self.duplication,
-                            &frame_info,
-                            &mut self.dxgi_rect_buffer,
-                            &mut self.source_dirty_rects_scratch,
-                        );
-                        if source_dirty_available {
-                            extract_region_dirty_rects(
-                                &self.source_dirty_rects_scratch,
-                                effective_desc.Width,
-                                effective_desc.Height,
-                                blit,
-                                &mut region_dirty_rects,
-                            )
-                        } else {
-                            region_dirty_rects.clear();
-                            false
-                        }
-                    };
+                    let region_dirty_available = extract_region_dirty_rects_direct(
+                        &self.duplication,
+                        &frame_info,
+                        &mut self.dxgi_rect_buffer,
+                        effective_desc.Width,
+                        effective_desc.Height,
+                        blit,
+                        &mut region_dirty_rects,
+                    );
                     let region_move_available = {
                         let source_move_available = extract_move_rects(
                             &self.duplication,
@@ -2512,11 +2449,8 @@ impl OutputCapturer {
             }
 
             let recording_mode = self.capture_mode == CaptureMode::ScreenRecording;
-            let can_use_dirty_reconstruct = can_use_region_dirty_reconstruct(
-                region_move_available,
-                region_has_moves,
-                region_move_reconstruct_enabled(),
-            );
+            let can_use_dirty_reconstruct =
+                can_use_region_dirty_reconstruct(region_move_available, region_has_moves, true);
             let dirty_copy_strategy = if region_dirty_available && can_use_dirty_reconstruct {
                 evaluate_dirty_copy_strategy(
                     &region_dirty_rects,
@@ -2694,12 +2628,11 @@ impl OutputCapturer {
             self.last_present_time = frame_info.LastPresentTime;
         }
 
-        let duplicate_fastpath = duplicate_dirty_fastpath_enabled();
         // Duplicate frames have no new desktop damage. Skip the COM metadata
         // query on this fast path.
         let source_unchanged = if frame.metadata.is_duplicate {
             frame.metadata.dirty_rects.clear();
-            duplicate_fastpath
+            true
         } else if extract_dirty_rects(
             &self.duplication,
             &frame_info,
@@ -2837,7 +2770,7 @@ impl OutputCapturer {
                             && desc.Format == effective_desc.Format
                     }) && self.pending_hdr == effective_hdr;
                     let skip_submit_copy = should_skip_screenrecord_submit_copy(
-                        duplicate_fastpath,
+                        true,
                         pending_slot_compatible,
                         frame.metadata.is_duplicate,
                         source_unchanged,
@@ -3259,9 +3192,7 @@ impl WindowsDxgiWindowCapturer {
         hwnd: HWND,
         win_rect: &RECT,
     ) -> CaptureResult<CaptureBlitRegion> {
-        let cache_enabled = window_monitor_cache_enabled();
-
-        if !cache_enabled || !rect_within_rect(win_rect, &self.current_monitor_rect) {
+        if !rect_within_rect(win_rect, &self.current_monitor_rect) {
             let hmon = monitor_from_window(hwnd).ok_or_else(|| {
                 CaptureError::BackendUnavailable("window is not on any monitor".into())
             })?;
@@ -3270,20 +3201,15 @@ impl WindowsDxgiWindowCapturer {
             }
         }
 
-        if !cache_enabled {
-            self.current_monitor_rect = monitor_rect(self.current_hmon.0)?;
-        }
-
         let blit = match Self::window_blit_on_monitor(&self.current_monitor_rect, win_rect) {
             Ok(blit) => blit,
-            Err(error) if cache_enabled => {
+            Err(error) => {
                 self.current_monitor_rect = monitor_rect(self.current_hmon.0)?;
                 match Self::window_blit_on_monitor(&self.current_monitor_rect, win_rect) {
                     Ok(blit) => blit,
                     Err(_) => return Err(error),
                 }
             }
-            Err(error) => return Err(error),
         };
 
         Ok(blit)

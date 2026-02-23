@@ -16,7 +16,6 @@ use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic, IsWindow,
 
 use crate::backend::{CaptureBlitRegion, CaptureMode, CaptureSampleMetadata};
 use crate::convert;
-use crate::env_config::{self, define_env_flag};
 use crate::error::{CaptureError, CaptureResult};
 use crate::frame::Frame;
 use crate::monitor::MonitorId;
@@ -93,31 +92,9 @@ const WINDOW_CAPTURE_ORDER_RECORDING: [WindowCapturePath; 4] = [
     WindowCapturePath::PrintWindow(PRINT_WINDOW_EXPERIMENTAL),
 ];
 
-define_env_flag!(enabled_unless(gdi_direct_region_capture_enabled, "SNOW_CAPTURE_DISABLE_GDI_DIRECT_REGION"));
-define_env_flag!(enabled_unless(gdi_desktop_direct_region_capture_enabled, "SNOW_CAPTURE_DISABLE_GDI_DESKTOP_REGION_DIRECT"));
-define_env_flag!(enabled_unless(gdi_window_state_cache_enabled, "SNOW_CAPTURE_DISABLE_GDI_WINDOW_STATE_CACHE"));
-define_env_flag!(enabled_unless(gdi_incremental_convert_enabled, "SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_CONVERT"));
-define_env_flag!(enabled_unless(gdi_incremental_span_convert_enabled, "SNOW_CAPTURE_DISABLE_GDI_INCREMENTAL_SPAN_CONVERT"));
-define_env_flag!(enabled_unless(gdi_incremental_span_single_scan_enabled, "SNOW_CAPTURE_DISABLE_GDI_SPAN_SINGLE_SCAN"));
-define_env_flag!(enabled_unless(gdi_swap_history_surfaces_enabled, "SNOW_CAPTURE_DISABLE_GDI_HISTORY_SURFACE_SWAP"));
-define_env_flag!(enabled_unless(gdi_row_compare_unroll_enabled, "SNOW_CAPTURE_DISABLE_GDI_ROW_COMPARE_UNROLL"));
-define_env_flag!(enabled_unless(gdi_row_compare_bidirectional_enabled, "SNOW_CAPTURE_DISABLE_GDI_ROW_COMPARE_BIDIRECTIONAL"));
-define_env_flag!(enabled_unless(gdi_row_diff_simd_enabled, "SNOW_CAPTURE_DISABLE_GDI_ROW_DIFF_SIMD"));
-define_env_flag!(enabled_unless(gdi_incremental_too_dirty_probe_enabled, "SNOW_CAPTURE_DISABLE_GDI_TOO_DIRTY_PROBE"));
-define_env_flag!(enabled_unless(gdi_parallel_row_scan_enabled, "SNOW_CAPTURE_DISABLE_GDI_PARALLEL_ROW_SCAN"));
-define_env_flag!(enabled_unless(gdi_parallel_span_scan_enabled, "SNOW_CAPTURE_DISABLE_GDI_PARALLEL_SPAN_SCAN"));
-define_env_flag!(enabled_unless(gdi_parallel_span_mode_history_enabled, "SNOW_CAPTURE_DISABLE_GDI_PARALLEL_SPAN_MODE_HISTORY"));
-define_env_flag!(enabled_unless(gdi_incremental_duplicate_probe_enabled, "SNOW_CAPTURE_DISABLE_GDI_DUPLICATE_PROBE"));
-
 #[inline]
 fn gdi_window_state_refresh_interval_frames() -> u32 {
-    use std::sync::OnceLock;
-    static INTERVAL: OnceLock<u32> = OnceLock::new();
-    *INTERVAL.get_or_init(|| {
-        env_config::env_var_positive_u64("SNOW_CAPTURE_GDI_WINDOW_STATE_REFRESH_FRAMES")
-            .map(|v| (v as u32).max(1))
-            .unwrap_or(8)
-    })
+    8
 }
 
 const GDI_INCREMENTAL_MIN_PIXELS: usize = 160_000;
@@ -431,9 +408,7 @@ type RowDiffBoundsKernel = unsafe fn(*const u8, *const u8, usize) -> Option<(usi
 
 #[inline(always)]
 fn incremental_too_dirty_probe_eligible(pixel_count: usize, height: usize) -> bool {
-    gdi_incremental_too_dirty_probe_enabled()
-        && pixel_count >= GDI_INCREMENTAL_TOO_DIRTY_PROBE_MIN_PIXELS
-        && height > 1
+    pixel_count >= GDI_INCREMENTAL_TOO_DIRTY_PROBE_MIN_PIXELS && height > 1
 }
 
 #[inline(always)]
@@ -443,8 +418,7 @@ fn incremental_duplicate_probe_eligible(
     src_stride: usize,
     history_stride: usize,
 ) -> bool {
-    gdi_incremental_duplicate_probe_enabled()
-        && pixel_count >= GDI_INCREMENTAL_DUPLICATE_PROBE_MIN_PIXELS
+    pixel_count >= GDI_INCREMENTAL_DUPLICATE_PROBE_MIN_PIXELS
         && row_bytes > 0
         && src_stride == row_bytes
         && history_stride == row_bytes
@@ -452,8 +426,7 @@ fn incremental_duplicate_probe_eligible(
 
 #[inline(always)]
 fn parallel_row_scan_eligible(pixel_count: usize, height: usize) -> bool {
-    gdi_parallel_row_scan_enabled()
-        && height > 1
+    height > 1
         && convert::should_parallelize_work(
             pixel_count,
             GDI_PARALLEL_ROW_SCAN_MIN_PIXELS,
@@ -464,10 +437,7 @@ fn parallel_row_scan_eligible(pixel_count: usize, height: usize) -> bool {
 
 #[inline(always)]
 fn incremental_span_convert_eligible(pixel_count: usize, width: usize, height: usize) -> bool {
-    gdi_incremental_span_convert_enabled()
-        && width > 1
-        && height > 1
-        && pixel_count >= GDI_INCREMENTAL_SPAN_MIN_PIXELS
+    width > 1 && height > 1 && pixel_count >= GDI_INCREMENTAL_SPAN_MIN_PIXELS
 }
 
 #[inline(always)]
@@ -477,8 +447,7 @@ fn parallel_span_scan_eligible(
     height: usize,
     incremental_too_dirty_hint: bool,
 ) -> bool {
-    gdi_parallel_span_scan_enabled()
-        && !incremental_too_dirty_hint
+    !incremental_too_dirty_hint
         && parallel_row_scan_eligible(pixel_count, height)
         && incremental_span_convert_eligible(pixel_count, width, height)
 }
@@ -556,9 +525,6 @@ fn select_parallel_span_scan_mode(
     duplicate_probe_hint: bool,
     mode_hint: Option<ParallelSpanScanMode>,
 ) -> ParallelSpanScanMode {
-    if !gdi_incremental_span_single_scan_enabled() {
-        return ParallelSpanScanMode::CompareThenDiff;
-    }
     if duplicate_probe_hint {
         return ParallelSpanScanMode::CompareThenDiff;
     }
@@ -642,8 +608,8 @@ fn row_compare_kernel() -> RowCompareKernel {
 fn select_row_compare_kernel() -> RowCompareKernel {
     #[cfg(target_arch = "x86_64")]
     {
-        let use_unrolled = gdi_row_compare_unroll_enabled();
-        let use_bidirectional = gdi_row_compare_bidirectional_enabled();
+        let use_unrolled = true;
+        let use_bidirectional = true;
         if std::arch::is_x86_feature_detected!("avx2") {
             return if use_unrolled {
                 if use_bidirectional {
@@ -680,13 +646,11 @@ fn row_diff_bounds_kernel() -> RowDiffBoundsKernel {
 fn select_row_diff_bounds_kernel() -> RowDiffBoundsKernel {
     #[cfg(target_arch = "x86_64")]
     {
-        if gdi_row_diff_simd_enabled() {
-            if std::arch::is_x86_feature_detected!("avx2") {
-                return row_diff_bounds_avx2;
-            }
-            if std::arch::is_x86_feature_detected!("sse2") {
-                return row_diff_bounds_sse2;
-            }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return row_diff_bounds_avx2;
+        }
+        if std::arch::is_x86_feature_detected!("sse2") {
+            return row_diff_bounds_sse2;
         }
     }
     row_diff_bounds_scalar
@@ -1276,7 +1240,7 @@ impl GdiResources {
     }
 
     fn ensure_history_surface(&mut self) -> CaptureResult<()> {
-        if !gdi_swap_history_surfaces_enabled() || self.width <= 0 || self.height <= 0 {
+        if self.width <= 0 || self.height <= 0 {
             return Ok(());
         }
         if self.history_bitmap.is_some() && !self.history_bits.is_null() {
@@ -1291,9 +1255,6 @@ impl GdiResources {
     }
 
     fn swap_capture_and_history_surfaces(&mut self) -> CaptureResult<()> {
-        if !gdi_swap_history_surfaces_enabled() {
-            return Ok(());
-        }
         self.ensure_history_surface()?;
 
         let Some(current_bitmap) = self.capture_bitmap else {
@@ -1382,16 +1343,6 @@ impl GdiResources {
         had_history
     }
 
-    unsafe fn copy_surface_to_history_unchecked(&mut self, byte_len: usize) {
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.bits.cast_const(),
-                self.bgra_history.as_mut_ptr(),
-                byte_len,
-            );
-        }
-    }
-
     fn ensure_dirty_row_flags(&mut self, row_count: usize) {
         if self.dirty_row_flags.len() != row_count {
             self.dirty_row_flags.resize(row_count, 0);
@@ -1464,11 +1415,7 @@ impl GdiResources {
         }
         self.ensure_dirty_row_spans(height);
         self.dirty_row_spans[..height].fill(DirtyRowSpan::default());
-        let mode_hint = if gdi_parallel_span_mode_history_enabled() {
-            self.parallel_span_mode_hint
-        } else {
-            None
-        };
+        let mode_hint = self.parallel_span_mode_hint;
         let scan_mode = select_parallel_span_scan_mode(
             self.bits.cast_const(),
             self.stride,
@@ -1494,16 +1441,12 @@ impl GdiResources {
             copy_changed_rows_to_history,
             scan_mode,
         );
-        if gdi_parallel_span_mode_history_enabled() {
-            self.parallel_span_mode_hint = Some(recommend_parallel_span_scan_mode(
-                dirty_rows,
-                dirty_pixels,
-                width,
-                height,
-            ));
-        } else {
-            self.parallel_span_mode_hint = None;
-        }
+        self.parallel_span_mode_hint = Some(recommend_parallel_span_scan_mode(
+            dirty_rows,
+            dirty_pixels,
+            width,
+            height,
+        ));
 
         if dirty_rows == 0 {
             return Ok(Some(DirtyScanResult {
@@ -1568,11 +1511,7 @@ impl GdiResources {
             if is_duplicate {
                 self.dirty_row_runs.clear();
                 self.dirty_span_runs.clear();
-                if gdi_parallel_span_mode_history_enabled() {
-                    self.parallel_span_mode_hint = Some(ParallelSpanScanMode::CompareThenDiff);
-                } else {
-                    self.parallel_span_mode_hint = None;
-                }
+                self.parallel_span_mode_hint = Some(ParallelSpanScanMode::CompareThenDiff);
                 return Ok(Some(DirtyScanResult {
                     dirty_rows: 0,
                     used_spans: false,
@@ -1607,11 +1546,7 @@ impl GdiResources {
         {
             self.dirty_row_runs.clear();
             self.dirty_span_runs.clear();
-            if gdi_parallel_span_mode_history_enabled() {
-                self.parallel_span_mode_hint = Some(ParallelSpanScanMode::SingleScanDiff);
-            } else {
-                self.parallel_span_mode_hint = None;
-            }
+            self.parallel_span_mode_hint = Some(ParallelSpanScanMode::SingleScanDiff);
             return Ok(None);
         }
 
@@ -1658,7 +1593,7 @@ impl GdiResources {
         let mut run_start = None::<usize>;
         let mut src_row = self.bits.cast_const();
         let mut history_row = history_base;
-        let span_single_scan = spans_enabled && gdi_incremental_span_single_scan_enabled();
+        let span_single_scan = spans_enabled;
 
         for row in 0..height {
             let mut dirty_span = None::<(usize, usize)>;
@@ -1948,14 +1883,8 @@ impl GdiResources {
     }
 
     fn commit_incremental_history(&mut self, total_bytes: usize) -> CaptureResult<()> {
-        if gdi_swap_history_surfaces_enabled() {
-            self.swap_capture_and_history_surfaces()?;
-        } else {
-            self.ensure_bgra_history(total_bytes);
-            unsafe {
-                self.copy_surface_to_history_unchecked(total_bytes);
-            }
-        }
+        let _ = total_bytes;
+        self.swap_capture_and_history_surfaces()?;
         Ok(())
     }
 
@@ -1986,9 +1915,8 @@ impl GdiResources {
         let mut frame = reuse.unwrap_or_else(Frame::empty);
         frame.reset_metadata();
         frame.ensure_rgba_capacity(width_u32, height_u32)?;
-        let track_incremental_history = mode == CaptureMode::ScreenRecording
-            && gdi_incremental_convert_enabled()
-            && pixel_count >= GDI_INCREMENTAL_MIN_PIXELS;
+        let track_incremental_history =
+            mode == CaptureMode::ScreenRecording && pixel_count >= GDI_INCREMENTAL_MIN_PIXELS;
         let total_bytes = if track_incremental_history {
             Some(
                 width
@@ -2000,7 +1928,7 @@ impl GdiResources {
             None
         };
         let incremental_enabled = track_incremental_history && destination_has_history;
-        let use_surface_history = track_incremental_history && gdi_swap_history_surfaces_enabled();
+        let use_surface_history = track_incremental_history;
         let mut next_too_dirty_hint = false;
         if incremental_enabled {
             let incremental_status = if use_surface_history {
@@ -2183,9 +2111,8 @@ impl GdiResources {
         let pixel_count = copy_w
             .checked_mul(copy_h)
             .ok_or(CaptureError::BufferOverflow)?;
-        let track_incremental_history = mode == CaptureMode::ScreenRecording
-            && gdi_incremental_convert_enabled()
-            && pixel_count >= GDI_INCREMENTAL_MIN_PIXELS;
+        let track_incremental_history =
+            mode == CaptureMode::ScreenRecording && pixel_count >= GDI_INCREMENTAL_MIN_PIXELS;
         let total_bytes = if track_incremental_history {
             Some(
                 pixel_count
@@ -2196,7 +2123,7 @@ impl GdiResources {
             None
         };
         let incremental_enabled = track_incremental_history && destination_has_history;
-        let use_surface_history = track_incremental_history && gdi_swap_history_surfaces_enabled();
+        let use_surface_history = track_incremental_history;
         let mut next_too_dirty_hint = false;
         if incremental_enabled {
             let incremental_status = if use_surface_history {
@@ -2575,10 +2502,6 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
         destination: &mut Frame,
         destination_has_history: bool,
     ) -> CaptureResult<Option<CaptureSampleMetadata>> {
-        if !gdi_direct_region_capture_enabled() {
-            return Ok(None);
-        }
-
         self.refresh_geometry()?;
         let capture_time = Instant::now();
         let is_duplicate = self.resources.capture_region_into_rgba(
@@ -2604,9 +2527,6 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
         destination: &mut Frame,
         destination_has_history: bool,
     ) -> CaptureResult<Option<CaptureSampleMetadata>> {
-        if !gdi_desktop_direct_region_capture_enabled() {
-            return Ok(None);
-        }
         if width == 0 || height == 0 {
             return Ok(Some(CaptureSampleMetadata {
                 capture_time: Some(Instant::now()),
@@ -2710,7 +2630,7 @@ impl WindowsWindowCapturer {
     }
 
     fn resolve_window_rect(&mut self) -> CaptureResult<(RECT, bool)> {
-        if self.capture_mode != CaptureMode::ScreenRecording || !gdi_window_state_cache_enabled() {
+        if self.capture_mode != CaptureMode::ScreenRecording {
             return self.refresh_window_rect(true).map(|rect| (rect, false));
         }
 

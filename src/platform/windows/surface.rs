@@ -1,6 +1,5 @@
 use anyhow::Context;
 use std::cell::{Cell, RefCell};
-use std::sync::OnceLock;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_STAGING, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
@@ -16,7 +15,6 @@ use crate::backend::CaptureBlitRegion;
 use crate::convert::{
     self, HdrToSdrParams, SurfaceConversionOptions, SurfaceLayout, SurfacePixelFormat,
 };
-use crate::env_config::{self, define_env_flag};
 use crate::error::{CaptureError, CaptureResult};
 use crate::frame::{DirtyRect, Frame};
 
@@ -117,41 +115,11 @@ fn map_resource_read_with_spin(
 ) -> CaptureResult<D3D11_MAPPED_SUBRESOURCE> {
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
 
-    if map_spin_wait_enabled() {
-        let max_polls = map_spin_poll_count();
-        let polls = adaptive_map_spin_polls(max_polls);
-        let mut exhausted_spin = true;
-        for attempt in 0..polls {
-            let map_result = unsafe {
-                context.Map(
-                    resource,
-                    0,
-                    D3D11_MAP_READ,
-                    D3D11_MAP_FLAG_DO_NOT_WAIT,
-                    Some(&mut mapped),
-                )
-            };
-            match map_result {
-                Ok(()) => {
-                    update_adaptive_map_spin_polls(max_polls, Some(attempt));
-                    return Ok(mapped);
-                }
-                Err(error) if error.code() == DXGI_ERROR_WAS_STILL_DRAWING => {
-                    if attempt + 1 < polls {
-                        std::hint::spin_loop();
-                    }
-                }
-                Err(_) => {
-                    exhausted_spin = false;
-                    break;
-                }
-            }
-        }
-        if exhausted_spin {
-            update_adaptive_map_spin_polls(max_polls, None);
-        }
-    } else {
-        let hr = unsafe {
+    let max_polls = map_spin_poll_count();
+    let polls = adaptive_map_spin_polls(max_polls);
+    let mut exhausted_spin = true;
+    for attempt in 0..polls {
+        let map_result = unsafe {
             context.Map(
                 resource,
                 0,
@@ -160,9 +128,24 @@ fn map_resource_read_with_spin(
                 Some(&mut mapped),
             )
         };
-        if hr.is_ok() {
-            return Ok(mapped);
+        match map_result {
+            Ok(()) => {
+                update_adaptive_map_spin_polls(max_polls, Some(attempt));
+                return Ok(mapped);
+            }
+            Err(error) if error.code() == DXGI_ERROR_WAS_STILL_DRAWING => {
+                if attempt + 1 < polls {
+                    std::hint::spin_loop();
+                }
+            }
+            Err(_) => {
+                exhausted_spin = false;
+                break;
+            }
         }
+    }
+    if exhausted_spin {
+        update_adaptive_map_spin_polls(max_polls, None);
     }
 
     mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -243,22 +226,8 @@ fn dirty_rects_non_overlapping_checked(dirty_rects: &[DirtyRect]) -> bool {
     true
 }
 
-define_env_flag!(enabled_unless(dirty_rect_parallel_enabled, "SNOW_CAPTURE_DISABLE_DIRTY_RECT_PARALLEL"));
-define_env_flag!(enabled_unless(dirty_rect_fastpath_enabled, "SNOW_CAPTURE_DISABLE_DIRTY_RECT_FASTPATH"));
-define_env_flag!(enabled_unless(dirty_rect_non_overlap_shortcut_enabled, "SNOW_CAPTURE_DISABLE_DIRTY_RECT_NON_OVERLAP_SHORTCUT"));
-define_env_flag!(enabled_unless(dirty_rect_trusted_fastpath_enabled, "SNOW_CAPTURE_DISABLE_DIRTY_RECT_TRUSTED_FASTPATH"));
-define_env_flag!(enabled_unless(dirty_rect_trusted_direct_enabled, "SNOW_CAPTURE_DISABLE_DIRTY_RECT_TRUSTED_DIRECT"));
-define_env_flag!(enabled_unless(dirty_rect_bgra_batch_kernel_enabled, "SNOW_CAPTURE_DISABLE_DIRTY_RECT_BGRA_BATCH_KERNEL"));
-define_env_flag!(enabled_unless(map_spin_wait_enabled, "SNOW_CAPTURE_DISABLE_D3D11_MAP_SPIN_WAIT"));
-
 fn map_spin_poll_count() -> usize {
-    static POLLS: OnceLock<usize> = OnceLock::new();
-    *POLLS.get_or_init(|| {
-        env_config::env_var_positive_u64("SNOW_CAPTURE_D3D11_MAP_SPIN_POLLS")
-            .map(|v| v as usize)
-            .unwrap_or(D3D11_MAP_SPIN_POLLS_DEFAULT)
-            .clamp(D3D11_MAP_SPIN_POLLS_MIN, D3D11_MAP_SPIN_POLLS_MAX)
-    })
+    D3D11_MAP_SPIN_POLLS_DEFAULT.clamp(D3D11_MAP_SPIN_POLLS_MIN, D3D11_MAP_SPIN_POLLS_MAX)
 }
 
 #[inline(always)]
@@ -485,13 +454,8 @@ unsafe fn convert_dirty_rects_trusted_direct_unchecked(
         DIRTY_RECT_PARALLEL_MIN_CHUNK_PIXELS,
         DIRTY_RECT_PARALLEL_MAX_WORKERS,
     );
-    let use_bgra_batch_kernel =
-        format == SurfacePixelFormat::Bgra8 && dirty_rect_bgra_batch_kernel_enabled();
-    let can_parallel = dirty_rect_parallel_enabled()
-        && converted >= DIRTY_RECT_PARALLEL_MIN_RECTS
-        && should_parallelize
-        && (dirty_rect_non_overlap_shortcut_enabled()
-            || dirty_rects_non_overlapping_checked(dirty_rects));
+    let use_bgra_batch_kernel = format == SurfacePixelFormat::Bgra8;
+    let can_parallel = converted >= DIRTY_RECT_PARALLEL_MIN_RECTS && should_parallelize;
 
     if can_parallel {
         use rayon::prelude::*;
@@ -972,8 +936,7 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
         let dst_base = frame.as_mut_rgba_ptr();
         let options = SurfaceConversionOptions { hdr_to_sdr };
         let converter = convert::SurfaceRowConverter::new(format, options);
-        let trusted_fastpath = dirty_rect_trusted_fastpath_enabled()
-            && dirty_rects_non_overlapping
+        let trusted_fastpath = dirty_rects_non_overlapping
             && (hints.trusted_bounds
                 || dirty_rects_fit_bounds(
                     dirty_rects,
@@ -985,7 +948,7 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
                     dst_height_u32,
                 ));
 
-        if trusted_fastpath && dirty_rect_trusted_direct_enabled() {
+        if trusted_fastpath {
             // SAFETY: `trusted_fastpath` guarantees all dirty rectangles are
             // in-bounds for both source and destination surfaces.
             return unsafe {
@@ -1005,7 +968,7 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
             };
         }
 
-        if dirty_rect_fastpath_enabled() && dirty_rects.len() < DIRTY_RECT_PARALLEL_MIN_RECTS {
+        if dirty_rects.len() < DIRTY_RECT_PARALLEL_MIN_RECTS {
             let allow_inner_parallel = dirty_rects.len() == 1;
             let mut converted = 0usize;
             for rect in dirty_rects {
@@ -1139,15 +1102,13 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
                 DIRTY_RECT_PARALLEL_MAX_WORKERS,
             );
             let work_items_slice = &work_items[..];
-            let non_overlapping =
-                if dirty_rects_non_overlapping && dirty_rect_non_overlap_shortcut_enabled() {
-                    debug_assert!(work_items_non_overlapping(work_items_slice));
-                    true
-                } else {
-                    work_items_non_overlapping(work_items_slice)
-                };
-            let can_parallel = dirty_rect_parallel_enabled()
-                && work_items_slice.len() >= DIRTY_RECT_PARALLEL_MIN_RECTS
+            let non_overlapping = if dirty_rects_non_overlapping {
+                debug_assert!(work_items_non_overlapping(work_items_slice));
+                true
+            } else {
+                work_items_non_overlapping(work_items_slice)
+            };
+            let can_parallel = work_items_slice.len() >= DIRTY_RECT_PARALLEL_MIN_RECTS
                 && should_parallelize
                 && non_overlapping;
 
@@ -1674,11 +1635,7 @@ mod tests {
             DIRTY_RECT_PARALLEL_MIN_CHUNK_PIXELS,
             DIRTY_RECT_PARALLEL_MAX_WORKERS,
         );
-        let can_parallel = dirty_rect_parallel_enabled()
-            && converted >= DIRTY_RECT_PARALLEL_MIN_RECTS
-            && should_parallelize
-            && (dirty_rect_non_overlap_shortcut_enabled()
-                || dirty_rects_non_overlapping_checked(dirty_rects));
+        let can_parallel = converted >= DIRTY_RECT_PARALLEL_MIN_RECTS && should_parallelize;
 
         if can_parallel {
             use rayon::prelude::*;

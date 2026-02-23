@@ -7,10 +7,6 @@ mod simd_x86;
 use parallel::{install_conversion_pool, parallel_chunk_pixels, should_parallelize};
 use std::sync::OnceLock;
 
-use crate::env_config::define_env_flag;
-
-define_env_flag!(enabled_unless(batched_row_nt_fence_enabled, "SNOW_CAPTURE_DISABLE_BATCHED_ROW_NT_FENCE"));
-
 /// Pre-initialize expensive one-time resources (rayon thread pool, F16 LUT,
 /// SIMD kernel selection) so the first capture doesn't pay the cost.
 /// Safe to call multiple times — only the first call does real work.
@@ -368,7 +364,6 @@ impl SurfaceRowConverter {
 
         let _ = layout.assert_pitches(self.plan.src_bytes_per_pixel);
         let total_pixels = layout.total_pixels();
-        let batch_nt_fence = batched_row_nt_fence_enabled();
         let bgra_row_nt_kernel = if self.format == SurfacePixelFormat::Bgra8 {
             bgra_nt_kernel_for_rows(layout.dst as *const u8, layout.dst_pitch)
         } else {
@@ -407,15 +402,13 @@ impl SurfaceRowConverter {
         } else {
             None
         };
-        let kernel = if use_nt && batch_nt_fence {
+        let kernel = if use_nt {
             bgra_row_nt_kernel_nofence.unwrap_or(self.plan.row_kernel_nt_nofence)
-        } else if use_nt {
-            bgra_row_nt_kernel.unwrap_or(self.plan.row_kernel_nt)
         } else {
             self.plan.row_kernel
         };
         unsafe {
-            if use_nt && batch_nt_fence {
+            if use_nt {
                 run_rows_serial_nt(layout, kernel);
             } else {
                 run_rows_serial(layout, kernel);
@@ -789,11 +782,6 @@ fn f16_nt_supported() -> bool {
     }
 }
 
-#[inline]
-fn bgra_nt_unaligned_enabled() -> bool {
-    true
-}
-
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
 struct BgraNtKernelSet {
@@ -851,21 +839,15 @@ fn bgra_nt_kernel_set() -> &'static BgraNtKernelSet {
 fn bgra_nt_kernel_for_destination(dst: *const u8) -> Option<PixelKernel> {
     #[cfg(target_arch = "x86_64")]
     {
-        let allow_unaligned = bgra_nt_unaligned_enabled();
+        let _ = dst;
         let kernels = bgra_nt_kernel_set();
-        if let Some(kernel) = kernels.avx512
-            && (allow_unaligned || ptr_is_aligned(dst, 64))
-        {
+        if let Some(kernel) = kernels.avx512 {
             return Some(kernel);
         }
-        if let Some(kernel) = kernels.avx2
-            && (allow_unaligned || ptr_is_aligned(dst, 32))
-        {
+        if let Some(kernel) = kernels.avx2 {
             return Some(kernel);
         }
-        if let Some(kernel) = kernels.ssse3
-            && (allow_unaligned || ptr_is_aligned(dst, 16))
-        {
+        if let Some(kernel) = kernels.ssse3 {
             return Some(kernel);
         }
         None
@@ -881,21 +863,15 @@ fn bgra_nt_kernel_for_destination(dst: *const u8) -> Option<PixelKernel> {
 fn bgra_nt_kernel_for_rows(dst: *const u8, dst_pitch: usize) -> Option<PixelKernel> {
     #[cfg(target_arch = "x86_64")]
     {
-        let allow_unaligned = bgra_nt_unaligned_enabled();
+        let _ = (dst, dst_pitch);
         let kernels = bgra_nt_kernel_set();
-        if let Some(kernel) = kernels.avx512
-            && (allow_unaligned || (ptr_is_aligned(dst, 64) && dst_pitch.is_multiple_of(64)))
-        {
+        if let Some(kernel) = kernels.avx512 {
             return Some(kernel);
         }
-        if let Some(kernel) = kernels.avx2
-            && (allow_unaligned || (ptr_is_aligned(dst, 32) && dst_pitch.is_multiple_of(32)))
-        {
+        if let Some(kernel) = kernels.avx2 {
             return Some(kernel);
         }
-        if let Some(kernel) = kernels.ssse3
-            && (allow_unaligned || (ptr_is_aligned(dst, 16) && dst_pitch.is_multiple_of(16)))
-        {
+        if let Some(kernel) = kernels.ssse3 {
             return Some(kernel);
         }
         None
@@ -911,21 +887,15 @@ fn bgra_nt_kernel_for_rows(dst: *const u8, dst_pitch: usize) -> Option<PixelKern
 fn bgra_nt_kernel_for_rows_nofence(dst: *const u8, dst_pitch: usize) -> Option<PixelKernel> {
     #[cfg(target_arch = "x86_64")]
     {
-        let allow_unaligned = bgra_nt_unaligned_enabled();
+        let _ = (dst, dst_pitch);
         let kernels = bgra_nt_kernel_set();
-        if let Some(kernel) = kernels.avx512_nofence
-            && (allow_unaligned || (ptr_is_aligned(dst, 64) && dst_pitch.is_multiple_of(64)))
-        {
+        if let Some(kernel) = kernels.avx512_nofence {
             return Some(kernel);
         }
-        if let Some(kernel) = kernels.avx2_nofence
-            && (allow_unaligned || (ptr_is_aligned(dst, 32) && dst_pitch.is_multiple_of(32)))
-        {
+        if let Some(kernel) = kernels.avx2_nofence {
             return Some(kernel);
         }
-        if let Some(kernel) = kernels.ssse3_nofence
-            && (allow_unaligned || (ptr_is_aligned(dst, 16) && dst_pitch.is_multiple_of(16)))
-        {
+        if let Some(kernel) = kernels.ssse3_nofence {
             return Some(kernel);
         }
         None
@@ -968,7 +938,6 @@ pub(crate) fn select_bgra_dirty_rect_kernel(
         let nt_kernel = bgra_nt_kernel_for_rows(dst, dst_pitch);
         if let Some(kernel) = nt_kernel {
             if defer_nt_fence
-                && batched_row_nt_fence_enabled()
                 && let Some(nofence_kernel) = bgra_nt_kernel_for_rows_nofence(dst, dst_pitch)
             {
                 return BgraDirtyRectKernel {
@@ -1109,7 +1078,6 @@ pub(crate) unsafe fn convert_surface_to_rgba_unchecked(
         return;
     }
 
-    let batch_nt_fence = batched_row_nt_fence_enabled();
     let bgra_row_nt_kernel = if format == SurfacePixelFormat::Bgra8 {
         bgra_nt_kernel_for_rows(layout.dst as *const u8, layout.dst_pitch)
     } else {
@@ -1131,15 +1099,13 @@ pub(crate) unsafe fn convert_surface_to_rgba_unchecked(
                 nt_rows_are_aligned(layout.dst as *const u8, layout.dst_pitch) && f16_nt_supported()
             }
         };
-    let kernel = if use_nt && batch_nt_fence {
+    let kernel = if use_nt {
         bgra_row_nt_kernel_nofence.unwrap_or(plan.row_kernel_nt_nofence)
-    } else if use_nt {
-        bgra_row_nt_kernel.unwrap_or(plan.row_kernel_nt)
     } else {
         plan.row_kernel
     };
     unsafe {
-        if use_nt && batch_nt_fence {
+        if use_nt {
             run_rows_serial_nt(layout, kernel);
         } else {
             run_rows_serial(layout, kernel);

@@ -2227,6 +2227,8 @@ impl OutputCapturer {
         self.ensure_region_pipeline_for_blit(blit);
 
         let capture_time = Instant::now();
+        let single_shot_screenshot =
+            self.capture_mode == CaptureMode::Screenshot && !destination_has_history;
         let (desktop_texture, frame_info) =
             match acquire_frame(&self.duplication, self.needs_presented_first_frame)? {
                 AcquireResult::Ok(texture, info) => (texture, info),
@@ -2277,6 +2279,35 @@ impl OutputCapturer {
             }
 
             let region_desc = Self::region_desc_for_blit(&effective_desc, blit);
+
+            if single_shot_screenshot {
+                let write_slot = 0usize;
+                self.ensure_region_slot(write_slot, &region_desc)?;
+                {
+                    let slot = &mut self.region_slots[write_slot];
+                    slot.capture_time = Some(capture_time);
+                    slot.present_time_qpc = source_present_time_qpc;
+                    slot.is_duplicate = source_is_duplicate;
+                    slot.hdr_to_sdr = effective_hdr;
+                    slot.source_desc = Some(region_desc);
+                    slot.dirty_mode_available = false;
+                    slot.move_mode_available = false;
+                    slot.dirty_cpu_copy_preferred = false;
+                    slot.dirty_gpu_copy_preferred = false;
+                    slot.dirty_total_pixels = 0;
+                    slot.dirty_rects.clear();
+                    slot.move_rects.clear();
+                    slot.populated = true;
+                }
+
+                self.copy_region_source_to_slot(write_slot, &effective_source, blit, false)?;
+                self.maybe_flush_region_after_submit(write_slot, write_slot);
+                let sample =
+                    self.read_region_slot_into_output(write_slot, destination, false, blit)?;
+                self.region_pending_slot = None;
+                self.region_next_write_slot = 0;
+                return Ok(sample);
+            }
 
             let (region_dirty_available, region_move_available, region_has_moves, region_unchanged) =
                 if source_is_duplicate {
@@ -2503,6 +2534,8 @@ impl OutputCapturer {
             .unwrap_or_else(Frame::empty);
         let has_frame_history =
             frame.metadata.capture_time.is_some() && !frame.as_rgba_bytes().is_empty();
+        let single_shot_screenshot =
+            self.capture_mode == CaptureMode::Screenshot && !has_frame_history;
         frame.reset_metadata();
 
         let capture_time = Instant::now();
@@ -2534,7 +2567,10 @@ impl OutputCapturer {
 
         // Duplicate frames have no new desktop damage. Skip the COM metadata
         // query on this fast path.
-        let source_unchanged = if frame.metadata.is_duplicate {
+        let source_unchanged = if single_shot_screenshot {
+            frame.metadata.dirty_rects.clear();
+            false
+        } else if frame.metadata.is_duplicate {
             frame.metadata.dirty_rects.clear();
             true
         } else if extract_dirty_rects(
@@ -2576,7 +2612,8 @@ impl OutputCapturer {
         let mut normalized_dirty_rects = std::mem::take(&mut self.source_dirty_rects_scratch);
         normalized_dirty_rects.clear();
         let mut current_dirty_strategy = DirtyCopyStrategy::default();
-        if !frame_pixels_unchanged
+        if !single_shot_screenshot
+            && !frame_pixels_unchanged
             && !frame.metadata.dirty_rects.is_empty()
             && frame.metadata.dirty_rects.len() <= DXGI_DIRTY_COPY_MAX_RECTS
         {

@@ -1002,7 +1002,10 @@ impl WindowsGraphicsCaptureCapturer {
         // - Disable the capture border where allowed by the OS.
         let _ = session.SetIsCursorCaptureEnabled(cursor_config.capture_cursor);
         let _ = session.SetIsBorderRequired(false);
-        let _ = session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportAndRender);
+        // Screenshot mode favors single-frame latency; keep WGC dirty-region
+        // mode at the lighter ReportOnly setting until recording requests
+        // ReportAndRender.
+        let _ = session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly);
 
         let signal = Arc::new(FrameSignal::default());
         let signal_for_frames = signal.clone();
@@ -2123,6 +2126,8 @@ impl WindowsGraphicsCaptureCapturer {
         let allow_stale_return =
             self.capture_mode == CaptureMode::ScreenRecording && destination_has_history;
         let capture_time = Instant::now();
+        let single_shot_screenshot =
+            self.capture_mode == CaptureMode::Screenshot && !destination_has_history;
 
         let maybe_capture = self.acquire_next_frame_or_stale_region(allow_stale_return)?;
         let (capture_frame, time_ticks) = if let Some(capture) = maybe_capture {
@@ -2244,6 +2249,77 @@ impl WindowsGraphicsCaptureCapturer {
             }
 
             let region_desc = Self::region_desc_for_blit(&effective_desc, blit);
+            if single_shot_screenshot {
+                let write_slot = 0usize;
+                self.ensure_region_slot(write_slot, &region_desc)?;
+                {
+                    let slot = &self.region_slots[write_slot];
+                    let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
+                        CaptureError::Platform(anyhow::anyhow!(
+                            "failed to resolve WGC region staging resource for screenshot fast path"
+                        ))
+                    })?;
+                    let source_box = D3D11_BOX {
+                        left: blit.src_x,
+                        top: blit.src_y,
+                        front: 0,
+                        right: src_right,
+                        bottom: src_bottom,
+                        back: 1,
+                    };
+                    with_texture_resource(
+                        &effective_source,
+                        "failed to cast WGC region source texture to ID3D11Resource",
+                        |source_resource| {
+                            unsafe {
+                                self.context.CopySubresourceRegion(
+                                    staging_resource,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    source_resource,
+                                    0,
+                                    Some(&source_box),
+                                );
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
+                unsafe {
+                    self.context.Flush();
+                }
+                {
+                    let slot = &self.region_slots[write_slot];
+                    let staging = slot.staging.as_ref().ok_or_else(|| {
+                        CaptureError::Platform(anyhow::anyhow!(
+                            "failed to resolve WGC region staging texture for screenshot fast path"
+                        ))
+                    })?;
+                    surface::map_staging_to_frame(
+                        &self.context,
+                        staging,
+                        slot.staging_resource.as_ref(),
+                        &region_desc,
+                        out,
+                        effective_hdr,
+                        "failed to map WGC region staging texture",
+                    )?;
+                }
+                let sample = CaptureSampleMetadata {
+                    capture_time: Some(capture_time),
+                    present_time_qpc: if time_ticks != 0 {
+                        Some(time_ticks)
+                    } else {
+                        None
+                    },
+                    is_duplicate: source_is_duplicate,
+                };
+                self.region_pending_slot = None;
+                self.region_next_write_slot = 0;
+                return Ok(sample);
+            }
             let region_dirty_extraction = if source_is_duplicate {
                 region_dirty_rects.clear();
                 RegionDirtyRectExtraction {
@@ -2405,6 +2481,8 @@ impl WindowsGraphicsCaptureCapturer {
         let mut out = reuse.unwrap_or_else(Frame::empty);
         let destination_has_history =
             out.metadata.capture_time.is_some() && !out.as_rgba_bytes().is_empty();
+        let single_shot_screenshot =
+            self.capture_mode == CaptureMode::Screenshot && !destination_has_history;
         out.reset_metadata();
 
         let allow_stale_return = self.capture_mode == CaptureMode::ScreenRecording
@@ -2514,6 +2592,63 @@ impl WindowsGraphicsCaptureCapturer {
                 } else {
                     (frame_texture.clone(), src_desc, self.hdr_to_sdr)
                 };
+
+            if single_shot_screenshot {
+                let write_slot = 0usize;
+                self.ensure_staging_slot(write_slot, &effective_desc)?;
+                {
+                    let slot = &self.staging_slots[write_slot];
+                    let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
+                        CaptureError::Platform(anyhow::anyhow!(
+                            "failed to resolve WGC staging resource for screenshot fast path"
+                        ))
+                    })?;
+                    with_texture_resource(
+                        &effective_source,
+                        "failed to cast WGC frame texture to ID3D11Resource",
+                        |source_resource| {
+                            unsafe {
+                                self.context.CopyResource(staging_resource, source_resource);
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
+                unsafe {
+                    self.context.Flush();
+                }
+                {
+                    let slot = &self.staging_slots[write_slot];
+                    let staging = slot.staging.as_ref().ok_or_else(|| {
+                        CaptureError::Platform(anyhow::anyhow!(
+                            "failed to resolve WGC staging texture for screenshot fast path"
+                        ))
+                    })?;
+                    surface::map_staging_to_frame(
+                        &self.context,
+                        staging,
+                        slot.staging_resource.as_ref(),
+                        &effective_desc,
+                        &mut out,
+                        effective_hdr,
+                        "failed to map WGC staging texture",
+                    )?;
+                }
+                out.metadata.capture_time = Some(capture_time);
+                out.metadata.present_time_qpc = if time_ticks != 0 {
+                    Some(time_ticks)
+                } else {
+                    None
+                };
+                out.metadata.is_duplicate = source_is_duplicate;
+                out.metadata.dirty_rects.clear();
+                if time_ticks != 0 {
+                    self.last_emitted_present_time = time_ticks;
+                }
+                self.pending_slot = None;
+                self.next_write_slot = 0;
+                return Ok(());
+            }
 
             let (source_dirty_available, source_unchanged) = if source_is_duplicate {
                 source_dirty_rects.clear();
@@ -2662,6 +2797,12 @@ impl WindowsGraphicsCaptureCapturer {
             return;
         }
         self.capture_mode = mode;
+        let dirty_mode = if mode == CaptureMode::ScreenRecording {
+            GraphicsCaptureDirtyRegionMode::ReportAndRender
+        } else {
+            GraphicsCaptureDirtyRegionMode::ReportOnly
+        };
+        let _ = self.session.SetDirtyRegionMode(dirty_mode);
         self.reset_staging_pipeline();
     }
 

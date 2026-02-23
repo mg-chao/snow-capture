@@ -39,7 +39,7 @@ use super::dirty_rect::{
 };
 use super::gpu_tonemap::{GpuF16Converter, GpuTonemapper};
 use super::monitor::{HdrMonitorMetadata, MonitorResolver, hdr_to_sdr_params};
-use super::region_pipeline::{RegionPipelineState, RegionSlot};
+use super::region_pipeline::{self, RegionPipelineState, RegionSlot, RegionStagingSlotAccess};
 use super::surface::{self, StagingSampleDesc};
 
 const WGC_FRAME_TIMEOUT: Duration = Duration::from_millis(250);
@@ -733,6 +733,28 @@ impl RegionSlot for WgcStagingSlot {
     }
 }
 
+impl RegionStagingSlotAccess for WgcStagingSlot {
+    fn staging_resource(&self) -> Option<&ID3D11Resource> {
+        self.staging_resource.as_ref()
+    }
+    fn set_staging(&mut self, tex: ID3D11Texture2D, res: ID3D11Resource) {
+        self.staging = Some(tex);
+        self.staging_resource = Some(res);
+    }
+    fn query(&self) -> Option<&ID3D11Query> {
+        self.query.as_ref()
+    }
+    fn set_query(&mut self, q: ID3D11Query) {
+        self.query = Some(q);
+    }
+    fn dirty_rects(&self) -> &[DirtyRect] {
+        &self.dirty_rects
+    }
+    fn dirty_gpu_copy_preferred(&self) -> bool {
+        self.dirty_gpu_copy_preferred
+    }
+}
+
 
 /// WGC FrameArrived stores the system-relative time alongside the frame.
 #[derive(Default)]
@@ -1323,134 +1345,32 @@ impl WindowsGraphicsCaptureCapturer {
 
         if needs_recreate {
             slot.staging = None;
-            let staging = surface::ensure_staging_texture(
-                &self.device,
-                &mut slot.staging,
-                desc,
-                StagingSampleDesc::SingleSample,
-                "failed to create WGC region staging texture",
-            )?;
-            slot.staging_resource = Some(
-                staging
-                    .cast::<ID3D11Resource>()
-                    .context("failed to cast WGC region staging texture to ID3D11Resource")
-                    .map_err(CaptureError::Platform)?,
-            );
             slot.source_desc = Some(*desc);
             slot.populated = false;
         }
-
-        if slot.query.is_none() {
-            let query_desc = D3D11_QUERY_DESC {
-                Query: D3D11_QUERY_EVENT,
-                ..Default::default()
-            };
-            let mut query: Option<ID3D11Query> = None;
-            unsafe { self.device.CreateQuery(&query_desc, Some(&mut query)) }
-                .context("CreateQuery for WGC region staging slot failed")
-                .map_err(CaptureError::Platform)?;
-            slot.query = query;
-        }
-        Ok(())
+        region_pipeline::ensure_region_slot_texture(
+            &self.device,
+            slot,
+            desc,
+            needs_recreate,
+            "failed to create WGC region staging texture",
+        )
     }
 
     fn copy_region_source_to_slot(
-        &mut self,
+        &self,
         slot_idx: usize,
         source_resource: &ID3D11Resource,
         blit: CaptureBlitRegion,
         can_use_dirty_gpu_copy: bool,
     ) -> CaptureResult<()> {
-        let mut used_dirty_copy = false;
-        {
-            let slot = &self.region.slots[slot_idx];
-            let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
-                CaptureError::Platform(anyhow::anyhow!(
-                    "failed to resolve WGC region staging resource for slot {}",
-                    slot_idx
-                ))
-            })?;
-
-            if can_use_dirty_gpu_copy && slot.dirty_gpu_copy_preferred {
-                for rect in &slot.dirty_rects {
-                    let source_left = blit
-                        .src_x
-                        .checked_add(rect.x)
-                        .ok_or(CaptureError::BufferOverflow)?;
-                    let source_top = blit
-                        .src_y
-                        .checked_add(rect.y)
-                        .ok_or(CaptureError::BufferOverflow)?;
-                    let source_right = source_left
-                        .checked_add(rect.width)
-                        .ok_or(CaptureError::BufferOverflow)?;
-                    let source_bottom = source_top
-                        .checked_add(rect.height)
-                        .ok_or(CaptureError::BufferOverflow)?;
-                    let source_box = D3D11_BOX {
-                        left: source_left,
-                        top: source_top,
-                        front: 0,
-                        right: source_right,
-                        bottom: source_bottom,
-                        back: 1,
-                    };
-                    unsafe {
-                        self.context.CopySubresourceRegion(
-                            staging_resource,
-                            0,
-                            rect.x,
-                            rect.y,
-                            0,
-                            source_resource,
-                            0,
-                            Some(&source_box),
-                        );
-                    }
-                }
-                used_dirty_copy = true;
-            }
-
-            if !used_dirty_copy {
-                let src_right = blit
-                    .src_x
-                    .checked_add(blit.width)
-                    .ok_or(CaptureError::BufferOverflow)?;
-                let src_bottom = blit
-                    .src_y
-                    .checked_add(blit.height)
-                    .ok_or(CaptureError::BufferOverflow)?;
-                let source_box = D3D11_BOX {
-                    left: blit.src_x,
-                    top: blit.src_y,
-                    front: 0,
-                    right: src_right,
-                    bottom: src_bottom,
-                    back: 1,
-                };
-
-                unsafe {
-                    self.context.CopySubresourceRegion(
-                        staging_resource,
-                        0,
-                        0,
-                        0,
-                        0,
-                        source_resource,
-                        0,
-                        Some(&source_box),
-                    );
-                }
-            }
-
-            if let Some(query) = slot.query.as_ref() {
-                unsafe {
-                    self.context.End(query);
-                }
-            }
-        }
-        self.region.slots[slot_idx].populated = true;
-        Ok(())
+        region_pipeline::copy_region_source_to_slot(
+            &self.context,
+            &self.region.slots[slot_idx],
+            source_resource,
+            blit,
+            can_use_dirty_gpu_copy,
+        )
     }
 
     fn copy_source_to_slot(
@@ -1520,16 +1440,7 @@ impl WindowsGraphicsCaptureCapturer {
     }
 
     fn query_signaled(&self, query: &ID3D11Query, flags: u32) -> bool {
-        let mut data = 0u32;
-        let status = unsafe {
-            self.context.GetData(
-                query,
-                Some(&mut data as *mut u32 as *mut _),
-                std::mem::size_of::<u32>() as u32,
-                flags,
-            )
-        };
-        status.is_ok() && data != 0
+        region_pipeline::query_signaled(&self.context, query, flags, true)
     }
 
     fn slot_query_completed(&self, slot_idx: usize) -> bool {
@@ -1576,48 +1487,23 @@ impl WindowsGraphicsCaptureCapturer {
         }
     }
 
-    fn region_slot_query_completed(&self, slot_idx: usize) -> bool {
-        const DO_NOT_FLUSH: u32 = 0x1;
-        let Some(query) = self.region.slots[slot_idx].query.as_ref() else {
-            return false;
-        };
-        self.query_signaled(query, DO_NOT_FLUSH)
-    }
-
     fn maybe_flush_region_after_submit(&self, write_slot: usize, read_slot: usize) {
-        if write_slot == read_slot || !self.region_slot_query_completed(read_slot) {
-            unsafe {
-                self.context.Flush();
-            }
-        }
+        region_pipeline::maybe_flush_region_after_submit(
+            &self.context,
+            write_slot,
+            read_slot,
+            &self.region.slots[read_slot],
+            true,
+        );
     }
 
     fn wait_for_region_slot_copy(&mut self, slot_idx: usize) {
-        const DO_NOT_FLUSH: u32 = 0x1;
-        let Some(query) = self.region.slots[slot_idx].query.as_ref() else {
-            return;
-        };
-
-        let mut completed_in_spin = false;
-        for _ in 0..self.region.adaptive_spin_polls {
-            if self.query_signaled(query, DO_NOT_FLUSH) {
-                completed_in_spin = true;
-                break;
-            }
-            std::hint::spin_loop();
-        }
-
-        if completed_in_spin {
-            self.region.adaptive_spin_polls = self
-                .region.adaptive_spin_polls
-                .saturating_sub(1)
-                .max(WGC_QUERY_SPIN_MIN_POLLS);
-        } else {
-            self.region.adaptive_spin_polls = self
-                .region.adaptive_spin_polls
-                .saturating_add(WGC_QUERY_SPIN_INCREASE_STEP)
-                .min(WGC_QUERY_SPIN_MAX_POLLS);
-        }
+        self.region.adaptive_spin_polls = region_pipeline::wait_for_region_slot_copy(
+            &self.context,
+            &self.region.slots[slot_idx],
+            self.region.adaptive_spin_polls,
+            true,
+        );
     }
 
     fn read_region_slot_into_output(
